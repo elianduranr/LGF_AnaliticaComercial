@@ -1,0 +1,34 @@
+
+
+!resultados/README.md
+# Archivos pesados / caches / bases locales
+# Carpetas de cache/output pesado
+# Configuración sensible
+# Datos y salidas
+# Entornos virtuales
+# Python
+**/_cache/
+*.bak
+*.csv
+*.db
+*.log
+*.pickle
+*.pkl
+*.pyc
+*.sqlite
+*.xlsx
+.env
+.ipynb_checkpoints/
+.venv/
+__pycache__/
+data/
+outputs/
+outputs_*/
+outputs_descriptivo/_cache/
+outputs_descriptivo_2026_dash/_cache/
+outputs_descriptivo_2026_demo/*.sqlite
+outputs_forecast_solidos_historico/_cache/
+PDAEntorno/
+pruebas antiguas/
+resultados/*
+venv/
