@@ -8,15 +8,14 @@ Esta guia es el punto de entrada operativo del proyecto. La idea es saber que co
 
 ## Regla principal
 
-No trabajar descriptivos, clusters, forecast e inventario al mismo tiempo.
+No trabajar descriptivos, forecast e inventario al mismo tiempo.
 
 Orden recomendado:
 
 1. Descriptivos.
 2. Dashboard descriptivo.
-3. Clusters y similares.
-4. Forecast / proyeccion.
-5. Inventario y compra.
+3. Forecast / proyeccion.
+4. Inventario y compra.
 
 Ahora el foco recomendado es **descriptivos**.
 
@@ -44,16 +43,6 @@ Archivos:
 - `src/lgf_operativo/metrics.py`
 
 Este es el modulo que debes usar para mejorar Cliente 360 y Visualizador clientes general.
-
-### Clusters
-
-Agrupa clientes y calcula similares.
-
-Archivo:
-
-- `src/lgf_operativo/similarity.py`
-
-No tocar mientras se este trabajando descriptivos, salvo que el objetivo sea explicitamente clusters.
 
 ### Forecast
 
@@ -186,16 +175,7 @@ Separar dentro de Dash:
 
 Cada vista debe leer CSV agregados.
 
-### Paso 3: volver a clusters
-
-Cuando descriptivos este estable, revisar:
-
-- `clientes_similares.csv`
-- `clusters_clientes.csv`
-- nombres de clusters;
-- explicacion de por que un cliente pertenece a cada grupo.
-
-### Paso 4: volver a forecast
+### Paso 3: volver a forecast
 
 Despues revisar:
 

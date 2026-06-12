@@ -1,8 +1,8 @@
 """Ejecutor del forecast historico semanal para pedidos SOLIDO confirmados.
 
-Este modulo es el unico que usa directamente todo el historico consolidado
-durante la etapa actual del proyecto. Limpia solo el universo necesario,
-mantiene cache propio y genera outputs separados para el Dash.
+Este modulo usa por defecto el historico consolidado en SQL Server. Limpia
+solo el universo necesario cuando se usa una fuente cruda local, mantiene cache
+propio y genera outputs separados para el Dash.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import pandas as pd
 
 from src.lgf_operativo.cleaning import clean_historical_orders, load_tipo_pedido_reference
 from src.lgf_operativo.io_utils import read_table, write_outputs
+from src.lgf_operativo.op_sales_sql import read_op_sales_fact
 from src.lgf_operativo.solid_forecast import SolidForecastConfig, run_solid_forecast_pipeline
 
 
@@ -48,7 +49,13 @@ SOLID_COLS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="LGF: forecast semanal de demanda SOLIDO a partir del historico crudo completo."
+        description="LGF: forecast semanal de demanda SOLIDO a partir del historico consolidado."
+    )
+    parser.add_argument(
+        "--source",
+        choices=["sql", "csv"],
+        default="sql",
+        help="Fuente de datos: sql lee op_sales.fact_sales_line; csv usa --raw-historico o --historico-limpio.",
     )
     parser.add_argument(
         "--raw-historico",
@@ -67,6 +74,8 @@ def parse_args() -> argparse.Namespace:
         help="Respaldo opcional para extractos incompletos sin campos de receta; no usar con la base completa.",
     )
     parser.add_argument("--historico-sheet", default=None, help="Hoja Excel, si la fuente cruda es XLSX/XLS.")
+    parser.add_argument("--start-date", default=None, help="Fecha inicial opcional para --source sql, formato YYYY-MM-DD.")
+    parser.add_argument("--end-date", default=None, help="Fecha final opcional para --source sql, formato YYYY-MM-DD.")
     parser.add_argument("--chunk-size", type=int, default=150_000, help="Filas por bloque para CSV crudo.")
     parser.add_argument("--no-cache", action="store_true", help="Ignora cache limpio del forecast.")
     parser.add_argument("--test-weeks", type=int, default=8, help="Semanas finales usadas como test.")
@@ -136,10 +145,22 @@ def _exclude_mixed_structure_markers(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _read_clean_confirmed(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path, low_memory=False, encoding="utf-8-sig")
+    return _clean_confirmed_solids_frame(frame)
+
+
+def _clean_confirmed_solids_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if "fecha" in frame.columns:
         frame["fecha"] = pd.to_datetime(frame["fecha"], errors="coerce")
+    if "estado_canonico" in frame.columns:
+        informed = frame["estado_canonico"].fillna("").astype(str).str.strip().ne("")
+        if informed.any():
+            frame = frame[frame["estado_canonico"].astype(str).str.lower().eq("confirmado")].copy()
     if "tipo_pedido_operativo" in frame.columns:
         frame = frame[frame["tipo_pedido_operativo"].astype(str).str.upper().eq("SOLIDO")].copy()
+    if "tallos_analisis" in frame.columns:
+        frame = frame[pd.to_numeric(frame["tallos_analisis"], errors="coerce").fillna(0).gt(0)].copy()
+    keep = [col for col in SOLID_COLS if col in frame.columns]
+    frame = frame[keep].copy() if keep else frame
     return _exclude_mixed_structure_markers(frame)
 
 
@@ -154,7 +175,7 @@ def _load_raw_solids(
     """Limpia la fuente cruda por bloques y conserva solo SOLIDO confirmado.
 
     El cache pertenece exclusivamente al forecast para evitar forzar al
-    descriptivo o a clusters a usar toda la historia durante sus pruebas.
+    descriptivo a usar toda la historia durante sus pruebas.
     """
     cache = _forecast_cache_path(source, output, tipo_reference_path)
     if use_cache and cache.exists():
@@ -216,7 +237,13 @@ if __name__ == "__main__":
     output.mkdir(parents=True, exist_ok=True)
 
     print("Iniciando forecast historico de solidos LGF...", flush=True)
-    if args.historico_limpio:
+    if args.source == "sql":
+        print("- Fuente: op_sales.fact_sales_line", flush=True)
+        print(f"- Rango SQL: {args.start_date or 'inicio'} a {args.end_date or 'fin'}", flush=True)
+        historico = _clean_confirmed_solids_frame(read_op_sales_fact(args.start_date, args.end_date))
+        source_path = None
+        source_note = "op_sales.fact_sales_line"
+    elif args.historico_limpio:
         source_path = Path(args.historico_limpio)
         print(f"- Historico limpio informado: {source_path}", flush=True)
         historico = _read_clean_confirmed(source_path)

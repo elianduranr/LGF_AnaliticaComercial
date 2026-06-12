@@ -22,13 +22,12 @@ Este documento identifica los componentes del flujo activo. Los archivos de inve
 
 | Funcion | Descripcion | Entradas | Salidas | Donde se usa |
 |---|---|---|---|---|
-| `run_descriptive_pipeline()` | Ejecuta limpieza, filtro temporal opcional, perfiles, mixes, SKUs y estructuras. | Ruta historica, `analysis_year` o `analysis_years`, carpeta de salida. | CSV/XLSX en `resultados/descriptivos/`. | Visualizador y estructuras; entrada para clusters. |
+| `run_descriptive_pipeline()` | Ejecuta limpieza, filtro temporal opcional, perfiles, mixes, SKUs y estructuras. | Ruta historica, `analysis_year` o `analysis_years`, carpeta de salida. | CSV/XLSX en `resultados/descriptivos/`. | Visualizador y estructuras. |
 | `_load_or_clean_historical()` | Reutiliza cache de limpieza para evitar reprocesar la base cruda. | DataFrame crudo/ruta/cache. | Ordenes limpias. | Interno del descriptivo. |
 | `build_operational_structure_tables()` | Resume la orden regular por cliente, semana y version de estructura; conserva repeticiones y composicion sin materializar cada linea historica repetida. | Historico confirmado limpio. | `estructura_caja.csv`, `estructura_componentes.csv`, `catalogo_estructura_version.csv`. | Pestana Estructuras y componentes. |
 
 **Outputs importantes:** `historico_confirmado.csv`, `historico_visualizador_comercial.csv`, `perfil_cliente.csv`, `ventas_semana_cliente_producto.csv`, `estructura_caja.csv`, `estructura_componentes.csv`.
-`historico_confirmado.csv` preserva `pais`, requerido para clasificar los cinco
-mercados antes de entrenar clusters.
+`historico_confirmado.csv` preserva `pais` para lectura comercial y forecast.
 `historico_visualizador_comercial.csv` agrega las lineas con valor monetario
 aunque no transporten tallos; se usa solo para ventas y precio promedio en el
 visualizador cuando factura y composicion fisica vienen en lineas distintas.
@@ -36,25 +35,14 @@ visualizador cuando factura y composicion fisica vienen en lineas distintas.
 para el dashboard: cada fila resume una estructura/version observada en una
 semana y sus contadores preservan la cantidad real de pedidos representados.
 
-## Generacion De Clusters
+## Modulo De Clusters Archivado
 
-**Ejecutor:** `run_clusters.py`  
-**Modulo:** `src/lgf_operativo/clustering.py`
+El modulo de clusters queda fuera del flujo master actual. Su codigo,
+notebooks, informe y resultados historicos estan archivados en
+`pruebas antiguas/cluster_archivado_2026-06-09/`.
 
-| Funcion / Clase | Descripcion | Entradas | Salidas | Donde se usa |
-|---|---|---|---|---|
-| `ClusterConfig` | Parametros de k, pesos de bloques y evaluacion. | Configuracion opcional. | Configuracion inmutable. | Pipeline clusters. |
-| `classify_market()` | Separa los cinco mercados definidos por negocio. | Pais. | Mercado. | Clusters y forecast. |
-| `build_client_clustering_dataset()` | Crea atributos por cliente: constancia, volumen, composicion, formato y cumplimiento; agrega ventas, tendencia reciente, participacion de mercado y complejidad para lectura ejecutiva. | Historico confirmado con `pais` y perfil. | Base modelable y descriptiva por cliente. | Modelos cluster/Dash. |
-| `run_cluster_pipeline()` | Evalua K-medias, K-modas y jerarquico dentro de cada mercado; genera explicaciones y similares. | Historico descriptivo filtrado al `--year` requerido por el ejecutor. | CSV/XLSX en `resultados/clusters/<ano>/`. | Pestaña Clusters. |
 
-**Ventana temporal:** `run_clusters.py` exige `--year`. Filtra
-`historico_confirmado.csv` al ano seleccionado y recalcula el perfil sobre ese
-mismo ano, aunque descriptivos contenga toda la historia. Además exporta
-`cluster_periodo_analisis.csv` para auditoria. El Dash descubre las carpetas
-anuales y el filtro `Ano de cluster` cambia el conjunto de resultados cargado.
-Las variables comerciales agregadas se muestran como caracterizacion y no
-alteran los pesos actuales del modelo de segmentacion.
+ 
 
 ## Visualizador General De Clientes
 
@@ -62,7 +50,7 @@ alteran los pesos actuales del modelo de segmentacion.
 
 | Funcion | Descripcion | Entradas | Salidas |
 |---|---|---|---|
-| `load_data()` | Lee separadamente descriptivos, clusters y forecast. | Tres carpetas de resultados. | Diccionario de DataFrames. |
+| `load_data()` | Lee separadamente descriptivos y forecast. | Carpetas de resultados. | Diccionario de DataFrames. |
 | `render_visualizador_clientes_general()` | Presenta historico, ventas, SKUs y composicion del cliente. | Filtros de cliente, producto, color, periodo y metricas. | Componentes Dash. |
 | `filter_visual_operational_base()` | Aplica filtros operativos del visualizador. | Historico y selecciones. | Base filtrada. |
 
@@ -138,14 +126,12 @@ a modelos independientes.
 |---|---|
 | `build_app()` | Construye layout, pestañas y callbacks con carpetas modulares. |
 | `render_ventas_generales_tab()` | Presenta el control comercial rapido desde el agregado semanal de ventas. |
-| `render_clusters_tab()` | Prioriza resumen ejecutivo, diferencias contra el mercado, clientes representativos/similares y acciones; conserva el detalle metodologico en una seccion avanzada. |
 | `render_forecast_solidos_tab()` | Organiza alcance, proyeccion, historia comparativa, validacion, escenario y explicabilidad; visualiza horizonte futuro filtrable y validacion retrospectiva de 2, 5 u 8 semanas. |
 | `render_reserved_module()` | Mantiene pestañas de inventario creadas, sin activar analisis no disponible. |
 
 Argumentos:
 
 - `--data-dir`: resultados descriptivos.
-- `--clusters-dir`: resultados de clusters.
 - `--forecast-dir`: resultados de forecast solidos.
 
 ## Utilidades

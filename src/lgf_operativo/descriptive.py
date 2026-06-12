@@ -1,7 +1,7 @@
 """Pipeline descriptivo que prepara perfiles, estructuras y tablas del Dash.
 
 El resultado de este modulo alimenta el visualizador general, la vista de
-orden regular y constituye la entrada controlada para entrenar clusters.
+orden regular y constituye la entrada controlada para analisis operativos.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from .pipeline import PipelineProgress
 
 DESCRIPTIVE_DASH_COLUMNS = {
     "pedidos_limpios_todos_estados": [
-        "fecha", "cod_cliente", "cliente", "pais", "pedido", "estado_canonico", "estado_categoria",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "estado_canonico", "estado_categoria",
         "tipo_pedido_operativo", "origen_tipologia_operativa", "producto", "variedad", "color", "grado", "tipo_caja",
         "tallos_x_ramo", "capuchon", "comida", "empaque", "tallos_analisis",
         "tallos_total", "tallos_confirmados", "faltante_tallos", "ventas_usd",
@@ -42,7 +42,7 @@ DESCRIPTIVE_DASH_COLUMNS = {
         "tallos_componente_caja", "tallos_programa_caja", "tallos_componentes_caja", "ramos_programa_caja_inferidos", "tallos_programa_ramo",
     ],
     "historico_confirmado": [
-        "fecha", "cod_cliente", "cliente", "pais", "pedido", "tipo_pedido_operativo", "origen_tipologia_operativa",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "tipo_pedido_operativo", "origen_tipologia_operativa",
         "familia_analisis_operativa", "enfoque_analisis_operativo", "rol_color_operativo",
         "producto", "variedad", "color", "grado", "tipo_caja", "tallos_x_ramo",
         "capuchon", "comida", "empaque", "tallos_analisis", "tallos_total",
@@ -55,19 +55,19 @@ DESCRIPTIVE_DASH_COLUMNS = {
         "anio", "semana_iso", "anio_semana", "mes_num",
     ],
     "ordenes_pendientes_reales": [
-        "fecha", "cod_cliente", "cliente", "pais", "pedido", "tipo_pedido_operativo", "producto",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "tipo_pedido_operativo", "producto",
         "variedad", "color", "grado", "tipo_caja", "tallos_x_ramo", "tallos_analisis",
         "tallos_confirmados", "faltante_tallos", "sku_terminado", "sku_flexible",
         "llave_analisis_operativo", "color_componente_key", "receta_estructura_key", "receta_programa_key", "receta_programa_tamano_key",
     ],
     "estimados_comerciales_en_proceso": [
-        "fecha", "cod_cliente", "cliente", "pais", "pedido", "tipo_pedido_operativo", "producto",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "tipo_pedido_operativo", "producto",
         "variedad", "color", "grado", "tipo_caja", "tallos_x_ramo", "tallos_analisis",
         "tallos_confirmados", "faltante_tallos", "sku_terminado", "sku_flexible",
         "llave_analisis_operativo", "color_componente_key", "receta_estructura_key", "receta_programa_key", "receta_programa_tamano_key",
     ],
     "cambios_por_verificar_reproceso": [
-        "fecha", "cod_cliente", "cliente", "pais", "pedido", "tipo_pedido_operativo", "producto",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "tipo_pedido_operativo", "producto",
         "variedad", "color", "grado", "tipo_caja", "tallos_x_ramo", "tallos_analisis",
         "tallos_confirmados", "faltante_tallos", "sku_terminado", "sku_flexible",
         "llave_analisis_operativo", "color_componente_key", "receta_estructura_key", "receta_programa_key", "receta_programa_tamano_key",
@@ -90,7 +90,7 @@ def _clean_cache_paths(
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "sheet": historical_sheet,
-        "version": 8,
+        "version": 11,
         "tipo_reference": str(reference.resolve()).lower() if reference and reference.exists() else "",
         "tipo_reference_size": reference_stat.st_size if reference_stat else 0,
         "tipo_reference_mtime_ns": reference_stat.st_mtime_ns if reference_stat else 0,
@@ -125,7 +125,7 @@ def _load_or_clean_historical(
 
 
 def run_descriptive_pipeline(
-    historical_path: str | Path,
+    historical_path: str | Path | pd.DataFrame,
     output_dir: str | Path = Path("resultados") / "descriptivos",
     historical_sheet: str | None = None,
     show_progress: bool = True,
@@ -138,7 +138,7 @@ def run_descriptive_pipeline(
 ) -> dict[str, pd.DataFrame]:
     """Build only descriptive outputs for client/product analysis.
 
-    This intentionally excludes clustering, similarity, forecast and inventory.
+    This intentionally excludes forecast and inventory.
     Use it when the work is focused on understanding historical client behavior
     and improving the descriptive dashboard.
 
@@ -172,9 +172,9 @@ def run_descriptive_pipeline(
         ("Mixes generales", 5),
         ("Estructuras repetidas", 4),
         ("Semana tipica", 4),
+        ("Estructuras caja/componentes", 5),
         ("SKU operativo resumen", 5),
         ("SKU operativo composicion", 5),
-        ("Estructuras caja/componentes", 5),
         ("Cliente semana SKU operativo", 5),
         ("Agregados ventas visualizador", 4),
         ("Estados no confirmados", 2),
@@ -182,16 +182,25 @@ def run_descriptive_pipeline(
     ])
 
     progress.start("Resolver rutas", 1)
-    hist_path = resolve_path(historical_path)
-    if hist_path is None or not hist_path.exists():
-        raise FileNotFoundError(f"No encontre el historico: {historical_path}")
-    progress.finish(str(hist_path))
-
-    cache_path, _ = _clean_cache_paths(hist_path, output_dir, historical_sheet, tipo_reference_path)
-    cache_ready = use_cache and cache_path.exists()
+    raw_source_is_frame = isinstance(historical_path, pd.DataFrame)
+    if raw_source_is_frame:
+        hist_path = None
+        progress.finish("DataFrame en memoria")
+        cache_ready = False
+        cache_path = None
+    else:
+        hist_path = resolve_path(historical_path)
+        if hist_path is None or not hist_path.exists():
+            raise FileNotFoundError(f"No encontre el historico: {historical_path}")
+        progress.finish(str(hist_path))
+        cache_path, _ = _clean_cache_paths(hist_path, output_dir, historical_sheet, tipo_reference_path)
+        cache_ready = use_cache and cache_path.exists()
 
     progress.start("Leer historico", 12)
-    if cache_ready:
+    if raw_source_is_frame:
+        raw_hist = historical_path.copy()
+        progress.finish(f"{raw_hist.shape[0]:,} filas x {raw_hist.shape[1]:,} columnas desde SQL")
+    elif cache_ready:
         raw_hist = pd.DataFrame()
         progress.finish(f"saltado; cache limpio disponible en {cache_path}")
     else:
@@ -199,9 +208,32 @@ def run_descriptive_pipeline(
         progress.finish(f"{raw_hist.shape[0]:,} filas x {raw_hist.shape[1]:,} columnas")
 
     progress.start("Limpiar y clasificar pedidos", 18)
-    pedidos_all = _load_or_clean_historical(
-        raw_hist, hist_path, output_dir, historical_sheet, tipo_reference_path, use_cache, progress
-    )
+    cleaned_markers = {
+        "estado_canonico",
+        "sku_operativo",
+        "sku_composicion",
+        "tallos_analisis",
+        "receta_programa_tamano_key",
+    }
+    if raw_source_is_frame and cleaned_markers.issubset(raw_hist.columns):
+        pedidos_all = raw_hist.copy()
+        pedidos_all["fecha"] = pd.to_datetime(pedidos_all["fecha"], errors="coerce")
+        iso = pedidos_all["fecha"].dt.isocalendar()
+        if "anio" not in pedidos_all.columns:
+            pedidos_all["anio"] = iso.year.astype(int)
+        if "semana_iso" not in pedidos_all.columns:
+            pedidos_all["semana_iso"] = iso.week.astype(int)
+        if "anio_semana" not in pedidos_all.columns:
+            pedidos_all["anio_semana"] = pedidos_all["anio"].astype(int) * 100 + pedidos_all["semana_iso"].astype(int)
+        if "mes_num" not in pedidos_all.columns:
+            pedidos_all["mes_num"] = pedidos_all["fecha"].dt.month.astype(int)
+    elif raw_source_is_frame:
+        tipo_reference = load_tipo_pedido_reference(tipo_reference_path)
+        pedidos_all = clean_historical_orders(raw_hist, tipo_reference=tipo_reference)
+    else:
+        pedidos_all = _load_or_clean_historical(
+            raw_hist, hist_path, output_dir, historical_sheet, tipo_reference_path, use_cache, progress
+        )
     progress.finish(f"{pedidos_all.shape[0]:,} filas limpias")
 
     if selected_years:
@@ -243,14 +275,6 @@ def run_descriptive_pipeline(
     semana_tipica = build_typical_week(historico_confirmado)
     progress.finish(f"{semana_tipica.shape[0]:,} filas x {semana_tipica.shape[1]:,} columnas")
 
-    progress.start("SKU operativo resumen", 5)
-    sku_operativo_resumen = build_operational_sku_summary(historico_confirmado)
-    progress.finish(f"{sku_operativo_resumen.shape[0]:,} filas x {sku_operativo_resumen.shape[1]:,} columnas")
-
-    progress.start("SKU operativo composicion", 5)
-    sku_operativo_composicion = build_operational_sku_composition(historico_confirmado)
-    progress.finish(f"{sku_operativo_composicion.shape[0]:,} filas x {sku_operativo_composicion.shape[1]:,} columnas")
-
     progress.start("Estructuras caja/componentes", 5)
     estructura_tables = build_operational_structure_tables(historico_confirmado)
     progress.finish(
@@ -258,6 +282,14 @@ def run_descriptive_pipeline(
         f"componentes {estructura_tables['estructura_componentes'].shape[0]:,}, "
         f"versiones {estructura_tables['catalogo_estructura_version'].shape[0]:,}"
     )
+
+    progress.start("SKU operativo resumen", 5)
+    sku_operativo_resumen = build_operational_sku_summary(historico_confirmado, structure_tables=estructura_tables)
+    progress.finish(f"{sku_operativo_resumen.shape[0]:,} filas x {sku_operativo_resumen.shape[1]:,} columnas")
+
+    progress.start("SKU operativo composicion", 5)
+    sku_operativo_composicion = build_operational_sku_composition(historico_confirmado, structure_tables=estructura_tables)
+    progress.finish(f"{sku_operativo_composicion.shape[0]:,} filas x {sku_operativo_composicion.shape[1]:,} columnas")
 
     progress.start("Cliente semana SKU operativo", 5)
     cliente_semana_sku_operativo = build_client_week_operational_sku(historico_confirmado)

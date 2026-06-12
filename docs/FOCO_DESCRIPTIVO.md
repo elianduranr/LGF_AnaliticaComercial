@@ -18,7 +18,6 @@ Este documento define el alcance inmediato para no complejizar todo al mismo tie
 - Reentrenar forecast.
 - Redisenar modelo estacional.
 - Cambiar logica de inventario.
-- Rehacer clusters.
 - Meter acciones de compra dentro del descriptivo.
 
 ## Preguntas que debe responder el descriptivo

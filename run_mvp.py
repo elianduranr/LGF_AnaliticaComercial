@@ -1,8 +1,7 @@
 """Ejecutor legado del MVP con inventario.
 
 Se conserva para referencia y futuras fases de inventario. El flujo activo
-actual usa ``run_descriptivos.py``, ``run_clusters.py`` y
-``run_forecast_solidos.py`` por separado.
+actual usa ``run_descriptivos.py`` y ``run_forecast_solidos.py`` por separado.
 """
 
 from __future__ import annotations

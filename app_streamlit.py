@@ -79,7 +79,7 @@ if run:
         c3.metric("Líneas demanda futura", f"{len(demanda):,}" if not demanda.empty else "0")
         c4.metric("Líneas cruce inventario", f"{len(cruce):,}" if not cruce.empty else "0")
 
-        tabs = st.tabs(["Estados", "Perfil clientes", "Demanda futura", "Comparación modelos", "Cruce inventario", "Similares", "Descargas"])
+        tabs = st.tabs(["Estados", "Perfil clientes", "Demanda futura", "Comparación modelos", "Cruce inventario", "Descargas"])
 
         with tabs[0]:
             st.subheader("Resumen por estado")
@@ -126,10 +126,6 @@ if run:
                 st.plotly_chart(fig, use_container_width=True)
 
         with tabs[5]:
-            st.subheader("Clientes similares")
-            st.dataframe(outputs.get("clientes_similares", pd.DataFrame()), use_container_width=True, height=420)
-
-        with tabs[6]:
             excel_path = out_dir / "LGF_MVP_Caracterizacion_Forecast.xlsx"
             with open(excel_path, "rb") as f:
                 st.download_button(

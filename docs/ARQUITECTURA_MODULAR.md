@@ -5,7 +5,7 @@
 > `../README_EJECUCION.md` y `../README_FUNCIONES.md`. Las rutas
 > `outputs_*` de este documento registran iteraciones anteriores.
 
-Este proyecto debe evolucionar por modulos separados. La regla de trabajo es no mezclar descriptivos, modelos, clusters, forecast e inventario en una sola iteracion.
+Este proyecto debe evolucionar por modulos separados. La regla de trabajo es no mezclar descriptivos, modelos, forecast e inventario en una sola iteracion.
 
 ## Objetivo inmediato
 
@@ -18,7 +18,7 @@ El foco actual queda en la parte descriptiva:
 - mejorar el tablero tipo Power BI;
 - optimizar consultas para no depender del historico completo en cada callback.
 
-Clusters, forecast, compra e inventario quedan como modulos separados y se tocan despues.
+Forecast, compra e inventario quedan como modulos separados y se tocan despues.
 
 ## Capas del proyecto
 
@@ -31,7 +31,7 @@ Archivos actuales:
 - `src/lgf_operativo/cleaning.py`
 - `src/lgf_operativo/io_utils.py`
 
-No debe contener logica visual, forecast ni cluster.
+No debe contener logica visual ni forecast.
 
 ### 2. Descriptivos
 
@@ -63,40 +63,7 @@ Outputs principales:
 
 Este es el modulo prioritario.
 
-### 3. Clusters y similares
-
-Responsabilidad: agrupar clientes y encontrar clientes parecidos.
-
-Archivos actuales:
-
-- `src/lgf_operativo/similarity.py`
-- `src/lgf_operativo/clustering.py`
-- `run_clusters.py`
-
-Outputs:
-
-- `clientes_similares.csv`
-- `clusters_clientes.csv`
-- `cluster_model_evaluation.csv`
-- `cluster_features_cliente.csv`
-- `cluster_resumen.csv`
-
-No debe bloquear el trabajo descriptivo. Si se recalcula, debe correr como paso separado.
-
-Comando recomendado para 2026:
-
-```powershell
-python run_clusters.py --input-dir "outputs_descriptivo_2026_demo" --output "outputs_clusters_2026"
-```
-
-Para abrir visualizador descriptivo y clusters en una sola instancia Dash:
-
-```powershell
-python run_clusters.py --input-dir "outputs_descriptivo_2026_demo" --output "outputs_descriptivo_2026_dash"
-python app_dash.py --data-dir "outputs_descriptivo_2026_dash" --host 127.0.0.1 --port 8054
-```
-
-### 4. Forecast / proyeccion
+### 3. Forecast / proyeccion
 
 Responsabilidad: estimar demanda futura cuando no existe pedido pendiente real.
 
@@ -182,8 +149,8 @@ Usar solo cuando el foco sea mejorar proyeccion.
 
 1. Estabilizar outputs descriptivos y dashboard descriptivo.
 2. Optimizar carga del dashboard para usar agregados.
-3. Separar pantallas: descriptivos, clusters, forecast, inventario.
-4. Mejorar clusters y similares.
+3. Separar pantallas: descriptivos, forecast, inventario.
+4. Mejorar forecast e inventario segun prioridad del negocio.
 5. Mejorar forecast.
 6. Mejorar compra e inventario.
 

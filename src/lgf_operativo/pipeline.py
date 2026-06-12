@@ -19,7 +19,6 @@ from .metrics import (
     build_typical_week,
     summarize_operational_demand,
 )
-from .similarity import compute_client_similarity, cluster_clients
 
 
 def _empty() -> pd.DataFrame:
@@ -118,7 +117,7 @@ def run_mvp_pipeline(
         ("Leer historico", 12),
         ("Limpiar historico y clasificar pedidos", 18),
         ("Separar estados", 3),
-        ("Perfil, mixes, similares y clusters", 22),
+        ("Perfil, mixes y estructuras", 22),
         ("Forecast baseline", 12),
         ("Forecast estacional", 22 if forecast_model == "seasonal_boosting" else 0),
         ("Demanda futura y estructuras", 8),
@@ -153,7 +152,7 @@ def run_mvp_pipeline(
         f"confirmado {historico_confirmado.shape[0]:,}, pendiente {splits['ordenes_pendientes_reales'].shape[0]:,}, en proceso {splits['estimados_comerciales_en_proceso'].shape[0]:,}"
     )
 
-    progress.start("Perfil, mixes, similares y clusters", 22)
+    progress.start("Perfil, mixes y estructuras", 22)
     perfil = build_client_profile(historico_confirmado)
     progress.note(f"Perfil cliente: {perfil.shape[0]:,} clientes")
     mix_tables = build_mix_tables(historico_confirmado)
@@ -163,9 +162,7 @@ def run_mvp_pipeline(
     sku_operativo_composicion = build_operational_sku_composition(historico_confirmado)
     cliente_semana_sku_operativo = build_client_week_operational_sku(historico_confirmado)
     progress.note(f"Mixes generados: {len(mix_tables):,}")
-    similares = compute_client_similarity(historico_confirmado)
-    clusters = cluster_clients(historico_confirmado, perfil)
-    progress.finish(f"similares {similares.shape[0]:,}, clusters {clusters.shape[0]:,}")
+    progress.finish(f"mixes {len(mix_tables):,}, estructuras {estructuras_repetidas.shape[0]:,}")
 
     progress.start("Forecast baseline", 12)
     forecast_hist = build_structural_forecast(
@@ -241,8 +238,6 @@ def run_mvp_pipeline(
         "cliente_sku_operativo_resumen": sku_operativo_resumen,
         "cliente_sku_operativo_composicion": sku_operativo_composicion,
         "cliente_semana_sku_operativo": cliente_semana_sku_operativo,
-        "clientes_similares": similares,
-        "clusters_clientes": clusters,
         "forecast_historico_confirmado": forecast_hist,
         "forecast_modelo_estacional": forecast_modelo_estacional,
         "forecast_pendientes_reales": forecast_pendiente,

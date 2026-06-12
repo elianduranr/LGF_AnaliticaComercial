@@ -1,6 +1,6 @@
 """Ejecutor del modulo descriptivo de clientes y SKUs operativos.
 
-Lee el historico crudo local del proyecto y genera las tablas que consumen el
+Lee por defecto `op_sales.fact_sales_line` y genera las tablas que consumen el
 visualizador general y la vista resumida de estructuras. Los filtros
 ``--year`` y ``--years`` permiten analizar una ventana seleccionada sin
 cambiar la fuente consolidada.
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from src.lgf_operativo.op_sales_sql import read_op_sales_fact
 from src.lgf_operativo.descriptive import run_descriptive_pipeline
 
 
@@ -23,6 +24,14 @@ def parse_args():
         description="LGF: pipeline solo descriptivo para clientes, productos, historicos y SKUs operativos."
     )
     parser.add_argument("--historico", default=DEFAULT_HISTORICO, help="Ruta del historico/ordenes CSV/TXT/XLSX.")
+    parser.add_argument(
+        "--source",
+        choices=["csv", "sql"],
+        default="sql",
+        help="Fuente de datos: csv usa --historico; sql lee op_sales.fact_sales_line.",
+    )
+    parser.add_argument("--start-date", default=None, help="Fecha inicial opcional para --source sql, formato YYYY-MM-DD.")
+    parser.add_argument("--end-date", default=None, help="Fecha final opcional para --source sql, formato YYYY-MM-DD.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Carpeta donde se guardan descriptivos.")
     parser.add_argument(
         "--tipo-reference",
@@ -53,16 +62,24 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     print("Iniciando pipeline descriptivo LGF...", flush=True)
-    print(f"- Historico: {args.historico}", flush=True)
+    print(f"- Fuente: {args.source}", flush=True)
+    print(f"- Historico: {args.historico if args.source == 'csv' else 'op_sales.fact_sales_line'}", flush=True)
     print(f"- Output: {args.output}", flush=True)
+    if args.source == "sql":
+        print(f"- Rango SQL: {args.start_date or 'inicio'} a {args.end_date or 'fin'}", flush=True)
     if args.year is not None:
         print(f"- Ano analisis: {args.year}", flush=True)
     elif args.years:
         print(f"- Anos analisis: {', '.join(map(str, sorted(set(args.years))))}", flush=True)
     else:
         print("- Anos analisis: toda la historia disponible", flush=True)
+    historical_source = (
+        read_op_sales_fact(args.start_date, args.end_date)
+        if args.source == "sql"
+        else args.historico
+    )
     outputs = run_descriptive_pipeline(
-        historical_path=args.historico,
+        historical_path=historical_source,
         output_dir=args.output,
         historical_sheet=args.historico_sheet,
         show_progress=not args.no_progress,

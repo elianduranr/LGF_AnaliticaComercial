@@ -1,7 +1,7 @@
 """Reglas de limpieza y normalizacion de pedidos historicos LGF.
 
 Este modulo traduce columnas crudas a nombres canonicos y aplica reglas
-operativas compartidas por descriptivos, clusters y forecast.
+operativas compartidas por descriptivos y forecast.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ CANONICAL_COLUMNS = {
     "fecha": ["FECHA", "Fecha", "fecha"],
     "cod_cliente": ["CODCUSTOM", "CodCustom", "COD_CLIENTE", "cod_cliente", "codigo_cliente"],
     "cliente": ["CLIENTE", "Cliente", "cliente"],
+    "NomCompania": ["NomCompania", "NOMCOMPANIA", "Compania", "COMPAÑIA", "COMPANIA", "compania"],
     "grupo": ["GRUPO", "Grupo", "grupo"],
     "subcliente": ["SUBCLIENTE", "Subcliente", "subcliente"],
     "tipo_venta": ["TIPOVENTA", "TipoVenta", "tipo_venta"],
@@ -400,17 +401,17 @@ def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
     enfoque_analisis[tipo.eq("BQT")] = "RECETA_BQT_ESTRUCTURA"
     enfoque_analisis[tipo.eq("BOUQUET")] = "RECETA_BOUQUET_ESTRUCTURA"
     enfoque_analisis[tipo.eq("COMBO")] = "COMBO_ESTRUCTURA_CAJA"
-    enfoque_analisis[tipo.eq("BULK")] = "BULK_PRODUCTO_COLOR"
+    enfoque_analisis[tipo.eq("BULK")] = "BULK_ESTRUCTURA_PEDIDO"
 
     rol_color = pd.Series("COLOR_REFERENCIAL", index=tmp.index, dtype="object")
     rol_color[tipo.eq("SOLIDO")] = "COLOR_DEFINITORIO_SKU"
     rol_color[tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "COLOR_COMPONENTE_ESTRUCTURA"
-    rol_color[tipo.eq("BULK")] = "COLOR_BASE_VOLUMEN"
+    rol_color[tipo.eq("BULK")] = "COLOR_COMPONENTE_ESTRUCTURA"
 
     familia_analisis = pd.Series("OTROS_FORMATOS", index=tmp.index, dtype="object")
     familia_analisis[tipo.eq("SOLIDO")] = "SOLIDOS_COLOR_CAJA"
     familia_analisis[tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "ESTRUCTURAS_MIXTAS_RECETA"
-    familia_analisis[tipo.eq("BULK")] = "BULK_COLOR_BASE"
+    familia_analisis[tipo.eq("BULK")] = "ESTRUCTURAS_MIXTAS_RECETA"
 
     return pd.DataFrame({
         "tipo_pedido_operativo": tipo,
@@ -457,7 +458,7 @@ def clean_historical_orders(
     """
     df = rename_to_canonical(df, CANONICAL_COLUMNS)
     required = [
-        "fecha", "cod_cliente", "cliente", "producto", "variedad", "color", "grado",
+        "fecha", "cod_cliente", "cliente", "NomCompania", "producto", "variedad", "color", "grado",
         "tipo_caja", "tallos_pedidos", "tallos_confirmados", "tallos_total", "tallos_x_ramo",
         "ramos_pedidos", "ramos_confirmados", "ramos_x_caja", "ramos_x_caja_detalle", "piezas", "fulles", "equivalencia",
         "tipo_empaque", "empaque", "capuchon", "comida", "pais", "ciudad",
@@ -486,7 +487,7 @@ def clean_historical_orders(
         df[col] = estado_info[col].values
 
     text_cols = [
-        "cliente", "subcliente", "grupo", "producto", "variedad", "color", "grado",
+        "cliente", "NomCompania", "subcliente", "grupo", "producto", "variedad", "color", "grado",
         "tipo_caja", "tipo_empaque", "empaque", "capuchon", "comida", "pais", "ciudad", "tipo_orden",
         "tipo_orden_empaque", "receta", "estado", "finca", "abrev_finca", "vendedor", "tipo_venta",
         "caja_id", "id_caja", "codempaque", "bulkbouquet",
@@ -497,6 +498,9 @@ def clean_historical_orders(
     for col in text_cols:
         if col in df.columns:
             df[col] = normalize_text_series(df[col])
+    if "NomCompania" in df.columns:
+        missing_company = df["NomCompania"].isin(["sin_info", "", "nan", "none"])
+        df.loc[missing_company, "NomCompania"] = df.loc[missing_company, "cliente"]
 
     # Clasificación explícita del tipo de pedido: surtido, sólido, surtido M, Rainbow, etc.
     # Sales extracts can omit the original recipe fields. Restore historical
@@ -542,6 +546,10 @@ def clean_historical_orders(
     )
     df["estructura_pedido"] = normalize_key_series(df["estructura_pedido"])
     df["producto_color"] = combine_key_columns(df, ["producto", "color"])
+    solid_tallos_ramo = df["tallos_x_ramo"].astype(str).str.strip()
+    solid_sku_operativo = df["producto_color"].astype(str) + "|" + solid_tallos_ramo + "_tallos_ramo"
+    solid_sku_operativo = solid_sku_operativo.where(~solid_tallos_ramo.isin(["", "0", "0.0", "nan", "None"]), df["producto_color"])
+    solid_sku_operativo = normalize_key_series(solid_sku_operativo)
     df["producto_variedad_color"] = (
         df["producto"].astype(str) + "|" + df["variedad"].astype(str) + "|" + df["color"].astype(str)
     )
@@ -605,6 +613,13 @@ def clean_historical_orders(
     totals["tallos_programa_ramo"] = (
         totals["tallos_programa_caja"] / totals["ramos_programa_caja_inferidos"].replace(0, np.nan)
     )
+    derived_program_cols = [
+        "tallos_programa_caja",
+        "tallos_componentes_caja",
+        "ramos_programa_caja_inferidos",
+        "tallos_programa_ramo",
+    ]
+    df = df.drop(columns=[col for col in derived_program_cols if col in df.columns])
     df = df.merge(
         totals[recipe_group + [
             "tallos_programa_caja",
@@ -640,13 +655,11 @@ def clean_historical_orders(
     df["llave_analisis_operativo"] = np.select(
         [
             df["tipo_pedido_operativo"].eq("SOLIDO"),
-            df["tipo_pedido_operativo"].isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO"]),
-            df["tipo_pedido_operativo"].eq("BULK"),
+            df["tipo_pedido_operativo"].ne("SOLIDO"),
         ],
         [
-            df["producto_color"],
-            df["receta_programa_tamano_key"].where(df["tipo_pedido_operativo"].isin(["RAINBOW", "BOUQUET", "BQT", "COMBO"]), df["receta_estructura_key"]),
-            df["producto_color"],
+            solid_sku_operativo,
+            df["receta_programa_tamano_key"].where(df["tipo_pedido_operativo"].isin(["RAINBOW", "BOUQUET", "BQT", "COMBO"]), df["sku_composicion"]),
         ],
         default=df["estructura_pedido"],
     )
@@ -654,14 +667,12 @@ def clean_historical_orders(
         [
             df["tipo_pedido_operativo"].eq("SOLIDO"),
             df["tipo_pedido_operativo"].isin(["RAINBOW", "BOUQUET", "BQT", "COMBO"]),
-            df["tipo_pedido_operativo"].isin(["SURTIDO", "SURTIDO_M"]),
-            df["tipo_pedido_operativo"].eq("BULK"),
+            df["tipo_pedido_operativo"].ne("SOLIDO"),
         ],
         [
-            df["producto_color"],
+            solid_sku_operativo,
             df["receta_programa_tamano_key"],
             df["sku_composicion"],
-            df["producto_color"],
         ],
         default=df["llave_analisis_operativo"],
     )

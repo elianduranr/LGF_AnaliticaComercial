@@ -20,8 +20,6 @@ EXCEL_SHEETS_PRIORITY = [
     "cliente_semana_sku_operativo",
     "cliente_estructuras_repetidas",
     "cliente_semana_tipica",
-    "clientes_similares",
-    "clusters_clientes",
     "demanda_operativa_futura",
     "cruce_forecast_inventario",
     "ordenes_pendientes_reales",

@@ -45,7 +45,6 @@ pip install -r requirements.txt
 El proyecto queda separado por focos para no mezclar todo en una sola iteracion:
 
 - Descriptivos: clientes, productos, historicos, precios y Cliente 360. Entrada recomendada: `run_descriptivos.py`.
-- Clusters/similares: agrupacion y parecidos de clientes por mercado. Modulos: `src/lgf_operativo/clustering.py`, `src/lgf_operativo/similarity.py` y comando `run_clusters.py`.
 - Forecast/proyeccion: demanda futura baseline o estacional. Modulos: `src/lgf_operativo/forecast.py` y `src/lgf_operativo/seasonal_model.py`.
 - Inventario/compra: cruce de demanda contra disponibilidad. Modulo: `src/lgf_operativo/inventory.py`.
 - Dashboard: solo debe leer outputs generados; no debe recalcular modelos pesados.
@@ -62,22 +61,9 @@ Para trabajar solo descriptivos:
 python run_descriptivos.py --output "outputs_descriptivo"
 ```
 
-Para trabajar solo clusters con ejemplos 2026:
-
-```powershell
-python run_clusters.py --input-dir "outputs_descriptivo_2026_demo" --output "outputs_clusters_2026"
-```
-
-Este modulo evalua K-medias, K-modas y clustering jerarquico dentro de cinco mercados definidos: Estados Unidos/Canada, The Netherlands, Polonia, Asia y Otros. La version actual pondera con mayor fuerza color, producto, tipo de pedido y constancia, y exporta variables diferenciadoras por cluster.
-
-Para abrir **todo junto** en Dash 2026, escribe los clusters dentro de la carpeta completa del dashboard y levanta Dash contra esa misma carpeta:
-
-```powershell
-python run_clusters.py --input-dir "outputs_descriptivo_2026_demo" --output "outputs_descriptivo_2026_dash"
-python app_dash.py --data-dir "outputs_descriptivo_2026_dash" --host 127.0.0.1 --port 8054
-```
-
-No uses `outputs_clusters_2026` para el visualizador general de clientes; esa carpeta sirve para revisar solo clusters.
+El modulo de clusters queda fuera del flujo master actual. Su codigo, notebooks,
+presentaciones y resultados historicos estan archivados en
+`pruebas antiguas/cluster_archivado_2026-06-09/`.
 
 La primera corrida limpia y clasifica el historico, y guarda un cache en `outputs_descriptivo/_cache`.
 Las siguientes corridas con el mismo archivo reutilizan ese cache y saltan la limpieza pesada.
@@ -189,10 +175,11 @@ El dashboard Dash usa los CSV ya generados en `outputs/`. Si cambias la carpeta 
 
 Pestañas principales del dashboard:
 
-- `Cliente 360`: estabilidad, score, mix, SKUs y clientes similares.
-- `Clusters`: exploración de clusters y segmentos; muestra qué clientes pertenecen a cada grupo.
+- `Visualizador clientes general`: historico, ventas, SKUs y composicion operativa.
+- `Ventas generales`: tallos, ventas y precio promedio ponderado.
+- `Estructuras y componentes`: orden regular y componentes por cliente.
 - `Comprador`: lista accionable de qué comprar, por prioridad, fecha, cliente, producto, variedad, color, grado y caja.
-- `Demanda e inventario`: lectura de demanda futura, historico reciente y riesgos de disponibilidad. Para pedidos `SOLIDO` permite filtrar por producto, ver las 3 semanas reales previas, y comparar contra el año anterior por mismas fechas o por mismas semanas ISO.
+- `Forecast solidos historico`: lectura historica, validacion y escenarios para pedidos `SOLIDO`.
 
 El selector de cliente es opcional. Si se deja vacío, las pestañas trabajan con todos los clientes que cumplan los filtros de segmento, recomendación y score.
 
@@ -218,7 +205,6 @@ Los graficos y tablas de esta vista incluyen `fecha_semana` y/o `semana_label` p
 - `estimados_comerciales_en_proceso.csv`: estimados comerciales.
 - `cambios_por_verificar_reproceso.csv`: cambios sobre confirmado.
 - `perfil_cliente.csv`: perfil y score por `cod_cliente` + `cliente`.
-- `clientes_similares.csv`: clientes similares con códigos.
 - `forecast_historico_confirmado.csv`: baseline basado solo en histórico confirmado, usando mediana reciente por estructura y día de semana.
 - `forecast_modelo_estacional.csv`: forecast robusto con boosting estacional. Usa histórico confirmado, recencia, país, ciudad, semana ISO, ventanas florales pico, cliente, producto/color, estructura operativa y rezagos históricos.
 - `forecast_pendientes_reales.csv`: pendientes reales convertidos al formato de demanda futura.

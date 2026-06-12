@@ -1,21 +1,31 @@
-"""Dashboard modular de analitica comercial LGF.
+﻿"""Dashboard modular de analitica comercial LGF.
 
-Consume de forma separada outputs descriptivos, clusters por mercado y
-forecast historico de solidos. Las pestañas de inventario se mantienen como
+Consume de forma separada outputs descriptivos y forecast historico de solidos.
+Las pestaÃ±as de inventario se mantienen como
 reservas funcionales hasta que exista una fuente oficial de proyeccion.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import math
+import os
+import re
+import sqlite3
+import zlib
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import dash
 from dash import Dash
+from dash import ALL
 from dash import Input
+from dash import MATCH
 from dash import Output
 from dash import State
 from dash import ctx
@@ -25,19 +35,34 @@ from dash import html
 
 
 DEFAULT_DATA_DIR = Path("resultados") / "descriptivos"
-DEFAULT_CLUSTER_DIR = Path("resultados") / "clusters"
 DEFAULT_FORECAST_DIR = Path("resultados") / "forecast_solidos"
+DEFAULT_DASHBOARD_DB = Path("resultados") / "dashboard_operativo.sqlite"
+DEFAULT_LOGO_PATH = Path("Logos") / "Logo La Gaitana-01.png"
+
+
+def resolve_logo_path() -> Path | None:
+    preferred_names = ("Logo La Gaitana-01.png", "Logo La Gaitana-02.png")
+    for folder in (Path("Logos"), Path("logos")):
+        for name in preferred_names:
+            candidate = folder / name
+            if candidate.exists():
+                return candidate
+        if folder.exists():
+            images = sorted([*folder.glob("*.png"), *folder.glob("*.jpg"), *folder.glob("*.jpeg")])
+            if images:
+                return images[0]
+    return DEFAULT_LOGO_PATH if DEFAULT_LOGO_PATH.exists() else None
 
 CORPORATE_BURGUNDY = "#800020"
 FORECAST_LINE_COLOR = "#E63946"
 SCENARIO_LINE_COLOR = "#00875A"
 REGION_COLOR_MAP = {
     "EEUU / CANADA": "#4E79A7",
-    "EEUU / CANADÁ": "#4E79A7",
+    "EEUU / CANADÃ": "#4E79A7",
     "USA": "#4E79A7",
     "UNITED STATES": "#4E79A7",
     "CANADA": "#4E79A7",
-    "CANADÁ": "#4E79A7",
+    "CANADÃ": "#4E79A7",
     "EUROPA": "#59A14F",
     "EUROPE": "#59A14F",
     "ASIA": "#F28E2B",
@@ -338,6 +363,8 @@ SKU_SUMMARY_COLS = [
     "cod_cliente", "cliente", "sku_operativo", "lectura_operativa", "tipo_pedido_operativo", "subtipo_pedido_operativo",
     "producto", "empaque", "tipo_caja", "tallos_por_ramo", "tallos_programa_caja", "tallos_componentes_caja",
     "ramos_programa_caja_inferidos", "tallos_programa_ramo", "ramos_x_caja", "fulles", "piezas", "capuchon", "comida", "receta", "caja_operativa", "codempaque", "bulkbouquet",
+    "productos_composicion", "colores_composicion", "variedades_composicion", "lineas_componentes", "composicion_versiones",
+    "composicion_firma_principal", "tallos_promedio_estructura", "ramos_estimados_comercial",
     "tallos_promedio_semana_normal", "porcentaje_semana_normal", "frecuencia_en_ventana", "pedidos_en_ventana", "instancias_en_ventana",
     "cumplimiento", "vigencia_sku", "recomendacion", "tallos_ventana", "ventas_usd_ventana",
 ]
@@ -346,6 +373,8 @@ SKU_COMPOSITION_COLS = [
     "cod_cliente", "cliente", "sku_operativo", "tipo_pedido_operativo", "producto", "color", "variedad",
     "porcentaje_composicion", "tallos_promedio_semana_normal", "ramos_promedio_semana_normal",
     "tipo_caja", "tallos_por_ramo", "capuchon", "comida", "empaque", "semanas", "estabilidad_composicion", "std_share_color",
+    "productos_composicion", "colores_composicion", "variedades_composicion", "lineas_componentes", "composicion_versiones",
+    "composicion_firma_principal",
 ]
 
 WEEK_SKU_COLS = [
@@ -360,6 +389,8 @@ SALES_VISUAL_COLS = [
     "anio_semana",
     "cod_cliente",
     "cliente",
+    "NomCompania",
+    "pais",
     "tipo_pedido_operativo",
     "producto",
     "color",
@@ -401,11 +432,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dashboard Dash de analitica comercial LGF.")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Carpeta con los CSV generados por run_descriptivos.py.")
     parser.add_argument(
-        "--clusters-dir",
-        default=str(DEFAULT_CLUSTER_DIR),
-        help="Carpeta independiente con los CSV generados por run_clusters.py.",
-    )
-    parser.add_argument(
         "--forecast-dir",
         default=str(DEFAULT_FORECAST_DIR),
         help="Carpeta independiente con los CSV generados por run_forecast_solidos.py.",
@@ -431,92 +457,159 @@ def read_csv_if_exists(path: Path, usecols: list[str] | None = None, parse_dates
 
 
 def moneyless_number(value: float | int | None, decimals: int = 0) -> str:
-    if value is None or pd.isna(value):
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value):
         return "0"
     return f"{value:,.{decimals}f}"
 
 
 def percent(value: float | int | None) -> str:
-    if value is None or pd.isna(value):
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value):
         return "0.0%"
     return f"{value * 100:,.1f}%"
+
+
+def panel_note(text: str) -> html.Div:
+    return html.Div(text, className="panel-note")
 
 
 def normalize_code(series: pd.Series) -> pd.Series:
     return series.astype(str).str.replace(r"\.0$", "", regex=True)
 
 
-def load_cluster_bundle(source_dir: Path) -> dict[str, pd.DataFrame]:
-    """Carga una corrida anual completa de clusters desde una carpeta."""
-    similares = read_csv_if_exists(source_dir / "clientes_similares.csv")
-    if not similares.empty:
-        similares["cod_cliente_base"] = normalize_code(similares["cod_cliente_base"])
-        similares["cod_cliente_similar"] = normalize_code(similares["cod_cliente_similar"])
+def valid_validation_window_starts(frame: pd.DataFrame, year: int | None, weeks: int) -> list[int]:
+    if frame.empty or year is None or "anio" not in frame.columns or "semana_iso" not in frame.columns:
+        return []
+    try:
+        year = int(year)
+        weeks = int(weeks)
+    except (TypeError, ValueError):
+        return []
+    if weeks <= 0:
+        return []
+    work = frame.copy()
+    work["anio"] = pd.to_numeric(work["anio"], errors="coerce")
+    work["semana_iso"] = pd.to_numeric(work["semana_iso"], errors="coerce")
+    work = work[work["anio"].eq(year) & work["semana_iso"].notna()]
+    if work.empty:
+        return []
+    available = set(work["semana_iso"].astype(int).unique().tolist())
+    starts = []
+    for start in sorted(available):
+        window = set(range(start, start + weeks))
+        if window.issubset(available):
+            starts.append(int(start))
+    return starts
 
-    clusters = read_csv_if_exists(source_dir / "clusters_clientes.csv")
-    if not clusters.empty:
-        clusters["cod_cliente"] = normalize_code(clusters["cod_cliente"])
-        for col in [
-            "tallos_total", "semanas_activas", "pct_semanas_activas",
-            "tallos_promedio_semana", "cv_volumen", "cumplimiento_tallos",
-            "ventas_usd_total", "ventas_usd_por_tallo", "participacion_tallos_mercado",
-            "tallos_ultimas_8_semanas", "tallos_8_semanas_previas", "variacion_reciente_vs_previa",
-            "complejidad_operativa_score",
-            "share_top3_color", "share_top5_sku", "share_top1_tipo_pedido",
-            "tallos_x_ramo_promedio", "ramos_x_caja_promedio",
-            "score_compra_terminada", "score_compra_terminada_operativo",
-            "silhouette_modelo", "calinski_modelo",
-        ]:
-            if col in clusters.columns:
-                clusters[col] = pd.to_numeric(clusters[col], errors="coerce").fillna(0)
-    features = read_csv_if_exists(source_dir / "cluster_features_cliente.csv")
-    if not features.empty:
-        features["cod_cliente"] = normalize_code(features["cod_cliente"])
-    return {
-        "similares": similares,
-        "clusters": clusters,
-        "cluster_eval": read_csv_if_exists(source_dir / "cluster_model_evaluation.csv"),
-        "cluster_resumen": read_csv_if_exists(source_dir / "cluster_resumen.csv"),
-        "cluster_features": features,
-        "cluster_diff": read_csv_if_exists(source_dir / "cluster_variables_diferenciadoras.csv"),
-        "cluster_blocks": read_csv_if_exists(source_dir / "cluster_perfil_bloques.csv"),
-        "cluster_periodo": read_csv_if_exists(source_dir / "cluster_periodo_analisis.csv", parse_dates=["fecha_min", "fecha_max"]),
+
+def read_dashboard_sql_view(db_path: Path, view_name: str) -> pd.DataFrame:
+    if not db_path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(db_path) as con:
+        try:
+            return pd.read_sql_query(f"SELECT * FROM {view_name}", con)
+        except Exception:
+            return pd.DataFrame()
+
+
+def read_op_sales_sql_table(table_name: str, params: list | None = None, where: str = "") -> pd.DataFrame:
+    if os.getenv("OP_SALES_USE_SQL_SERVER", "0").strip().lower() not in {"1", "true", "yes", "si"}:
+        return pd.DataFrame()
+    allowed = {
+        "op_sales.agg_sales_week_client_product",
+        "op_sales.agg_client_sku_week",
+        "op_sales.result_descriptivo_perfil_cliente",
+        "op_sales.result_descriptivo_serie_cliente_semana",
+        "op_sales.result_descriptivo_mix_producto",
+        "op_sales.result_descriptivo_mix_color",
+        "op_sales.result_descriptivo_mix_tipo_pedido",
+        "op_sales.result_descriptivo_mix_sku_terminado",
+        "op_sales.result_descriptivo_mix_analisis_operativo",
+        "op_sales.result_descriptivo_mix_color_rol",
+        "op_sales.result_descriptivo_estado_resumen",
+        "op_sales.result_descriptivo_cliente_estructuras_repetidas",
+        "op_sales.result_descriptivo_cliente_semana_tipica",
+        "op_sales.result_descriptivo_cliente_sku_operativo_resumen",
+        "op_sales.result_descriptivo_cliente_sku_operativo_composicion",
+        "op_sales.result_descriptivo_cliente_semana_sku_operativo",
+        "op_sales.result_descriptivo_ventas_producto_periodo",
+        "op_sales.result_descriptivo_ventas_cliente_periodo",
+        "op_sales.result_descriptivo_ventas_caja_periodo",
+        "op_sales.result_descriptivo_estructura_caja",
+        "op_sales.result_descriptivo_estructura_componentes",
+        "op_sales.result_descriptivo_catalogo_estructura_version",
+        "op_sales.result_forecast_solid_forecast_fuente_datos",
+        "op_sales.result_forecast_solid_forecast_model_evaluation",
+        "op_sales.result_forecast_solid_forecast_feature_importance",
+        "op_sales.result_forecast_solid_forecast_market_feature_importance",
+        "op_sales.result_forecast_solid_forecast_market_calibration",
+        "op_sales.result_forecast_solid_forecast_predictors",
+        "op_sales.result_forecast_solid_forecast_weekly_demand",
+        "op_sales.result_forecast_solid_forecast_test_predictions",
+        "op_sales.result_forecast_solid_forecast_historical_validation",
+        "op_sales.result_forecast_solid_forecast_future",
+        "op_sales.result_forecast_solid_forecast_error_by_market",
     }
+    if table_name not in allowed:
+        return pd.DataFrame()
+    try:
+        from src.lgf_operativo.op_sales_sql import get_connection
+
+        with get_connection() as con:
+            return pd.read_sql_query(f"SELECT * FROM {table_name}{where}", con, params=params or [])
+    except Exception:
+        return pd.DataFrame()
 
 
-def discover_cluster_bundles(cluster_root: Path) -> tuple[dict[str, dict[str, pd.DataFrame]], str | None]:
-    """Descubre corridas `clusters/<anio>/`; admite una corrida plana legado."""
-    bundles: dict[str, dict[str, pd.DataFrame]] = {}
-    if cluster_root.exists():
-        for path in sorted(cluster_root.iterdir()):
-            if path.is_dir() and path.name.isdigit() and (path / "clusters_clientes.csv").exists():
-                bundles[path.name] = load_cluster_bundle(path)
-        if not bundles and (cluster_root / "clusters_clientes.csv").exists():
-            flat = load_cluster_bundle(cluster_root)
-            periodo = flat.get("cluster_periodo", pd.DataFrame())
-            year = (
-                str(int(periodo.iloc[0]["anio_cluster"]))
-                if not periodo.empty and "anio_cluster" in periodo.columns
-                else "Corrida vigente"
-            )
-            bundles[year] = flat
-    default_year = sorted(bundles, key=lambda value: int(value) if value.isdigit() else -1)[-1] if bundles else None
-    return bundles, default_year
+def read_result_or_csv(
+    sql_table: str,
+    path: Path,
+    usecols: list[str] | None = None,
+    parse_dates: list[str] | None = None,
+) -> pd.DataFrame:
+    frame = read_op_sales_sql_table(sql_table)
+    if frame.empty:
+        frame = read_csv_if_exists(path, usecols, parse_dates)
+    elif usecols:
+        frame = frame[[col for col in usecols if col in frame.columns]].copy()
+    if not frame.empty and parse_dates:
+        for col in parse_dates:
+            if col in frame.columns:
+                frame[col] = pd.to_datetime(frame[col], errors="coerce")
+    return frame
+
+
+def read_client_sku_week_from_sql(client_code: str | None) -> pd.DataFrame:
+    if not client_code:
+        return pd.DataFrame()
+    frame = read_op_sales_sql_table(
+        "op_sales.agg_client_sku_week",
+        params=[str(client_code)],
+        where=" WHERE cod_cliente = ?",
+    )
+    if frame.empty:
+        return frame
+    frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
+    if "fecha" in frame.columns:
+        frame["fecha"] = pd.to_datetime(frame["fecha"], errors="coerce")
+    for col in ["tallos_confirmados", "tallos_pedidos", "tallos_historicos", "ventas_usd", "valor_total_original"]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
+    return frame
 
 
 def load_data(
     data_dir: Path,
     forecast_dir: Path | None = None,
-    clusters_dir: Path | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Carga outputs independientes para construir las vistas del dashboard.
 
-    ``data_dir`` contiene descriptivos, ``clusters_dir`` contiene la
-    segmentacion de clientes y ``forecast_dir`` contiene solo el forecast de
-    solidos. Si no existe una carpeta separada de clusters se admite la
-    carpeta descriptiva por compatibilidad con corridas antiguas.
+    ``data_dir`` contiene descriptivos y ``forecast_dir`` contiene solo el
+    forecast de solidos.
     """
-    perfil = read_csv_if_exists(data_dir / "perfil_cliente.csv", PROFILE_COLS)
+    eager_results = os.getenv("OP_SALES_EAGER_RESULTS", "0").strip().lower() in {"1", "true", "yes", "si"}
+    perfil = read_result_or_csv("op_sales.result_descriptivo_perfil_cliente", data_dir / "perfil_cliente.csv", PROFILE_COLS)
     if not perfil.empty:
         perfil["cod_cliente"] = normalize_code(perfil["cod_cliente"])
         if "ultima_fecha_confirmada" in perfil.columns:
@@ -525,7 +618,7 @@ def load_data(
             perfil["dias_desde_ultima_compra"] = (perfil["ultima_fecha_confirmada"].max() - perfil["ultima_fecha_confirmada"]).dt.days
         perfil = perfil.sort_values(["score_compra_terminada", "tallos_total"], ascending=False)
 
-    serie = read_csv_if_exists(data_dir / "serie_cliente_semana.csv", SERIE_COLS)
+    serie = read_result_or_csv("op_sales.result_descriptivo_serie_cliente_semana", data_dir / "serie_cliente_semana.csv", SERIE_COLS)
     if not serie.empty:
         serie["cod_cliente"] = normalize_code(serie["cod_cliente"])
         serie["semana_orden"] = serie["anio"].astype(int) * 100 + serie["semana_iso"].astype(int)
@@ -559,13 +652,15 @@ def load_data(
             drop_cols = [col for col in recency.columns if col in perfil.columns and col not in ["cod_cliente", "cliente"]]
             perfil = perfil.drop(columns=drop_cols).merge(recency, on=["cod_cliente", "cliente"], how="left")
 
-    mix_producto = read_csv_if_exists(data_dir / "mix_producto.csv", MIX_COMMON_COLS + ["producto"])
-    mix_color = read_csv_if_exists(data_dir / "mix_color.csv", MIX_COMMON_COLS + ["color"])
-    mix_tipo = read_csv_if_exists(
+    mix_producto = read_result_or_csv("op_sales.result_descriptivo_mix_producto", data_dir / "mix_producto.csv", MIX_COMMON_COLS + ["producto"]) if eager_results else pd.DataFrame()
+    mix_color = read_result_or_csv("op_sales.result_descriptivo_mix_color", data_dir / "mix_color.csv", MIX_COMMON_COLS + ["color"]) if eager_results else pd.DataFrame()
+    mix_tipo = read_result_or_csv(
+        "op_sales.result_descriptivo_mix_tipo_pedido",
         data_dir / "mix_tipo_pedido.csv",
         MIX_COMMON_COLS + ["tipo_pedido_operativo", "subtipo_pedido_operativo", "tipo_empaque", "receta"],
-    )
-    mix_sku = read_csv_if_exists(
+    ) if eager_results else pd.DataFrame()
+    mix_sku = read_result_or_csv(
+        "op_sales.result_descriptivo_mix_sku_terminado",
         data_dir / "mix_sku_terminado.csv",
         MIX_COMMON_COLS
         + [
@@ -582,8 +677,9 @@ def load_data(
             "tallos_x_ramo",
             "llave_analisis_operativo",
         ],
-    )
-    mix_analisis = read_csv_if_exists(
+    ) if eager_results else pd.DataFrame()
+    mix_analisis = read_result_or_csv(
+        "op_sales.result_descriptivo_mix_analisis_operativo",
         data_dir / "mix_analisis_operativo.csv",
         MIX_COMMON_COLS
         + [
@@ -597,25 +693,15 @@ def load_data(
             "tipo_caja",
             "receta",
         ],
-    )
-    mix_color_rol = read_csv_if_exists(
+    ) if eager_results else pd.DataFrame()
+    mix_color_rol = read_result_or_csv(
+        "op_sales.result_descriptivo_mix_color_rol",
         data_dir / "mix_color_rol.csv",
         MIX_COMMON_COLS + ["familia_analisis_operativa", "rol_color_operativo", "tipo_pedido_operativo", "producto", "color"],
-    )
+    ) if eager_results else pd.DataFrame()
     for frame in [mix_producto, mix_color, mix_tipo, mix_sku, mix_analisis, mix_color_rol]:
         if not frame.empty:
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
-
-    cluster_source_dir = clusters_dir if clusters_dir and clusters_dir.exists() else data_dir
-    cluster_bundles, cluster_default_year = discover_cluster_bundles(cluster_source_dir)
-    active_cluster_bundle = cluster_bundles.get(cluster_default_year, {})
-    similares = active_cluster_bundle.get("similares", pd.DataFrame())
-    clusters = active_cluster_bundle.get("clusters", pd.DataFrame())
-    cluster_eval = active_cluster_bundle.get("cluster_eval", pd.DataFrame())
-    cluster_resumen = active_cluster_bundle.get("cluster_resumen", pd.DataFrame())
-    cluster_features = active_cluster_bundle.get("cluster_features", pd.DataFrame())
-    cluster_diff = active_cluster_bundle.get("cluster_diff", pd.DataFrame())
-    cluster_blocks = active_cluster_bundle.get("cluster_blocks", pd.DataFrame())
 
     demanda = read_csv_if_exists(data_dir / "demanda_operativa_futura.csv", DEMAND_COLS, ["fecha_forecast"])
     if not demanda.empty:
@@ -642,20 +728,18 @@ def load_data(
         inventario_color = inventario_color.rename(columns={"fecha": "fecha_forecast"})
         inventario_color = add_week_columns(inventario_color, "fecha_forecast")
 
-    historico_confirmado = read_csv_if_exists(data_dir / "historico_confirmado.csv", HISTORICO_SOLIDOS_COLS, ["fecha"])
-    historico_visualizador_comercial = read_csv_if_exists(
-        data_dir / "historico_visualizador_comercial.csv", HISTORICO_SOLIDOS_COLS, ["fecha"]
-    )
-    if historico_visualizador_comercial.empty:
-        historico_visualizador_comercial = historico_confirmado.copy()
+    dashboard_db = DEFAULT_DASHBOARD_DB
+    historico_visualizador_comercial = pd.DataFrame()
+    historico_confirmado = pd.DataFrame()
     for history_frame in [historico_confirmado, historico_visualizador_comercial]:
         if history_frame.empty:
             continue
         history_frame["cod_cliente"] = normalize_code(history_frame["cod_cliente"])
-        history_frame["tallos_historicos"] = pd.to_numeric(
-            history_frame.get("tallos_analisis", history_frame.get("tallos_total", 0)),
-            errors="coerce",
-        ).fillna(0)
+        tallos_source = history_frame.get(
+            "tallos_analisis",
+            history_frame.get("tallos_total", history_frame.get("tallos_confirmados", pd.Series(0, index=history_frame.index))),
+        )
+        history_frame["tallos_historicos"] = pd.to_numeric(tallos_source, errors="coerce").fillna(0)
         if "ventas_usd" not in history_frame.columns:
             history_frame["ventas_usd"] = 0.0
         history_frame["ventas_usd"] = pd.to_numeric(history_frame["ventas_usd"], errors="coerce").fillna(0)
@@ -664,28 +748,29 @@ def load_data(
                 history_frame[col] = pd.to_numeric(history_frame[col], errors="coerce").fillna(0)
         if "NomMoneda" not in history_frame.columns:
             history_frame["NomMoneda"] = "SIN_MONEDA"
-        enriched = add_week_columns(history_frame, "fecha")
-        history_frame[enriched.columns] = enriched
+        if "fecha" in history_frame.columns:
+            enriched = add_week_columns(history_frame, "fecha")
+            history_frame[enriched.columns] = enriched
     historico_solidos = historico_confirmado.copy()
     if not historico_solidos.empty:
         historico_solidos = historico_solidos[
             historico_solidos["tipo_pedido_operativo"].astype(str).str.upper().eq("SOLIDO")
         ].copy()
 
-    estado = read_csv_if_exists(data_dir / "estado_resumen.csv")
+    estado = read_result_or_csv("op_sales.result_descriptivo_estado_resumen", data_dir / "estado_resumen.csv")
 
     forecast_dir = forecast_dir or DEFAULT_FORECAST_DIR
-    solid_forecast_source = read_csv_if_exists(forecast_dir / "solid_forecast_fuente_datos.csv", parse_dates=["fecha_min", "fecha_max"])
-    solid_forecast_eval = read_csv_if_exists(forecast_dir / "solid_forecast_model_evaluation.csv")
-    solid_forecast_importance = read_csv_if_exists(forecast_dir / "solid_forecast_feature_importance.csv")
-    solid_forecast_market_importance = read_csv_if_exists(forecast_dir / "solid_forecast_market_feature_importance.csv")
-    solid_forecast_market_calibration = read_csv_if_exists(forecast_dir / "solid_forecast_market_calibration.csv")
-    solid_forecast_predictors = read_csv_if_exists(forecast_dir / "solid_forecast_predictors.csv")
-    solid_forecast_weekly = read_csv_if_exists(forecast_dir / "solid_forecast_weekly_demand.csv", parse_dates=["week_start"])
-    solid_forecast_test = read_csv_if_exists(forecast_dir / "solid_forecast_test_predictions.csv", parse_dates=["week_start"])
-    solid_forecast_historical_validation = read_csv_if_exists(forecast_dir / "solid_forecast_historical_validation.csv", parse_dates=["week_start"])
-    solid_forecast_future = read_csv_if_exists(forecast_dir / "solid_forecast_future.csv", parse_dates=["week_start"])
-    solid_forecast_error_market = read_csv_if_exists(forecast_dir / "solid_forecast_error_by_market.csv")
+    solid_forecast_source = read_result_or_csv("op_sales.result_forecast_solid_forecast_fuente_datos", forecast_dir / "solid_forecast_fuente_datos.csv", parse_dates=["fecha_min", "fecha_max"])
+    solid_forecast_eval = read_result_or_csv("op_sales.result_forecast_solid_forecast_model_evaluation", forecast_dir / "solid_forecast_model_evaluation.csv")
+    solid_forecast_importance = read_result_or_csv("op_sales.result_forecast_solid_forecast_feature_importance", forecast_dir / "solid_forecast_feature_importance.csv")
+    solid_forecast_market_importance = read_result_or_csv("op_sales.result_forecast_solid_forecast_market_feature_importance", forecast_dir / "solid_forecast_market_feature_importance.csv")
+    solid_forecast_market_calibration = read_result_or_csv("op_sales.result_forecast_solid_forecast_market_calibration", forecast_dir / "solid_forecast_market_calibration.csv")
+    solid_forecast_predictors = read_result_or_csv("op_sales.result_forecast_solid_forecast_predictors", forecast_dir / "solid_forecast_predictors.csv")
+    solid_forecast_weekly = read_result_or_csv("op_sales.result_forecast_solid_forecast_weekly_demand", forecast_dir / "solid_forecast_weekly_demand.csv", parse_dates=["week_start"])
+    solid_forecast_test = read_result_or_csv("op_sales.result_forecast_solid_forecast_test_predictions", forecast_dir / "solid_forecast_test_predictions.csv", parse_dates=["week_start"])
+    solid_forecast_historical_validation = read_result_or_csv("op_sales.result_forecast_solid_forecast_historical_validation", forecast_dir / "solid_forecast_historical_validation.csv", parse_dates=["week_start"])
+    solid_forecast_future = read_result_or_csv("op_sales.result_forecast_solid_forecast_future", forecast_dir / "solid_forecast_future.csv", parse_dates=["week_start"])
+    solid_forecast_error_market = read_result_or_csv("op_sales.result_forecast_solid_forecast_error_by_market", forecast_dir / "solid_forecast_error_by_market.csv")
     for frame in [solid_forecast_weekly, solid_forecast_test, solid_forecast_historical_validation, solid_forecast_future]:
         if not frame.empty and "cod_cliente" in frame.columns:
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
@@ -694,26 +779,30 @@ def load_data(
                 if col in frame.columns:
                     frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
 
-    estructuras = read_csv_if_exists(data_dir / "cliente_estructuras_repetidas.csv", STRUCTURE_COLS)
+    estructuras = read_result_or_csv("op_sales.result_descriptivo_cliente_estructuras_repetidas", data_dir / "cliente_estructuras_repetidas.csv", STRUCTURE_COLS) if eager_results else pd.DataFrame()
     if not estructuras.empty:
         estructuras["cod_cliente"] = normalize_code(estructuras["cod_cliente"])
 
-    semana_tipica = read_csv_if_exists(data_dir / "cliente_semana_tipica.csv", TYPICAL_WEEK_COLS)
+    semana_tipica = read_result_or_csv("op_sales.result_descriptivo_cliente_semana_tipica", data_dir / "cliente_semana_tipica.csv", TYPICAL_WEEK_COLS) if eager_results else pd.DataFrame()
     if not semana_tipica.empty:
         semana_tipica["cod_cliente"] = normalize_code(semana_tipica["cod_cliente"])
         semana_tipica["semana"] = pd.to_numeric(semana_tipica["semana"], errors="coerce").astype("Int64")
 
-    sku_resumen = read_csv_if_exists(data_dir / "cliente_sku_operativo_resumen.csv", SKU_SUMMARY_COLS)
-    sku_composicion = read_csv_if_exists(data_dir / "cliente_sku_operativo_composicion.csv", SKU_COMPOSITION_COLS)
-    semana_sku = read_csv_if_exists(data_dir / "cliente_semana_sku_operativo.csv", WEEK_SKU_COLS)
+    sku_resumen = read_result_or_csv("op_sales.result_descriptivo_cliente_sku_operativo_resumen", data_dir / "cliente_sku_operativo_resumen.csv", SKU_SUMMARY_COLS)
+    sku_composicion = read_result_or_csv("op_sales.result_descriptivo_cliente_sku_operativo_composicion", data_dir / "cliente_sku_operativo_composicion.csv", SKU_COMPOSITION_COLS)
+    semana_sku = read_result_or_csv("op_sales.result_descriptivo_cliente_semana_sku_operativo", data_dir / "cliente_semana_sku_operativo.csv", WEEK_SKU_COLS) if eager_results else pd.DataFrame()
     for frame in [sku_resumen, sku_composicion, semana_sku]:
         if not frame.empty and "cod_cliente" in frame.columns:
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
 
-    ventas_semana = read_csv_if_exists(data_dir / "ventas_semana_cliente_producto.csv", SALES_VISUAL_COLS)
-    ventas_producto = read_csv_if_exists(data_dir / "ventas_producto_periodo.csv", [col for col in SALES_VISUAL_COLS if col not in ["cod_cliente", "cliente"]])
-    ventas_cliente = read_csv_if_exists(data_dir / "ventas_cliente_periodo.csv", ["anio", "semana_iso", "anio_semana", "cod_cliente", "cliente", "moneda_original", "tallos_confirmados", "ventas_usd", "valor_total_original", "pedidos", "cajas_ids", "precio_usd_tallo", "precio_moneda_original_tallo"])
-    ventas_caja = read_csv_if_exists(data_dir / "ventas_caja_periodo.csv", SALES_BOX_COLS)
+    ventas_semana = read_op_sales_sql_table("op_sales.agg_sales_week_client_product")
+    if ventas_semana.empty:
+        ventas_semana = read_dashboard_sql_view(dashboard_db, "vw_ventas_generales_semana_cliente_producto")
+    if ventas_semana.empty:
+        ventas_semana = read_csv_if_exists(data_dir / "ventas_semana_cliente_producto.csv", SALES_VISUAL_COLS)
+    ventas_producto = read_result_or_csv("op_sales.result_descriptivo_ventas_producto_periodo", data_dir / "ventas_producto_periodo.csv", [col for col in SALES_VISUAL_COLS if col not in ["cod_cliente", "cliente"]]) if eager_results else pd.DataFrame()
+    ventas_cliente = read_result_or_csv("op_sales.result_descriptivo_ventas_cliente_periodo", data_dir / "ventas_cliente_periodo.csv", ["anio", "semana_iso", "anio_semana", "cod_cliente", "cliente", "moneda_original", "tallos_confirmados", "ventas_usd", "valor_total_original", "pedidos", "cajas_ids", "precio_usd_tallo", "precio_moneda_original_tallo"]) if eager_results else pd.DataFrame()
+    ventas_caja = read_result_or_csv("op_sales.result_descriptivo_ventas_caja_periodo", data_dir / "ventas_caja_periodo.csv", SALES_BOX_COLS) if eager_results else pd.DataFrame()
     for frame in [ventas_semana, ventas_cliente, ventas_caja]:
         if not frame.empty and "cod_cliente" in frame.columns:
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
@@ -723,13 +812,14 @@ def load_data(
                 if col in frame.columns:
                     frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
 
-    estructura_caja = read_csv_if_exists(data_dir / "estructura_caja.csv", STRUCTURE_BOX_COLS, ["fecha"])
-    estructura_componentes = read_csv_if_exists(data_dir / "estructura_componentes.csv", STRUCTURE_COMPONENT_COLS, ["fecha"])
-    catalogo_estructura_version = read_csv_if_exists(
+    estructura_caja = read_result_or_csv("op_sales.result_descriptivo_estructura_caja", data_dir / "estructura_caja.csv", STRUCTURE_BOX_COLS, ["fecha"]) if eager_results else pd.DataFrame()
+    estructura_componentes = read_result_or_csv("op_sales.result_descriptivo_estructura_componentes", data_dir / "estructura_componentes.csv", STRUCTURE_COMPONENT_COLS, ["fecha"]) if eager_results else pd.DataFrame()
+    catalogo_estructura_version = read_result_or_csv(
+        "op_sales.result_descriptivo_catalogo_estructura_version",
         data_dir / "catalogo_estructura_version.csv",
         STRUCTURE_VERSION_COLS,
         ["primera_fecha", "ultima_fecha"],
-    )
+    ) if eager_results else pd.DataFrame()
     for frame in [estructura_caja, estructura_componentes, catalogo_estructura_version]:
         if not frame.empty and "cod_cliente" in frame.columns:
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
@@ -752,15 +842,6 @@ def load_data(
         "mix_sku": mix_sku,
         "mix_analisis": mix_analisis,
         "mix_color_rol": mix_color_rol,
-        "similares": similares,
-        "clusters": clusters,
-        "cluster_eval": cluster_eval,
-        "cluster_resumen": cluster_resumen,
-        "cluster_features": cluster_features,
-        "cluster_diff": cluster_diff,
-        "cluster_blocks": cluster_blocks,
-        "cluster_bundles": cluster_bundles,
-        "cluster_default_year": cluster_default_year,
         "demanda": demanda,
         "estimados": estimados,
         "forecast_historico": forecast_historico,
@@ -804,7 +885,7 @@ def empty_figure(title: str) -> go.Figure:
 
 
 def normalize_category(value) -> str:
-    return str(value or "").upper().replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U").strip()
+    return str(value or "").upper().replace("Ã", "A").replace("Ã‰", "E").replace("Ã", "I").replace("Ã“", "O").replace("Ãš", "U").strip()
 
 
 def color_for_category(value, index: int = 0) -> str:
@@ -905,14 +986,60 @@ def make_year_comparison_card(
     )
 
 
-def make_table(df: pd.DataFrame, page_size: int = 10) -> dash_table.DataTable:
+def make_delta_card(title: str, value: str, delta_value: float | None, detail: str = "") -> html.Div:
+    """Metric card with an explicit percentage change badge."""
+    if delta_value is None or pd.isna(delta_value):
+        delta_text = "sin base"
+        delta_class = "delta-badge neutral"
+    else:
+        delta_text = f"{delta_value:+.1%}"
+        delta_class = "delta-badge positive" if delta_value >= 0 else "delta-badge negative"
+    return html.Div(
+        [
+            html.Div([html.Div(title, className="metric-title"), html.Span(delta_text, className=delta_class)], className="metric-card-head"),
+            html.Div(value, className="metric-value"),
+            html.Div(detail, className="metric-detail"),
+        ],
+        className="metric-card metric-card-accent",
+    )
+
+
+def logo_data_uri(path: Path | None = None) -> str | None:
+    path = path or resolve_logo_path()
+    if path is None:
+        return None
+    if not path.exists():
+        return None
+    suffix = path.suffix.lower().lstrip(".") or "png"
+    mime = "jpeg" if suffix in {"jpg", "jpeg"} else "png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/{mime};base64,{encoded}"
+
+
+def make_table(
+    df: pd.DataFrame,
+    page_size: int = 10,
+    sort_by: list[dict[str, str]] | None = None,
+    table_id: str | None = None,
+) -> html.Div:
     if df.empty:
         df = pd.DataFrame({"mensaje": ["Sin datos para mostrar"]})
-    return dash_table.DataTable(
+    numeric_cols = {
+        col
+        for col in df.columns
+        if pd.api.types.is_numeric_dtype(df[col])
+    }
+    table_kwargs = {"id": {"type": "managed-table", "index": table_id}} if table_id else {}
+    table_component = dash_table.DataTable(
+        **table_kwargs,
         data=df.to_dict("records"),
-        columns=[{"name": col, "id": col} for col in df.columns],
+        columns=[
+            {"name": col, "id": col, "type": "numeric"} if col in numeric_cols else {"name": col, "id": col}
+            for col in df.columns
+        ],
         page_size=page_size,
         sort_action="native",
+        sort_by=sort_by or [],
         filter_action="native",
         export_format="csv",
         style_table={"overflowX": "auto", "maxHeight": "430px", "overflowY": "auto"},
@@ -930,11 +1057,32 @@ def make_table(df: pd.DataFrame, page_size: int = 10) -> dash_table.DataTable:
             {"if": {"row_index": "odd"}, "backgroundColor": "#f7f9fb"},
         ],
     )
+    if not table_id:
+        return table_component
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Button(
+                        "Reiniciar filtros",
+                        id={"type": "table-reset", "index": table_id},
+                        n_clicks=0,
+                        type="button",
+                        className="table-reset-button",
+                    ),
+                    dcc.Store(id={"type": "table-default-sort", "index": table_id}, data=sort_by or []),
+                ],
+                className="table-tools",
+            ),
+            table_component,
+        ],
+        className="managed-table-wrap",
+    )
 
 
-def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Path | None = None) -> Dash:
-    """Construye el tablero a partir de los tres modulos analiticos activos."""
-    data = load_data(data_dir, forecast_dir, clusters_dir)
+def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
+    """Construye el tablero a partir de los modulos analiticos activos."""
+    data = load_data(data_dir, forecast_dir)
     perfil = data["perfil"]
 
     recommendation_options = []
@@ -942,17 +1090,15 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
     client_options = []
     product_options = []
     color_options = []
-    cluster_year_options = []
-    cluster_default_year = data.get("cluster_default_year")
-    cluster_market_options = []
-    cluster_id_options = []
     sales_year_options = []
     sales_default_years = []
     sales_base_year_options = []
     sales_default_base_year = None
     sales_default_compare_year = None
     general_sales_client_options = []
+    general_sales_company_options = []
     general_sales_product_options = []
+    general_sales_country_options = []
     forecast_year_options = []
     forecast_default_years = []
     forecast_market_options = []
@@ -976,30 +1122,6 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
             {"label": f"{row.cod_cliente}", "value": row.cod_cliente}
             for row in perfil[["cod_cliente", "cliente"]].head(5000).itertuples(index=False)
         ]
-    cluster_year_options = [
-        {"label": str(year), "value": str(year)}
-        for year in sorted(
-            data.get("cluster_bundles", {}),
-            key=lambda value: int(value) if str(value).isdigit() else -1,
-            reverse=True,
-        )
-    ]
-    clusters_source = data.get("clusters", pd.DataFrame())
-    if not clusters_source.empty and "mercado_cluster" in clusters_source.columns:
-        cluster_market_options = [
-            {"label": market, "value": market}
-            for market in sorted(clusters_source["mercado_cluster"].dropna().astype(str).unique())
-        ]
-        if "cluster_id" in clusters_source.columns:
-            label_cols = [col for col in ["mercado_cluster", "cluster_id", "nombre_cluster"] if col in clusters_source.columns]
-            cluster_labels = clusters_source[label_cols].drop_duplicates().sort_values(label_cols).copy()
-            cluster_id_options = [
-                {
-                    "label": " | ".join(str(getattr(row, col)) for col in label_cols),
-                    "value": getattr(row, "cluster_id"),
-                }
-                for row in cluster_labels.itertuples(index=False)
-            ]
     ventas_source = data.get("ventas_semana", pd.DataFrame())
     if ventas_source.empty:
         ventas_source = data.get("ventas_producto", pd.DataFrame())
@@ -1020,10 +1142,21 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                 {"label": f"{row.cliente} | {row.cod_cliente}", "value": str(row.cod_cliente)}
                 for row in sales_clients.itertuples(index=False)
             ]
+        if "NomCompania" in ventas_source.columns:
+            general_sales_company_options = [
+                {"label": company, "value": company}
+                for company in sorted(ventas_source["NomCompania"].dropna().astype(str).unique())
+                if company.strip()
+            ]
         if "producto" in ventas_source.columns:
             general_sales_product_options = [
                 {"label": product, "value": product}
                 for product in sorted(ventas_source["producto"].dropna().astype(str).unique())
+            ]
+        if "pais" in ventas_source.columns:
+            general_sales_country_options = [
+                {"label": country, "value": country}
+                for country in sorted(ventas_source["pais"].dropna().astype(str).unique())
             ]
     product_sources = [
         frame
@@ -1118,6 +1251,19 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
     else:
         current_week = int(pd.Timestamp.today().isocalendar().week)
     app = Dash(__name__, title="LGF Analitica Comercial")
+
+    @app.callback(
+        Output({"type": "managed-table", "index": MATCH}, "filter_query"),
+        Output({"type": "managed-table", "index": MATCH}, "sort_by"),
+        Input({"type": "table-reset", "index": MATCH}, "n_clicks"),
+        State({"type": "table-default-sort", "index": MATCH}, "data"),
+        prevent_initial_call=True,
+    )
+    def reset_managed_table_filters(n_clicks, default_sort):
+        if not n_clicks:
+            return dash.no_update, dash.no_update
+        return "", default_sort or []
+
     app.layout = html.Div(
         [
             dcc.Store(id="data-dir", data=str(data_dir)),
@@ -1126,7 +1272,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                     html.Div(
                         [
                             html.H1("LGF Analitica Comercial"),
-                            html.P("Visualizador de clientes, clusters y forecast historico de solidos."),
+                            html.P("Visualizador de clientes, ventas, estructuras y forecast historico de solidos."),
                         ],
                         className="header-copy",
                     ),
@@ -1283,10 +1429,9 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                 id="tabs",
                                 value="visualizador_clientes_general",
                                 children=[
-                                    dcc.Tab(label="Visualizador clientes general", value="visualizador_clientes_general"),
+                                    dcc.Tab(label="Visualizador clientes detallado", value="visualizador_clientes_general"),
                                     dcc.Tab(label="Ventas generales", value="ventas_generales"),
                                     dcc.Tab(label="Estructuras y componentes", value="estructuras_componentes"),
-                                    dcc.Tab(label="Clusters", value="clusters"),
                                     dcc.Tab(label="Comprador", value="comprador"),
                                     dcc.Tab(label="Demanda e inventario", value="demanda"),
                                     dcc.Tab(label="Forecast solidos historico", value="forecast_solidos"),
@@ -1431,7 +1576,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Año base"),
+                                            html.Label("AÃ±o base"),
                                             dcc.Dropdown(
                                                 id="general-sales-base-year",
                                                 options=sales_base_year_options,
@@ -1444,7 +1589,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Año comparativo"),
+                                            html.Label("AÃ±o comparativo"),
                                             dcc.Dropdown(
                                                 id="general-sales-compare-year",
                                                 options=sales_base_year_options,
@@ -1473,6 +1618,20 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                     ),
                                     html.Div(
                                         [
+                                            html.Label("Compania"),
+                                            dcc.Dropdown(
+                                                id="general-sales-companies",
+                                                options=general_sales_company_options,
+                                                value=[],
+                                                multi=True,
+                                                clearable=True,
+                                                placeholder="Todas las companias",
+                                            ),
+                                        ],
+                                        className="demand-control",
+                                    ),
+                                    html.Div(
+                                        [
                                             html.Label("Cliente"),
                                             dcc.Dropdown(
                                                 id="general-sales-clients",
@@ -1481,6 +1640,20 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                                 multi=True,
                                                 clearable=True,
                                                 placeholder="Todos los clientes",
+                                            ),
+                                        ],
+                                        className="demand-control",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Label("Pais"),
+                                            dcc.Dropdown(
+                                                id="general-sales-countries",
+                                                options=general_sales_country_options,
+                                                value=[],
+                                                multi=True,
+                                                clearable=True,
+                                                placeholder="Todos los paises",
                                             ),
                                         ],
                                         className="demand-control",
@@ -1501,53 +1674,6 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                                     ),
                                 ],
                                 id="general-sales-options",
-                                className="demand-options",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            html.Label("Ano de cluster"),
-                                            dcc.Dropdown(
-                                                id="cluster-year-filter",
-                                                options=cluster_year_options,
-                                                value=cluster_default_year,
-                                                clearable=False,
-                                                placeholder="Selecciona el ano modelado",
-                                            ),
-                                        ],
-                                        className="demand-control",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label("Mercado"),
-                                            dcc.Dropdown(
-                                                id="cluster-market-filter",
-                                                options=cluster_market_options,
-                                                value=[],
-                                                multi=True,
-                                                clearable=True,
-                                                placeholder="Todos los mercados",
-                                            ),
-                                        ],
-                                        className="demand-control",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label("Cluster"),
-                                            dcc.Dropdown(
-                                                id="cluster-id-filter",
-                                                options=cluster_id_options,
-                                                value=[],
-                                                multi=True,
-                                                clearable=True,
-                                                placeholder="Todos los clusters",
-                                            ),
-                                        ],
-                                        className="demand-control",
-                                    ),
-                                ],
-                                id="cluster-options",
                                 className="demand-options",
                             ),
                             html.Div(
@@ -1769,15 +1895,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
         Input("general-sales-base-year", "value"),
         Input("general-sales-compare-year", "value"),
         Input("general-sales-week-range", "value"),
+        Input("general-sales-companies", "value"),
         Input("general-sales-clients", "value"),
+        Input("general-sales-countries", "value"),
         Input("general-sales-products", "value"),
         Input("compare-mode", "value"),
         Input("solid-product", "value"),
         Input("analysis-scope", "value"),
         Input("color-filter", "value"),
-        Input("cluster-year-filter", "value"),
-        Input("cluster-market-filter", "value"),
-        Input("cluster-id-filter", "value"),
         Input("forecast-date-range", "start_date"),
         Input("forecast-date-range", "end_date"),
         Input("forecast-years", "value"),
@@ -1820,15 +1945,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
         general_sales_base_year: int | None,
         general_sales_compare_year: int | None,
         general_sales_week_range: list[int] | None,
+        general_sales_companies: list[str] | None,
         general_sales_clients: list[str] | None,
+        general_sales_countries: list[str] | None,
         general_sales_products: list[str] | None,
         compare_mode: str | None,
         solid_product: str | None,
         analysis_scope: str | None,
         color_filter: str | None,
-        cluster_year_filter: str | None,
-        cluster_market_filter: list[str] | str | None,
-        cluster_id_filter: list[str] | str | None,
         forecast_start_date: str | None,
         forecast_end_date: str | None,
         forecast_years: list[int] | None,
@@ -1902,7 +2026,9 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                 general_sales_compare_year,
                 general_sales_years,
                 general_sales_week_range,
+                general_sales_companies,
                 general_sales_clients,
+                general_sales_countries,
                 general_sales_products,
             )
         if tab == "estructuras_componentes":
@@ -1914,20 +2040,6 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                 client_color_filter,
                 visual_sales_years,
                 visual_week_range,
-            )
-        if tab == "clusters":
-            cluster_data = data.copy()
-            cluster_bundle = data.get("cluster_bundles", {}).get(str(cluster_year_filter), {})
-            cluster_data.update(cluster_bundle)
-            return render_clusters_tab(
-                cluster_data,
-                filtered,
-                selected_code,
-                top_n,
-                cluster_market_filter,
-                cluster_id_filter,
-                cluster_year_filter,
-                data.get("cluster_bundles", {}),
             )
         if tab == "comprador":
             return render_reserved_module("Comprador", "Este modulo queda reservado para la fase de proyeccion y cruce con inventario.")
@@ -1973,7 +2085,6 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
         Output("selected-sku-operativo-wrap", "style"),
         Output("visual-sku-filter-wrap", "style"),
         Output("general-sales-options", "style"),
-        Output("cluster-options", "style"),
         Output("forecast-options", "style"),
         Output("global-client-filters", "style"),
         Output("app-shell", "style"),
@@ -1984,50 +2095,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
         hidden = {"display": "none"}
         if tab in ["visualizador_clientes_general", "estructuras_componentes"]:
             if tab == "visualizador_clientes_general":
-                return {"display": "none"}, {"display": "grid"}, hidden, hidden, visible, hidden, hidden, hidden, {}, {}
-            return {"display": "none"}, {"display": "grid"}, hidden, hidden, hidden, hidden, hidden, hidden, {}, {}
+                return {"display": "none"}, {"display": "grid"}, hidden, hidden, visible, hidden, hidden, {}, {}
+            return {"display": "none"}, {"display": "grid"}, hidden, hidden, hidden, hidden, hidden, {}, {}
         if tab == "ventas_generales":
-            return hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, hidden, hidden, {"gridTemplateColumns": "1fr"}
-        if tab == "clusters":
-            return hidden, hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, {"display": "none"}, {"gridTemplateColumns": "1fr"}
+            return hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, hidden, {"gridTemplateColumns": "1fr"}
         if tab == "forecast_solidos":
-            return hidden, hidden, hidden, hidden, hidden, hidden, hidden, {"display": "block"}, {"display": "none"}, {"gridTemplateColumns": "1fr"}
-        return hidden, hidden, hidden, hidden, hidden, hidden, hidden, hidden, {"display": "none"}, {"gridTemplateColumns": "1fr"}
-
-    @app.callback(
-        Output("cluster-market-filter", "options"),
-        Output("cluster-market-filter", "value"),
-        Output("cluster-id-filter", "options"),
-        Output("cluster-id-filter", "value"),
-        Input("cluster-year-filter", "value"),
-        Input("cluster-market-filter", "value"),
-        Input("cluster-id-filter", "value"),
-    )
-    def update_cluster_filter_options(year, markets, cluster_ids):
-        """Mantiene filtros consistentes con la corrida anual elegida."""
-        bundle = data.get("cluster_bundles", {}).get(str(year), {})
-        frame = bundle.get("clusters", pd.DataFrame())
-        if frame.empty:
-            return [], [], [], []
-        market_values = sorted(frame["mercado_cluster"].dropna().astype(str).unique())
-        selected_markets = [value for value in selected_values(markets) if value in set(market_values)]
-        scope = frame[frame["mercado_cluster"].astype(str).isin(selected_markets)].copy() if selected_markets else frame
-        label_cols = [col for col in ["mercado_cluster", "cluster_id", "nombre_cluster"] if col in scope.columns]
-        labels = scope[label_cols].drop_duplicates().sort_values(label_cols)
-        valid_ids = set(labels["cluster_id"].astype(str)) if "cluster_id" in labels.columns else set()
-        selected_ids = [value for value in selected_values(cluster_ids) if str(value) in valid_ids]
-        return (
-            [{"label": value, "value": value} for value in market_values],
-            selected_markets,
-            [
-                {
-                    "label": " | ".join(str(getattr(row, col)) for col in label_cols),
-                    "value": str(getattr(row, "cluster_id")),
-                }
-                for row in labels.itertuples(index=False)
-            ],
-            selected_ids,
-        )
+            return hidden, hidden, hidden, hidden, hidden, hidden, {"display": "block"}, {"display": "none"}, {"gridTemplateColumns": "1fr"}
+        return hidden, hidden, hidden, hidden, hidden, hidden, hidden, {"display": "none"}, {"gridTemplateColumns": "1fr"}
 
     @app.callback(
         Output("forecast-markets", "options"),
@@ -2390,31 +2464,37 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
 
     @app.callback(
         Output("general-sales-report-download", "data"),
-        Input("general-sales-export-report", "n_clicks"),
+        Input("general-sales-export-summary", "n_clicks"),
+        Input("general-sales-export-full", "n_clicks"),
         State("general-sales-base-year", "value"),
         State("general-sales-compare-year", "value"),
         State("general-sales-years", "value"),
         State("general-sales-week-range", "value"),
+        State("general-sales-companies", "value"),
         State("general-sales-clients", "value"),
+        State("general-sales-countries", "value"),
         State("general-sales-products", "value"),
         prevent_initial_call=True,
     )
-    def export_general_sales_report(n_clicks, base_year, compare_year, years, week_range, clients, products):
-        if not n_clicks:
+    def export_general_sales_report(summary_clicks, full_clicks, base_year, compare_year, years, week_range, companies, clients, countries, products):
+        if not summary_clicks and not full_clicks:
             return dash.no_update
         sales = data.get("ventas_semana", pd.DataFrame())
         if sales.empty:
             return dash.no_update
-        view = filter_general_sales_frame(sales, years, week_range, clients, products)
+        view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies)
         if view.empty:
             return dash.no_update
         context = build_sales_executive_context_v2(view, base_year, compare_year)
         if not context.get("ok"):
-            report_html = build_sales_report_html_v2(context)
-        else:
-            report_html = build_sales_report_html_v2(context)
-        filename = f"informe_ejecutivo_ventas_{context.get('base_year', 'base')}_vs_{context.get('compare_year', 'comp')}.html"
-        return dcc.send_string(report_html, filename=filename)
+            return dash.no_update
+        scope = sales_scope_summary(view, clients, products, countries, companies)
+        report_type = "full" if ctx.triggered_id == "general-sales-export-full" else "summary"
+        weekly = summarize_sales_frame(view, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
+        report_pdf = build_sales_report_pdf(context, scope, weekly=weekly, report_type=report_type, view=view)
+        suffix = "completo" if report_type == "full" else "resumido_1_pagina"
+        filename = f"informe_ventas_{suffix}_{context.get('base_year', 'base')}_vs_{context.get('compare_year', 'comp')}.pdf"
+        return dcc.send_bytes(report_pdf, filename=filename)
 
     app.index_string = """
     <!DOCTYPE html>
@@ -2456,11 +2536,45 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                 .tab-content { padding-top: 16px; }
                 .metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
                 .visual-metrics { grid-template-columns: repeat(6, minmax(150px, 1fr)); }
-                .metric-card { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 14px; min-height: 84px; }
+                .metric-card { background: linear-gradient(180deg, #ffffff 0%, #fbfcfd 100%); border: 1px solid #dfe5ec; border-radius: 8px; padding: 14px; min-height: 84px; box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06); }
+                .metric-card-accent { border-top: 4px solid #4E79A7; }
+                .metric-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
                 .metric-card-comparison { min-height: 128px; }
                 .metric-title { color: #667382; font-size: 12px; font-weight: 700; text-transform: uppercase; }
                 .metric-value { font-size: 26px; line-height: 34px; font-weight: 800; color: #17202a; overflow-wrap: anywhere; }
                 .metric-detail { color: #6f7c8a; font-size: 12px; }
+                .delta-badge { border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 800; white-space: nowrap; }
+                .delta-badge.positive { color: #006B4A; background: #E3F5EE; }
+                .delta-badge.negative { color: #A5281B; background: #FCE8E6; }
+                .delta-badge.neutral { color: #5b6775; background: #EEF2F6; }
+                .sales-executive-panel { background: transparent; margin-top: 14px; }
+                .sales-executive-header { display: flex; justify-content: space-between; gap: 18px; align-items: center; background: linear-gradient(135deg, #ffffff 0%, #f8fafc 62%, #f3e8ec 100%); border: 1px solid #dfe5ec; border-radius: 8px; padding: 18px 20px; margin-bottom: 12px; box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06); }
+                .executive-logo { display: block; max-width: 168px; max-height: 54px; object-fit: contain; margin-bottom: 10px; }
+                .executive-logo-text { color: #800020; font-size: 18px; font-weight: 800; margin-bottom: 8px; }
+                .executive-kicker { color: #800020; font-size: 12px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
+                .executive-title { color: #17202a; font-size: 24px; line-height: 30px; font-weight: 800; }
+                .executive-subtitle { color: #667382; font-size: 13px; margin-top: 4px; }
+                .executive-actions { display: flex; align-items: center; justify-content: flex-end; }
+                .executive-button-group { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+                .executive-button { border-radius: 6px; padding: 10px 14px; font-weight: 800; cursor: pointer; border: 1px solid #800020; }
+                .executive-button.primary { background: #800020; color: white; }
+                .executive-button.secondary { background: white; color: #800020; }
+                .executive-button:hover { box-shadow: 0 8px 18px rgba(128, 0, 32, 0.16); }
+                .scope-strip { display: grid; grid-template-columns: minmax(260px, 1.4fr) minmax(240px, 1.1fr) minmax(140px, 0.45fr) minmax(140px, 0.45fr); gap: 12px; margin-bottom: 14px; }
+                .scope-card { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 12px 14px; box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04); min-height: 58px; }
+                .scope-card-wide { border-left: 4px solid #4E79A7; }
+                .scope-label { color: #667382; font-size: 11px; font-weight: 800; text-transform: uppercase; margin-bottom: 5px; }
+                .scope-value { color: #17202a; font-size: 13px; line-height: 1.35; font-weight: 700; overflow-wrap: anywhere; }
+                .scope-number { color: #17202a; font-size: 24px; line-height: 28px; font-weight: 800; }
+                .executive-table-grid { display: grid; grid-template-columns: minmax(320px, 0.9fr) minmax(520px, 1.6fr); gap: 14px; align-items: start; }
+                .strategic-layout { display: grid; grid-template-columns: minmax(340px, 0.78fr) minmax(560px, 1.35fr); gap: 14px; align-items: stretch; }
+                .strategy-panel { background: #17202a; border: 1px solid #26323f; border-radius: 8px; padding: 10px 12px 14px; color: white; box-shadow: 0 14px 30px rgba(15, 23, 42, 0.14); min-width: 0; }
+                .strategy-panel .panel-title { color: white; }
+                .strategy-panel .panel-note { color: #cbd5e1; }
+                .strategy-grid { display: grid; grid-template-columns: 1fr; gap: 9px; padding: 8px 6px 2px; }
+                .strategy-card { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; align-items: start; background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; padding: 10px; }
+                .strategy-index { color: #F3E8EC; font-size: 12px; font-weight: 800; letter-spacing: 0; }
+                .strategy-text { color: #f8fafc; font-size: 13px; line-height: 1.4; }
                 .year-comparison { margin: 8px 0 6px; display: flex; flex-direction: column; gap: 5px; }
                 .year-row { display: grid; grid-template-columns: 44px minmax(70px, 1fr) minmax(96px, auto); gap: 6px; align-items: baseline; font-size: 12px; }
                 .year-label { font-weight: 700; color: #44505e; }
@@ -2471,11 +2585,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                 .year-delta.neutral { color: #6f7c8a; }
                 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
                 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-                .panel { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 8px; min-width: 0; }
+                .panel { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 8px; min-width: 0; box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04); }
+                .panel-feature { border-top: 4px solid #4E79A7; box-shadow: 0 12px 28px rgba(15, 23, 42, 0.07); }
                 .panel-title { font-size: 15px; font-weight: 800; padding: 8px 10px 0; }
-                .table-panel { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 12px; margin-top: 14px; }
+                .table-panel { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 12px; margin-top: 14px; box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04); }
                 .no-top-margin { margin-top: 0; }
-                .reading-panel { background: white; border: 1px solid #dfe5ec; border-left: 5px solid #800020; border-radius: 8px; padding: 10px 14px 16px; margin-bottom: 14px; }
+                .reading-panel { background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%); border: 1px solid #dfe5ec; border-left: 5px solid #800020; border-radius: 8px; padding: 10px 14px 16px; margin-bottom: 14px; box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05); }
                 .reading-text { color: #26323f; font-size: 16px; line-height: 1.48; padding: 8px 10px 0; max-width: 1200px; }
                 .section-gap { margin-top: 14px; }
                 .demand-options { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 10px 12px; margin-top: 12px; font-weight: 700; color: #334155; display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 16px; align-items: start; }
@@ -2502,6 +2617,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None, clusters_dir: Pa
                     .app-shell { grid-template-columns: 1fr; }
                     .filters { border-right: 0; border-bottom: 1px solid #d8dee6; }
                     .metrics-grid, .visual-metrics, .grid-2, .grid-3 { grid-template-columns: 1fr; }
+                    .executive-table-grid, .scope-strip, .strategic-layout { grid-template-columns: 1fr; }
+                    .sales-executive-header { flex-direction: column; align-items: flex-start; }
                     .forecast-filter-grid, .forecast-filter-grid-5, .forecast-filter-grid.compact { grid-template-columns: 1fr; }
                     .forecast-controls-header { flex-direction: column; align-items: flex-start; }
                     .app-header { flex-direction: column; align-items: flex-start; }
@@ -2827,11 +2944,10 @@ def build_structure_table(data: dict[str, pd.DataFrame], hist: pd.DataFrame, sel
     base["recomendacion"] = np.select(
         [
             tipo.eq("SOLIDO") & base["frecuencia_ultimas_12_semanas"].ge(2),
-            tipo.isin(["SURTIDO", "SURTIDO_M", "BULK"]) & base["frecuencia_ultimas_12_semanas"].ge(2),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]) & base["frecuencia_ultimas_12_semanas"].ge(2),
+            tipo.ne("SOLIDO") & base["frecuencia_ultimas_12_semanas"].ge(2),
             base["frecuencia_ultimas_12_semanas"].eq(0),
         ],
-        ["PILOTO", "COMPRAR_COLOR_BASE", "REVISAR_COMPOSICION", "NO_ANTICIPAR"],
+        ["PILOTO", "REVISAR_ESTRUCTURA_PEDIDO", "NO_ANTICIPAR"],
         default="REVISAR_MANUAL",
     )
     base = base.rename(columns={"tallos_x_ramo": "tallos_por_ramo"})
@@ -3044,13 +3160,11 @@ def build_recent_structure_table(hist_window: pd.DataFrame, top_n: int) -> pd.Da
     work["estructura_lectura"] = np.select(
         [
             work["tipo_upper"].eq("SOLIDO"),
-            work["tipo_upper"].isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT"]),
-            work["tipo_upper"].eq("BULK"),
+            work["tipo_upper"].ne("SOLIDO"),
         ],
         [
             work.get("producto_color", work.get("sku_terminado", work["sku_operativo"])),
             work["sku_operativo"],
-            (work["producto"].astype(str) + "|" + work["color"].astype(str)),
         ],
         default=work.get("llave_analisis_operativo", "sin_info"),
     )
@@ -3088,21 +3202,18 @@ def build_recent_structure_table(hist_window: pd.DataFrame, top_n: int) -> pd.Da
     base["lectura_operativa"] = np.select(
         [
             tipo.eq("SOLIDO"),
-            tipo.isin(["SURTIDO", "SURTIDO_M"]),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]),
-            tipo.eq("BULK"),
+            tipo.ne("SOLIDO"),
         ],
-        ["SKU terminado exacto", "Mezcla de colores/composicion", "Receta/composicion", "Producto-color volumen"],
+        ["SKU terminado exacto", "Estructura de pedido"],
         default="Revision manual",
     )
     base["recomendacion"] = np.select(
         [
             tipo.eq("SOLIDO") & base["semanas"].ge(2) & base["cumplimiento"].ge(0.9),
             tipo.eq("SOLIDO") & base["semanas"].ge(1),
-            tipo.isin(["SURTIDO", "SURTIDO_M", "BULK"]) & base["semanas"].ge(2),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]) & base["semanas"].ge(2),
+            tipo.ne("SOLIDO") & base["semanas"].ge(2),
         ],
-        ["COMPRAR_TERMINADO", "PILOTO", "COMPRAR_COLOR_BASE", "REVISAR_COMPOSICION"],
+        ["COMPRAR_TERMINADO", "PILOTO", "REVISAR_ESTRUCTURA_PEDIDO"],
         default="NO_ANTICIPAR",
     )
     base = base.rename(columns={"tallos_x_ramo": "tallos_por_ramo"})
@@ -3152,13 +3263,11 @@ def build_sku_composition_table(hist_window: pd.DataFrame, structure_table: pd.D
     work["estructura_lectura"] = np.select(
         [
             tipo.eq("SOLIDO"),
-            tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT"]),
-            tipo.eq("BULK"),
+            tipo.ne("SOLIDO"),
         ],
         [
             work.get("producto_color", work.get("sku_terminado", work["sku_operativo"])),
             work["sku_operativo"],
-            work["producto"].astype(str) + "|" + work["color"].astype(str),
         ],
         default=work["sku_operativo"],
     )
@@ -3207,33 +3316,6 @@ def sku_composition_from_outputs(data: dict[str, pd.DataFrame], selected_code: s
     return work.sort_values("tallos_promedio_semana_normal", ascending=False)
 
 
-def explain_similar_clients(sim_client: pd.DataFrame, hist: pd.DataFrame, selected_code: str) -> pd.DataFrame:
-    if sim_client.empty or hist.empty:
-        return sim_client
-    selected_recent = hist[hist["cod_cliente"] == selected_code].copy()
-    rows = []
-    for row in sim_client.to_dict("records"):
-        code = str(row.get("cod_cliente_similar", ""))
-        other = hist[hist["cod_cliente"] == code].copy()
-        reasons = []
-        for col, label in [
-            ("producto", "producto"),
-            ("color", "color"),
-            ("tipo_pedido_operativo", "tipo pedido"),
-            ("tallos_x_ramo", "tallos/ramo"),
-            ("capuchon", "capuchon"),
-            ("empaque", "empaque"),
-        ]:
-            a = set(_top_values(selected_recent, col, n=3))
-            b = set(_top_values(other, col, n=3))
-            common = [x for x in a.intersection(b) if x and x != "sin_info"]
-            if common:
-                reasons.append(f"{label}: {', '.join(common[:2])}")
-        row["razones_similitud"] = "; ".join(reasons) if reasons else "similitud por vectores de producto/color/tipo de pedido"
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
 def render_cliente_tab(
     data: dict[str, pd.DataFrame],
     filtered: pd.DataFrame,
@@ -3255,6 +3337,8 @@ def render_cliente_tab(
         return render_segment_overview(data, filtered, top_n)
 
     hist = data.get("historico_visualizador_comercial", data.get("historico_confirmado", pd.DataFrame()))
+    if hist.empty:
+        hist = read_client_sku_week_from_sql(selected_code)
     hist_client = hist[hist["cod_cliente"] == selected_code].copy() if not hist.empty else pd.DataFrame()
     hist_filtered = apply_client_detail_filters(hist_client, product_filter, color_filter, program_filter)
     current_window, last_year_window, window_label = client_analysis_windows(hist_filtered, analysis_week, history_weeks)
@@ -3275,20 +3359,6 @@ def render_cliente_tab(
     mix_product = ranked_recent_figure(regular_window, "producto", f"Producto reciente ({normal_note})", top_n)
     mix_color = ranked_recent_figure(regular_window, "color", f"Color reciente ({normal_note})", top_n)
     mix_tipo = ranked_recent_figure(regular_window, "tipo_pedido_operativo", f"Tipo de pedido reciente ({normal_note})", top_n)
-
-    similares = data["similares"]
-    sim_client = similares[similares["cod_cliente_base"] == selected_code].head(20) if not similares.empty else pd.DataFrame()
-    sim_cols = [
-        "cod_cliente_similar",
-        "cliente_similar",
-        "similitud_total",
-        "similitud_producto_color",
-        "similitud_sku_flexible",
-        "similitud_tipo_pedido",
-        "compatibilidad_operativa",
-    ]
-    sim_client = sim_client[[col for col in sim_cols if col in sim_client.columns]]
-    sim_client = explain_similar_clients(sim_client, hist, selected_code)
 
     return html.Div(
         [
@@ -3328,7 +3398,6 @@ def render_cliente_tab(
             ),
             html.Div([html.Div("Estructuras/SKUs recientes segun la ventana seleccionada", className="panel-title"), make_table(structure_table, 12)], className="table-panel"),
             html.Div([html.Div("Composicion interna del SKU operativo seleccionado", className="panel-title"), make_table(sku_composition, 12)], className="table-panel"),
-            html.Div([html.Div("Clientes similares y razones", className="panel-title"), make_table(sim_client, 8)], className="table-panel"),
         ]
     )
 
@@ -4035,7 +4104,7 @@ def format_sales_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-NON_SOLID_TYPES = {"SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT", "MIX", "ASSORTED"}
+NON_SOLID_TYPES = {"SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT", "BULK", "MIX", "ASSORTED"}
 
 
 def selected_values(value) -> list[str]:
@@ -4056,6 +4125,13 @@ def selected_label(value, default: str = "todos") -> str:
     return f"{len(values)} seleccionados"
 
 
+BLANK_DISPLAY_VALUES = {"", "nan", "none", "sin_info", "sin caja", "sin tallos", "sin_caja", "sin_ramo", "sin_estructura", "0", "0.0"}
+
+
+def is_blank_display_value(value) -> bool:
+    return str(value).strip().lower() in BLANK_DISPLAY_VALUES
+
+
 def synced_multi_value(current_value, ordered_values: list[str], select_all_id: str, clear_id: str) -> list[str]:
     trigger_id = ctx.triggered_id
     if trigger_id == clear_id:
@@ -4067,7 +4143,7 @@ def synced_multi_value(current_value, ordered_values: list[str], select_all_id: 
 
 
 def normalize_operational_type(series: pd.Series) -> pd.Series:
-    return series.fillna("SIN_TIPO").astype(str).str.upper().str.replace("Ó", "O", regex=False).str.strip()
+    return series.fillna("SIN_TIPO").astype(str).str.upper().str.replace("Ã“", "O", regex=False).str.strip()
 
 
 def ensure_visual_operational_sku(df: pd.DataFrame) -> pd.DataFrame:
@@ -4077,13 +4153,55 @@ def ensure_visual_operational_sku(df: pd.DataFrame) -> pd.DataFrame:
     tipo = normalize_operational_type(out.get("tipo_pedido_operativo", pd.Series("SIN_TIPO", index=out.index)))
     fallback = out.get("sku_operativo", pd.Series("sin_info", index=out.index)).fillna("sin_info").astype(str)
     solid = out.get("producto_color", out.get("sku_terminado", fallback)).fillna(fallback).astype(str)
-    nonsolid = out.get("receta_programa_key", out.get("sku_composicion", pd.Series("", index=out.index))).fillna("").astype(str)
+    recipe_structure = out.get("receta_programa_tamano_key", out.get("receta_programa_key", out.get("sku_composicion", pd.Series("", index=out.index)))).fillna("").astype(str)
+    order_structure = out.get("sku_composicion", recipe_structure).fillna("").astype(str)
+    nonsolid = recipe_structure.where(tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]), order_structure)
     receta = out.get("receta_estructura_key", fallback).fillna(fallback).astype(str)
     nonsolid = nonsolid.where(~nonsolid.str.lower().isin(["", "nan", "none", "sin_info"]), receta)
     out["sku_operativo"] = np.where(tipo.eq("SOLIDO"), solid, nonsolid)
     out["tipo_operativo_norm"] = tipo
     out["es_solido"] = tipo.eq("SOLIDO")
     return out
+
+
+def enrich_visual_with_sku_summary(data: dict[str, pd.DataFrame], frame: pd.DataFrame) -> pd.DataFrame:
+    summary = data.get("sku_resumen", pd.DataFrame())
+    if frame.empty or summary.empty or "sku_operativo" not in frame.columns or "sku_operativo" not in summary.columns:
+        return frame
+    join_keys = [col for col in ["cod_cliente", "sku_operativo", "tipo_pedido_operativo"] if col in frame.columns and col in summary.columns]
+    if not join_keys:
+        return frame
+    meta_cols = join_keys + [
+        col for col in [
+            "producto", "tipo_caja", "tallos_por_ramo", "tallos_programa_caja", "tallos_componentes_caja",
+            "ramos_programa_caja_inferidos", "tallos_programa_ramo", "ramos_x_caja", "capuchon", "comida",
+            "empaque", "receta", "caja_operativa", "productos_composicion", "colores_composicion",
+            "variedades_composicion", "lineas_componentes", "composicion_versiones",
+            "composicion_firma_principal", "tallos_promedio_estructura", "ramos_estimados_comercial",
+        ] if col in summary.columns and col not in join_keys
+    ]
+    if len(meta_cols) == len(join_keys):
+        return frame
+    meta = summary[meta_cols].drop_duplicates(join_keys).copy()
+    out = frame.merge(meta, on=join_keys, how="left", suffixes=("", "_sku_meta"))
+    fill_pairs = [
+        ("producto", "producto_sku_meta"),
+        ("tipo_caja", "tipo_caja_sku_meta"),
+        ("tallos_x_ramo", "tallos_por_ramo"),
+        ("capuchon", "capuchon_sku_meta"),
+        ("comida", "comida_sku_meta"),
+        ("empaque", "empaque_sku_meta"),
+        ("receta", "receta_sku_meta"),
+        ("caja_operativa", "caja_operativa_sku_meta"),
+    ]
+    for target, source in fill_pairs:
+        if target in out.columns and source in out.columns:
+            mask = out[target].map(is_blank_display_value) & ~out[source].map(is_blank_display_value)
+            if mask.any():
+                out[target] = out[target].astype("object")
+                out.loc[mask, target] = out.loc[mask, source].astype(str)
+    drop_cols = [col for col in out.columns if col.endswith("_sku_meta")]
+    return out.drop(columns=drop_cols)
 
 
 def filter_visual_operational_base(
@@ -4098,6 +4216,8 @@ def filter_visual_operational_base(
     sku_filter: str | list[str] | None,
 ) -> pd.DataFrame:
     hist = data.get("historico_visualizador_comercial", data.get("historico_confirmado", pd.DataFrame()))
+    if hist.empty and selected_code:
+        hist = read_client_sku_week_from_sql(selected_code)
     if hist.empty:
         return pd.DataFrame()
     needed = [
@@ -4107,13 +4227,18 @@ def filter_visual_operational_base(
         "subtipo_pedido_operativo", "tipo_orden_empaque", "tipo_empaque", "receta", "codempaque", "bulkbouquet",
         "tallos_analisis", "tallos_confirmados", "ventas_usd", "valor_total_original",
         "moneda_original", "sku_operativo", "sku_terminado", "sku_composicion", "receta_estructura_key",
+        "receta_programa_key", "receta_programa_tamano_key", "producto_color",
     ]
     out = hist[[col for col in needed if col in hist.columns]].copy()
+    for text_col in ["variedad", "capuchon", "comida", "empaque", "tipo_caja", "tallos_x_ramo", "caja_operativa"]:
+        if text_col not in out.columns:
+            out[text_col] = ""
     if "anio" not in out.columns and "anio_iso" in out.columns:
         out["anio"] = out["anio_iso"]
     out = ensure_visual_operational_sku(out)
     if "tallos_pedidos" not in out.columns:
-        out["tallos_pedidos"] = pd.to_numeric(out.get("tallos_analisis", 0), errors="coerce").fillna(0)
+        pedidos_source = out.get("tallos_analisis", out.get("tallos_confirmados", pd.Series(0, index=out.index)))
+        out["tallos_pedidos"] = pd.to_numeric(pedidos_source, errors="coerce").fillna(0)
     for col in ["tallos_confirmados", "ventas_usd", "valor_total_original"]:
         if col not in out.columns:
             out[col] = 0
@@ -4143,6 +4268,7 @@ def filter_visual_operational_base(
         valid_skus = {str(sku) for sku in sku_values if str(sku).strip()}
         if valid_skus:
             out = out[out["sku_operativo"].astype(str).isin(valid_skus)].copy()
+    out = enrich_visual_with_sku_summary(data, out)
     return out
 
 
@@ -4153,8 +4279,8 @@ def summarize_visual_operational(df: pd.DataFrame, group_cols: list[str]) -> pd.
         tallos_confirmados=("tallos_confirmados", "sum"),
         tallos_pedidos=("tallos_pedidos", "sum"),
         ventas_usd=("ventas_usd", "sum"),
-        pedidos=("pedido", "nunique") if "pedido" in df.columns else ("sku_operativo", "size"),
-        cajas=("caja_operativa", "nunique") if "caja_operativa" in df.columns else ("sku_operativo", "size"),
+        pedidos=("pedido", "nunique") if "pedido" in df.columns else (("pedidos", "sum") if "pedidos" in df.columns else ("sku_operativo", "size")),
+        cajas=("caja_operativa", "nunique") if "caja_operativa" in df.columns else (("cajas", "sum") if "cajas" in df.columns else ("sku_operativo", "size")),
         semanas_activas=("anio_semana", "nunique") if "anio_semana" in df.columns else ("sku_operativo", "size"),
     )
     out["precio_usd_tallo"] = (out["ventas_usd"] / out["tallos_confirmados"].replace(0, np.nan)).fillna(0)
@@ -4164,7 +4290,7 @@ def summarize_visual_operational(df: pd.DataFrame, group_cols: list[str]) -> pd.
 
 def top_text(series: pd.Series, n: int = 3) -> str:
     values = series.dropna().astype(str)
-    values = values[~values.str.lower().isin(["", "nan", "none", "sin_info"])]
+    values = values[~values.str.strip().str.lower().isin(BLANK_DISPLAY_VALUES)]
     return ", ".join(values.value_counts().head(n).index)
 
 
@@ -4172,14 +4298,14 @@ def _first_non_empty(row: pd.Series, fields: list[str], default: str = "sin_info
     for field in fields:
         value = row.get(field, "")
         text = str(value).strip()
-        if text and text.lower() not in {"nan", "none", "sin_info"}:
+        if not is_blank_display_value(text):
             return text
     return default
 
 
 def _primary_value(value: str) -> str:
     text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "sin_info"}:
+    if is_blank_display_value(text):
         return "sin_info"
     return text.split(",")[0].split("|")[0].strip()
 
@@ -4191,25 +4317,53 @@ def _mean_numeric_text(series: pd.Series, decimals: int = 1) -> str:
     return moneyless_number(float(numeric.mean()), decimals)
 
 
+def format_integerish_display(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if is_blank_display_value(text):
+        return ""
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        numeric = float(numeric)
+        if abs(numeric - round(numeric)) < 1e-9:
+            return str(int(round(numeric)))
+        return f"{numeric:g}"
+    return text
+
+
+def compact_label_parts(parts: list[str]) -> str:
+    clean_parts = []
+    seen = set()
+    for part in parts:
+        text = str(part).strip()
+        key = text.lower()
+        if not text or is_blank_display_value(text) or key == "sin_color" or key in seen:
+            continue
+        seen.add(key)
+        clean_parts.append(text)
+    return " | ".join(clean_parts)
+
+
 def operational_sku_label(row: pd.Series, detail: bool = False) -> str:
     tipo = str(
         row.get("tipo_operativo_norm", row.get("tipo_pedido_operativo", "SIN_TIPO"))
-    ).upper().replace("Ó", "O").replace("Ã“", "O").strip()
+    ).upper().replace("Ã“", "O").replace("Ãƒâ€œ", "O").strip()
 
     producto = _first_non_empty(
         row,
-        ["familia_analisis_operativa", "producto_familia", "producto"],
+        ["familia_analisis_operativa", "producto_familia", "producto", "productos_composicion"],
         "sin_producto",
     )
 
     color = _primary_value(
-        _first_non_empty(row, ["color", "colores_internos"], "")
+        _first_non_empty(row, ["color", "colores_internos", "colores_composicion"], "")
     )
 
-    tipo_caja = _first_non_empty(row, ["tipo_caja"], "sin_caja")
-    tallos_ramo = _first_non_empty(row, ["tallos_x_ramo", "tallos_por_ramo"], "sin_ramo")
-    tallos_programa = _first_non_empty(row, ["tallos_programa_ramo"], "")
-    tallos_caja_programa = _first_non_empty(row, ["tallos_programa_caja", "tallos_componentes_caja"], "")
+    tipo_caja = _first_non_empty(row, ["tipo_caja"], "")
+    tallos_ramo = format_integerish_display(_first_non_empty(row, ["tallos_x_ramo", "tallos_por_ramo"], ""))
+    tallos_programa = format_integerish_display(_first_non_empty(row, ["tallos_programa_ramo"], ""))
+    tallos_caja_programa = format_integerish_display(_first_non_empty(row, ["tallos_programa_caja", "tallos_componentes_caja"], ""))
     subtipo = _first_non_empty(
         row,
         ["subtipo_pedido_operativo", "tipo_orden_empaque", "tipo_empaque", "receta", "sku_composicion", "receta_estructura_key"],
@@ -4218,15 +4372,18 @@ def operational_sku_label(row: pd.Series, detail: bool = False) -> str:
     receta_programa = _first_non_empty(row, ["receta", "receta_programa_key", "receta_estructura_key"], "")
 
     # REGLA LGF:
-    # SOLIDO: el color sí hace parte del SKU visible.
+    # SOLIDO: el color sÃ­ hace parte del SKU visible.
     # NO SOLIDO: surtidos, rainbow, combo, bouquet, bulk, etc. se leen como estructura del pedido.
     if tipo == "SOLIDO":
         parts = [tipo, producto, color]
+        if tallos_ramo:
+            parts.append(f"{tallos_ramo} tallos/ramo")
 
         if detail:
-            parts.extend([tipo_caja, f"{tallos_ramo} tallos/ramo"])
+            if tipo_caja:
+                parts.append(tipo_caja)
 
-            variedad = _first_non_empty(row, ["variedad", "variedades_internas"], "")
+            variedad = _first_non_empty(row, ["variedad", "variedades_internas", "variedades_composicion"], "")
             if variedad:
                 parts.append(variedad)
 
@@ -4246,24 +4403,26 @@ def operational_sku_label(row: pd.Series, detail: bool = False) -> str:
                 if extra:
                     parts.append(extra)
 
-        return " | ".join([p for p in parts if p and str(p).lower() not in {"nan", "none", "sin_info", "sin_color"}])
+        return compact_label_parts(parts)
 
-    # Para NO sólidos se vuelve a la estructura del pedido.
-    # Aquí NO se mete color en el SKU visible.
+    # Para NO sÃ³lidos se vuelve a la estructura del pedido.
+    # AquÃ­ NO se mete color en el SKU visible.
     parts = [tipo, producto]
     if receta_programa:
         parts.append(receta_programa)
-    else:
-        parts.extend([tipo_caja, f"{tallos_ramo} tallos/ramo"])
-    if tallos_programa and str(tallos_programa).lower() not in {"nan", "none", "sin_info", "0", "0.0"}:
+    if tipo_caja:
+        parts.append(tipo_caja)
+    if tallos_ramo:
+        parts.append(f"{tallos_ramo} tallos/ramo")
+    if tallos_programa and not is_blank_display_value(tallos_programa):
         parts.append(f"{tallos_programa} tallos/ramo")
-    if detail and tallos_caja_programa and str(tallos_caja_programa).lower() not in {"nan", "none", "sin_info", "0", "0.0"}:
+    if detail and tallos_caja_programa and not is_blank_display_value(tallos_caja_programa):
         parts.append(f"{tallos_caja_programa} tallos/caja")
 
     if detail:
         parts.append(subtipo)
 
-        variedad = _first_non_empty(row, ["variedad", "variedades_internas"], "")
+        variedad = _first_non_empty(row, ["variedad", "variedades_internas", "variedades_composicion"], "")
         if variedad:
             parts.append(variedad)
 
@@ -4283,42 +4442,56 @@ def operational_sku_label(row: pd.Series, detail: bool = False) -> str:
             if extra:
                 parts.append(extra)
 
-    return " | ".join([p for p in parts if p and str(p).lower() not in {"nan", "none", "sin_info", "sin_color"}])
+    return compact_label_parts(parts)
 
 
 def operational_sku_filter_label(row: pd.Series) -> str:
     tipo = str(
         row.get("tipo_operativo_norm", row.get("tipo_pedido_operativo", "SIN_TIPO"))
-    ).upper().replace("Ó", "O").replace("Ã“", "O").strip()
+    ).upper().replace("Ã“", "O").replace("Ãƒâ€œ", "O").strip()
 
     producto = _first_non_empty(
         row,
-        ["familia_analisis_operativa", "producto_familia", "producto"],
+        ["familia_analisis_operativa", "producto_familia", "producto", "productos_composicion"],
         "",
     )
 
     color = _primary_value(
-        _first_non_empty(row, ["color", "colores_internos"], "")
+        _first_non_empty(row, ["color", "colores_internos", "colores_composicion"], "")
     )
 
     tipo_caja = _first_non_empty(row, ["tipo_caja"], "")
-    tallos_ramo = _first_non_empty(row, ["tallos_x_ramo", "tallos_por_ramo"], "")
-    tallos_programa = _first_non_empty(row, ["tallos_programa_ramo"], "")
+    tallos_ramo = format_integerish_display(_first_non_empty(row, ["tallos_x_ramo", "tallos_por_ramo"], ""))
+    tallos_programa = format_integerish_display(_first_non_empty(row, ["tallos_programa_ramo"], ""))
 
-    # SOLIDO: color sí identifica el SKU.
+    # SOLIDO: color sÃ­ identifica el SKU.
     if tipo == "SOLIDO":
-        parts = [p for p in [tipo, producto, color] if p and str(p).lower() not in {"nan", "none", "sin_info", "sin_color"}]
-        return " | ".join(parts) if parts else _first_non_empty(row, ["sku_operativo"], "sin_sku")
+        parts = [p for p in [tipo, producto, color] if p and not is_blank_display_value(p) and str(p).lower() != "sin_color"]
+        tipo_caja = _first_non_empty(row, ["tipo_caja"], "")
+        tallos_ramo = format_integerish_display(_first_non_empty(row, ["tallos_x_ramo", "tallos_por_ramo"], ""))
+        if tipo_caja:
+            parts.append(tipo_caja)
+        if tallos_ramo:
+            parts.append(f"{tallos_ramo} tallos/ramo")
+        label = compact_label_parts(parts)
+        return label if label else _first_non_empty(row, ["sku_operativo"], "sin_sku")
 
     # NO SOLIDO: se identifica por estructura general, no por color.
-    parts = [p for p in [tipo, producto, _first_non_empty(row, ["receta", "receta_programa_key", "receta_estructura_key"], "") or tipo_caja] if p and str(p).lower() not in {"nan", "none", "sin_info", "sin_color"}]
-    if tallos_programa and str(tallos_programa).lower() not in {"nan", "none", "sin_info", "0", "0.0"}:
+    structure = _first_non_empty(row, ["receta", "receta_programa_key", "receta_estructura_key", "sku_composicion"], "")
+    parts = [p for p in [tipo, producto, structure or tipo_caja] if p and not is_blank_display_value(p) and str(p).lower() != "sin_color"]
+    if tallos_programa and not is_blank_display_value(tallos_programa):
         parts.append(f"{tallos_programa} tallos/ramo")
 
-    if not _first_non_empty(row, ["receta", "receta_programa_key", "receta_estructura_key"], "") and tallos_ramo and str(tallos_ramo).lower() not in {"nan", "none", "sin_info", "sin_ramo"}:
+    if not structure and tallos_ramo and not is_blank_display_value(tallos_ramo):
         parts.append(f"{tallos_ramo} tallos/ramo")
 
-    return " | ".join(parts) if parts else _first_non_empty(row, ["sku_operativo"], "sin_sku")
+    if structure and tipo_caja:
+        parts.append(tipo_caja)
+    if structure and tallos_ramo and not is_blank_display_value(tallos_ramo):
+        parts.append(f"{tallos_ramo} tallos/ramo")
+
+    label = compact_label_parts(parts)
+    return label if label else _first_non_empty(row, ["sku_operativo"], "sin_sku")
 
 
 def operational_internal_label(row: pd.Series, mode: str = "color") -> str:
@@ -4425,8 +4598,6 @@ def visual_color_composition(df: pd.DataFrame, ranking: pd.DataFrame, selected_s
         return pd.DataFrame()
     multi_selected = isinstance(selected_sku, list) and len(selected_sku) > 1
     sku = selected_sku[0] if isinstance(selected_sku, list) and len(selected_sku) == 1 else selected_sku
-    if not sku and not multi_selected and not ranking.empty:
-        sku = str(ranking.iloc[0]["sku_operativo"])
     work = df[df["sku_operativo"].astype(str).eq(str(sku))].copy() if sku else df.copy()
     if color_view == "selected_week" and "semana_iso" in work.columns:
         week_work = work[pd.to_numeric(work["semana_iso"], errors="coerce").eq(int(analysis_week or 1))].copy()
@@ -4460,7 +4631,23 @@ def visual_color_composition(df: pd.DataFrame, ranking: pd.DataFrame, selected_s
     if "variedad" in out.columns:
         out["variedad_interna"] = out["variedad"].astype(str)
     out["detalle_interno"] = out.apply(lambda row: operational_internal_label(row, internal_detail), axis=1)
+    out["alcance_composicion"] = "SKU seleccionado" if sku else ("SKUs seleccionados" if multi_selected else "Total general filtrado")
     return out.sort_values("tallos_confirmados", ascending=False)
+
+
+def visual_composition_context(selected_sku: str | list[str] | None, ranking: pd.DataFrame) -> tuple[str, str, str | None]:
+    values = selected_values(selected_sku)
+    if len(values) == 1:
+        sku = values[0]
+        label = sku
+        if not ranking.empty and "sku_operativo" in ranking.columns:
+            match = ranking[ranking["sku_operativo"].astype(str).eq(str(sku))]
+            if not match.empty:
+                label = str(match.iloc[0].get("sku_operativo_visible") or match.iloc[0].get("sku_operativo_general") or sku)
+        return f"Composicion de colores del SKU seleccionado: {label}", f"SKU seleccionado: {label}", sku
+    if len(values) > 1:
+        return "Composicion general de colores", f"{len(values)} SKUs seleccionados; composicion agregada de la seleccion.", None
+    return "Composicion general de colores", "Sin SKU seleccionado; composicion agregada de todos los SKUs filtrados.", None
 
 
 def visual_recent_history(df: pd.DataFrame, analysis_week: int, top_n: int, sku_view_mode: str = "general") -> pd.DataFrame:
@@ -4468,18 +4655,22 @@ def visual_recent_history(df: pd.DataFrame, analysis_week: int, top_n: int, sku_
         return pd.DataFrame()
     work = df.copy()
     week = int(analysis_week or pd.to_numeric(work["semana_iso"], errors="coerce").max() or 1)
-    grouped = work.groupby(["sku_operativo", "tipo_pedido_operativo", "semana_iso"], dropna=False, as_index=False)["tallos_confirmados"].sum()
+    week_numbers = pd.to_numeric(work["semana_iso"], errors="coerce")
+    recent_week_set = {week, max(1, week - 1)}
+    recent = work[week_numbers.isin(recent_week_set)].copy()
+    if recent.empty:
+        recent = work.copy()
+    grouped = recent.groupby(["sku_operativo", "tipo_pedido_operativo", "semana_iso"], dropna=False, as_index=False)["tallos_confirmados"].sum()
     pivot = grouped.pivot_table(index=["sku_operativo", "tipo_pedido_operativo"], columns="semana_iso", values="tallos_confirmados", aggfunc="sum", fill_value=0).reset_index()
-    for offset in range(4):
+    for offset in range(2):
         col = week - offset
         label = "Semana actual" if offset == 0 else f"Semana -{offset}"
         pivot[label] = pivot[col] if col in pivot.columns else 0
-    last_12 = work[pd.to_numeric(work["semana_iso"], errors="coerce").between(max(1, week - 11), week)]
-    avg = summarize_visual_operational(last_12, ["sku_operativo"]).rename(columns={"tallos_confirmados": "promedio_ultimas_12"})
-    avg["promedio_ultimas_12"] = avg["promedio_ultimas_12"] / max(last_12["anio_semana"].nunique(), 1) if not last_12.empty else 0
-    total = work["tallos_confirmados"].sum()
-    total_sku = summarize_visual_operational(work, ["sku_operativo"])[["sku_operativo", "tallos_confirmados", "precio_usd_tallo"]]
-    sku_meta = work.groupby(["sku_operativo"], dropna=False, as_index=False).agg(
+    avg = summarize_visual_operational(recent, ["sku_operativo"]).rename(columns={"tallos_confirmados": "promedio_ultimas_2"})
+    avg["promedio_ultimas_2"] = avg["promedio_ultimas_2"] / max(recent["anio_semana"].nunique(), 1) if not recent.empty else 0
+    total = recent["tallos_confirmados"].sum()
+    total_sku = summarize_visual_operational(recent, ["sku_operativo"])[["sku_operativo", "tallos_confirmados", "precio_usd_tallo"]]
+    sku_meta = recent.groupby(["sku_operativo"], dropna=False, as_index=False).agg(
         producto=("producto", lambda s: top_text(s, 4)),
         colores_internos=("color", lambda s: top_text(s, 5)),
         capuchon=("capuchon", lambda s: top_text(s, 1)),
@@ -4491,13 +4682,13 @@ def visual_recent_history(df: pd.DataFrame, analysis_week: int, top_n: int, sku_
         ramos_x_caja=("ramos_pedidos", _mean_numeric_text) if "ramos_pedidos" in work.columns else ("tallos_confirmados", lambda s: ""),
         caja_operativa=("caja_operativa", lambda s: top_text(s, 1)),
     )
-    out = pivot.merge(avg[["sku_operativo", "promedio_ultimas_12"]], on="sku_operativo", how="left").merge(total_sku, on="sku_operativo", how="left").merge(sku_meta, on="sku_operativo", how="left")
+    out = pivot.merge(avg[["sku_operativo", "promedio_ultimas_2"]], on="sku_operativo", how="left").merge(total_sku, on="sku_operativo", how="left").merge(sku_meta, on="sku_operativo", how="left")
     out["participacion"] = out["tallos_confirmados"] / total if total else 0
-    out["variacion_vs_promedio"] = (out["Semana actual"] / out["promedio_ultimas_12"].replace(0, np.nan) - 1).fillna(0)
+    out["variacion_vs_promedio"] = (out["Semana actual"] / out["promedio_ultimas_2"].replace(0, np.nan) - 1).fillna(0)
     out["sku_operativo_general"] = out.apply(lambda row: operational_sku_label(row, detail=False), axis=1)
     out["sku_operativo_detalle"] = out.apply(lambda row: operational_sku_label(row, detail=True), axis=1)
     out["sku_operativo_visible"] = out["sku_operativo_general"] if str(sku_view_mode or "general").lower() != "detalle" else out["sku_operativo_detalle"]
-    cols = ["sku_operativo_visible", "sku_operativo_general", "sku_operativo_detalle", "tipo_pedido_operativo", "producto", "variedad", "capuchon", "comida", "empaque", "tipo_caja", "tallos_x_ramo", "ramos_x_caja", "caja_operativa", "Semana actual", "Semana -1", "Semana -2", "Semana -3", "promedio_ultimas_12", "participacion", "variacion_vs_promedio", "precio_usd_tallo"]
+    cols = ["sku_operativo_visible", "sku_operativo_general", "sku_operativo_detalle", "tipo_pedido_operativo", "producto", "variedad", "capuchon", "comida", "empaque", "tipo_caja", "tallos_x_ramo", "ramos_x_caja", "caja_operativa", "Semana actual", "Semana -1", "promedio_ultimas_2", "participacion", "variacion_vs_promedio", "precio_usd_tallo"]
     out = out.sort_values("tallos_confirmados", ascending=False).head(max(top_n, 15))
     return out[[col for col in cols if col in out.columns]]
 
@@ -4529,7 +4720,14 @@ def format_operational_display(df: pd.DataFrame) -> pd.DataFrame:
         "colores_internos": "Colores internos",
         "variedades_internas": "Variedades internas",
         "composicion_interna": "Composicion interna",
+        "productos_composicion": "Productos composicion",
+        "colores_composicion": "Colores composicion",
+        "variedades_composicion": "Variedades composicion",
+        "lineas_componentes": "Lineas componentes",
+        "composicion_versiones": "Versiones composicion",
+        "composicion_firma_principal": "Firma composicion",
         "promedio_ultimas_12": "Promedio ultimas 12 semanas",
+        "promedio_ultimas_2": "Promedio ultimas 2 semanas",
         "variacion_vs_promedio": "Variacion vs promedio",
         "capuchon": "Capuchon",
         "comida": "Comida",
@@ -4540,7 +4738,7 @@ def format_operational_display(df: pd.DataFrame) -> pd.DataFrame:
         "caja_operativa": "Caja ID",
     }
     out = out.rename(columns={col: label for col, label in rename.items() if col in out.columns})
-    for col in ["Tallos confirmados", "Tallos pedidos", "Pedidos", "Cajas", "Semanas activas", "Semana actual", "Semana -1", "Semana -2", "Semana -3", "Promedio ultimas 12 semanas"]:
+    for col in ["Tallos confirmados", "Tallos pedidos", "Pedidos", "Cajas", "Semanas activas", "Semana actual", "Semana -1", "Semana -2", "Semana -3", "Promedio ultimas 12 semanas", "Promedio ultimas 2 semanas"]:
         if col in out.columns:
             out[col] = out[col].map(lambda value: moneyless_number(value, 0))
     for col in ["Ventas USD"]:
@@ -4616,6 +4814,8 @@ def filter_general_sales_frame(
     week_range: list[int] | None,
     clients: list[str] | None,
     products: list[str] | None,
+    countries: list[str] | None = None,
+    companies: list[str] | None = None,
 ) -> pd.DataFrame:
     """Filter the pre-aggregated weekly sales source used by the fast view."""
     if frame.empty:
@@ -4628,6 +4828,12 @@ def filter_general_sales_frame(
     selected_clients = selected_values(clients)
     if selected_clients and "cod_cliente" in out.columns:
         out = out[out["cod_cliente"].astype(str).isin(selected_clients)].copy()
+    selected_countries = selected_values(countries)
+    if selected_countries and "pais" in out.columns:
+        out = out[out["pais"].astype(str).isin(selected_countries)].copy()
+    selected_companies = selected_values(companies)
+    if selected_companies and "NomCompania" in out.columns:
+        out = out[out["NomCompania"].astype(str).isin(selected_companies)].copy()
     selected_products = selected_values(products)
     if selected_products and "producto" in out.columns:
         out = out[out["producto"].astype(str).isin(selected_products)].copy()
@@ -4700,32 +4906,28 @@ def build_sales_executive_context(
     base_metrics = aggregate_year(base_frame)
     compare_metrics = aggregate_year(compare_frame)
     compare_weeks = max(int(compare_frame["semana_iso"].nunique()), 1) if "semana_iso" in compare_frame.columns else 1
-    compare_projected_usd = compare_metrics["ventas_usd"] if compare_weeks >= 52 else compare_metrics["ventas_usd"] / compare_weeks * 52
-    compare_projected_tallos = compare_metrics["tallos_confirmados"] if compare_weeks >= 52 else compare_metrics["tallos_confirmados"] / compare_weeks * 52
-    compare_projected_price = compare_projected_usd / compare_projected_tallos if compare_projected_tallos > 0 else 0.0
-
     monthly = pd.concat(
         [
-            base_frame.assign(ano_tipo="Año base"),
-            compare_frame.assign(ano_tipo="Año comparativo"),
+            base_frame.assign(ano_tipo="AÃ±o base"),
+            compare_frame.assign(ano_tipo="AÃ±o comparativo"),
         ],
         ignore_index=True,
     )
     monthly["mes_num"] = pd.to_numeric(monthly["mes_num"], errors="coerce").fillna(0).astype(int)
     monthly = summarize_sales_frame(monthly, ["ano_tipo", "mes_num"]).sort_values(["ano_tipo", "mes_num"])
     monthly["Mes"] = monthly["mes_num"].map(_month_label)
-    monthly["Año"] = monthly["ano_tipo"]
+    monthly["AÃ±o"] = monthly["ano_tipo"]
 
     product_summary = pd.concat(
         [
             base_frame.groupby("producto", dropna=False, as_index=False).agg(
                 tallos_base=("tallos_confirmados", "sum"),
                 ventas_base=("ventas_usd", "sum"),
-            ).assign(Ano="Año base"),
+            ).assign(Ano="AÃ±o base"),
             compare_frame.groupby("producto", dropna=False, as_index=False).agg(
                 tallos_compare=("tallos_confirmados", "sum"),
                 ventas_compare=("ventas_usd", "sum"),
-            ).assign(Ano="Año comparativo"),
+            ).assign(Ano="AÃ±o comparativo"),
         ],
         ignore_index=True,
         sort=False,
@@ -4768,8 +4970,8 @@ def build_sales_executive_context(
 
     monthly_fig = go.Figure()
     if not monthly.empty:
-        for year_name in ["Año base", "Año comparativo"]:
-            subset = monthly[monthly["Año"].eq(year_name)]
+        for year_name in ["AÃ±o base", "AÃ±o comparativo"]:
+            subset = monthly[monthly["AÃ±o"].eq(year_name)]
             monthly_fig.add_trace(
                 go.Bar(
                     x=subset["Mes"],
@@ -4777,18 +4979,18 @@ def build_sales_executive_context(
                     name=year_name,
                 )
             )
-        monthly_fig.update_layout(barmode="group", title="Facturación USD por mes")
+        monthly_fig.update_layout(barmode="group", title="FacturaciÃ³n USD por mes")
         monthly_fig.update_yaxes(title="Ventas USD")
         monthly_fig.update_xaxes(title="Mes")
         apply_common_layout(monthly_fig, 360)
     else:
-        monthly_fig = empty_figure("Facturación USD por mes")
+        monthly_fig = empty_figure("FacturaciÃ³n USD por mes")
 
     product_bar_fig = go.Figure()
     compare_top = product_compare.head(10).copy()
     if not compare_top.empty:
-        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_base"], name="Año base"))
-        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_compare"], name="Año comparativo"))
+        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_base"], name="AÃ±o base"))
+        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_compare"], name="AÃ±o comparativo"))
         product_bar_fig.update_layout(barmode="group", title="Tallos por producto: base vs comparativo")
         product_bar_fig.update_yaxes(title="Tallos confirmados")
         product_bar_fig.update_xaxes(title="Producto")
@@ -4801,7 +5003,7 @@ def build_sales_executive_context(
         names="producto",
         values="tallos_compare",
         hole=0.42,
-        title=f"Mix de tallos del año comparativo {compare_year}",
+        title=f"Mix de tallos del aÃ±o comparativo {compare_year}",
     ) if not mix_donut.empty else empty_figure("Mix por producto")
     if not mix_donut.empty:
         apply_pie_label_style(mix_fig)
@@ -4809,11 +5011,11 @@ def build_sales_executive_context(
 
     consolidated_table = pd.DataFrame(
         [
-            {"Año": f"Año base {base_year}", "Tipo de dato": "Real", "Total USD": base_metrics["ventas_usd"]},
-            {"Año": f"Año comparativo {compare_year}", "Tipo de dato": "Real", "Total USD": compare_metrics["ventas_usd"]},
+            {"AÃ±o": f"AÃ±o base {base_year}", "Tipo de dato": "Real", "Total USD": base_metrics["ventas_usd"]},
+            {"AÃ±o": f"AÃ±o comparativo {compare_year}", "Tipo de dato": "Real", "Total USD": compare_metrics["ventas_usd"]},
             {
-                "Año": f"Año comparativo {compare_year}",
-                "Tipo de dato": "Proyección simple",
+                "AÃ±o": f"AÃ±o comparativo {compare_year}",
+                "Tipo de dato": "ProyecciÃ³n simple",
                 "Total USD": compare_projected_usd,
             },
         ]
@@ -4849,7 +5051,7 @@ def build_sales_executive_context(
         )
     if pd.notna(consolidated_delta_pct):
         insights.append(
-            f"La proyeccion del año comparativo estima una diferencia de {moneyless_number(consolidated_delta, 2)} USD frente al año base, equivalente a {percent(consolidated_delta_pct)} y {compare_growth_mult:.2f}x."
+            f"La proyeccion del aÃ±o comparativo estima una diferencia de {moneyless_number(consolidated_delta, 2)} USD frente al aÃ±o base, equivalente a {percent(consolidated_delta_pct)} y {compare_growth_mult:.2f}x."
         )
     insights = insights[:6]
 
@@ -4858,7 +5060,9 @@ def build_sales_executive_context(
             "ok": True,
             "message": "",
             "monthly_fig": monthly_fig,
+            "monthly_data": monthly,
             "mix_fig": mix_fig,
+            "mix_data": mix_donut,
             "product_bar_fig": product_bar_fig,
             "product_compare": product_compare,
             "consolidated_table": consolidated_table,
@@ -4928,27 +5132,27 @@ def build_sales_report_html(context: dict[str, object]) -> str:
     monthly_html = context["monthly_fig"].to_html(full_html=False, include_plotlyjs="cdn")
     mix_html = context["mix_fig"].to_html(full_html=False, include_plotlyjs=False)
     product_html = context["product_bar_fig"].to_html(full_html=False, include_plotlyjs=False)
-    weekly_note = "Incluye lectura semanal detallada al final de la pestaña en el dashboard."
+    weekly_note = "Incluye lectura semanal detallada al final de la pestaÃ±a en el dashboard."
     return f"""
     <html><head><meta charset="utf-8">{style}</head><body>
     <h1>Informe ejecutivo de Ventas Generales</h1>
-    <div class="meta">Comparación: año base {base_year} vs año comparativo {compare_year}</div>
+    <div class="meta">ComparaciÃ³n: aÃ±o base {base_year} vs aÃ±o comparativo {compare_year}</div>
     <div class="cards">
-      <div class="card"><div class="label">Facturación año base</div><div class="value">{moneyless_number(base_metrics['ventas_usd'], 2)}</div><div class="sub">USD</div></div>
-      <div class="card"><div class="label">Facturación comparativa</div><div class="value">{moneyless_number(context['compare_projected_usd'], 2)}</div><div class="sub">USD proyectados / reales</div></div>
-      <div class="card"><div class="label">Diferencia absoluta</div><div class="value">{moneyless_number(context['consolidated_delta'], 2)}</div><div class="sub">USD</div></div>
+      <div class="card"><div class="label">FacturaciÃ³n aÃ±o base</div><div class="value">{moneyless_number(base_metrics['ventas_usd'], 2)}</div><div class="sub">USD</div></div>
+      <div class="card"><div class="label">FacturaciÃ³n comparativa</div><div class="value">{moneyless_number(context['compare_projected_usd'], 2)}</div><div class="sub">USD proyectados / reales</div></div>
+      <div class="card"><div class="label">Diferencia absoluta</div><div class="value">{moneyless_number(context['compare_real_delta'], 2)}</div><div class="sub">USD reales</div></div>
       <div class="card"><div class="label">Crecimiento</div><div class="value">{percent(context['consolidated_delta_pct'])}</div><div class="sub">{context['compare_growth_mult']:.2f}x</div></div>
     </div>
     <div class="grid2">
-      <div class="panel"><h3>Resumen de facturación USD</h3>{monthly_html}</div>
+      <div class="panel"><h3>Resumen de facturaciÃ³n USD</h3>{monthly_html}</div>
       <div class="panel"><h3>Mix por producto</h3>{mix_html}</div>
     </div>
     <div class="grid2">
       <div class="panel"><h3>Tallos por producto</h3>{product_html}</div>
-      <div class="panel"><h3>Consolidado y proyección</h3>{consolidated_table.to_html(index=False, escape=False)}</div>
+      <div class="panel"><h3>Consolidado y proyecciÃ³n</h3>{consolidated_table.to_html(index=False, escape=False)}</div>
     </div>
     <div class="panel">
-      <h2>Insights automáticos</h2>
+      <h2>Insights automÃ¡ticos</h2>
       <ul class="insights">
         {''.join(f'<li>{item}</li>' for item in context['insights'])}
       </ul>
@@ -5036,7 +5240,7 @@ def render_ventas_generales_tab(
                     html.Div("Ventas generales", className="panel-title"),
                     panel_note(
                         "Vista rapida basada en ventas agregadas por semana, cliente y producto. "
-                        "Muestra tallos, ventas USD y precio ponderado; para composicion detallada usa Visualizador clientes general."
+                        "Muestra tallos, ventas USD y precio ponderado; para composicion detallada usa Visualizador clientes detallado."
                     ),
                     html.Div(
                         [
@@ -5115,10 +5319,6 @@ def build_sales_executive_context_v2(
     base_weeks = max(int(base_frame["semana_iso"].nunique()), 1) if "semana_iso" in base_frame.columns else 1
     compare_weeks = max(int(compare_frame["semana_iso"].nunique()), 1) if "semana_iso" in compare_frame.columns else 1
 
-    compare_projected_usd = compare_metrics["ventas_usd"] if compare_weeks >= 52 else compare_metrics["ventas_usd"] / compare_weeks * 52
-    compare_projected_tallos = compare_metrics["tallos_confirmados"] if compare_weeks >= 52 else compare_metrics["tallos_confirmados"] / compare_weeks * 52
-    compare_projected_price = compare_projected_usd / compare_projected_tallos if compare_projected_tallos > 0 else 0.0
-
     monthly = pd.concat(
         [
             base_frame.assign(ano_label=f"Ano base {int(base_year)}"),
@@ -5178,25 +5378,37 @@ def build_sales_executive_context_v2(
     product_bar_fig.update_xaxes(title="Producto")
     apply_common_layout(product_bar_fig, 370)
 
+    product_sales_bar_fig = go.Figure()
+    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_base"], name=f"Ano base {base_year}"))
+    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_compare"], name=f"Ano comparativo {compare_year}"))
+    product_sales_bar_fig.update_layout(barmode="group", title="Facturacion por producto: base vs comparativo")
+    product_sales_bar_fig.update_yaxes(title="Ventas USD")
+    product_sales_bar_fig.update_xaxes(title="Producto")
+    apply_common_layout(product_sales_bar_fig, 370)
+
     consolidated_table = pd.DataFrame(
         [
             {"Ano": f"Ano base {base_year}", "Tipo de dato": "Real", "Total USD": base_metrics["ventas_usd"]},
             {"Ano": f"Ano comparativo {compare_year}", "Tipo de dato": "Real", "Total USD": compare_metrics["ventas_usd"]},
-            {"Ano": f"Ano comparativo {compare_year}", "Tipo de dato": "Proyeccion simple", "Total USD": compare_projected_usd},
         ]
     )
     consolidated_fig = go.Figure()
-    consolidated_fig.add_trace(go.Bar(x=consolidated_table["Ano"], y=consolidated_table["Total USD"], marker_color=["#800020", "#4E79A7", "#59A14F"]))
-    consolidated_fig.update_layout(title="Consolidado y proyeccion USD", showlegend=False)
+    consolidated_fig.add_trace(go.Bar(x=consolidated_table["Ano"], y=consolidated_table["Total USD"], marker_color=["#800020", "#4E79A7"]))
+    consolidated_fig.update_layout(title="Consolidado real USD", showlegend=False)
     consolidated_fig.update_yaxes(title="USD")
     apply_common_layout(consolidated_fig, 330)
 
-    consolidated_delta = compare_projected_usd - base_metrics["ventas_usd"]
+    consolidated_delta = compare_metrics["ventas_usd"] - base_metrics["ventas_usd"]
     consolidated_delta_pct = consolidated_delta / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
     compare_real_delta = compare_metrics["ventas_usd"] - base_metrics["ventas_usd"]
     compare_real_pct = compare_real_delta / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
     compare_real_mult = compare_metrics["ventas_usd"] / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
-    compare_growth_mult = compare_projected_usd / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
+    annual_cards = pd.DataFrame(
+        [
+            {"anio": int(base_year), **base_metrics},
+            {"anio": int(compare_year), **compare_metrics},
+        ]
+    )
 
     product_leader = mix_donut.sort_values("share", ascending=False).iloc[0] if not mix_donut.empty else None
     product_grower = product_compare.sort_values("delta_usd_pct", ascending=False).iloc[0] if not product_compare.empty else None
@@ -5218,22 +5430,22 @@ def build_sales_executive_context_v2(
             "ok": True,
             "message": "",
             "monthly_fig": monthly_fig,
+            "monthly_data": monthly,
             "mix_fig": mix_fig,
+            "mix_data": mix_donut,
             "product_bar_fig": product_bar_fig,
+            "product_sales_bar_fig": product_sales_bar_fig,
             "consolidated_fig": consolidated_fig,
             "consolidated_table": consolidated_table,
             "product_compare": product_compare,
+            "annual_cards": annual_cards,
             "base_metrics": base_metrics,
             "compare_metrics": compare_metrics,
-            "compare_projected_usd": compare_projected_usd,
-            "compare_projected_tallos": compare_projected_tallos,
-            "compare_projected_price": compare_projected_price,
             "consolidated_delta": consolidated_delta,
             "consolidated_delta_pct": consolidated_delta_pct,
             "compare_real_delta": compare_real_delta,
             "compare_real_pct": compare_real_pct,
             "compare_real_mult": compare_real_mult,
-            "compare_growth_mult": compare_growth_mult,
             "insights": insights,
             "base_year": int(base_year),
             "compare_year": int(compare_year),
@@ -5241,6 +5453,754 @@ def build_sales_executive_context_v2(
         }
     )
     return context
+
+
+def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
+    if not context.get("ok"):
+        return pd.DataFrame()
+    base = context["base_metrics"]
+    compare = context["compare_metrics"]
+    rows = []
+    specs = [
+        ("Ventas USD", "ventas_usd", lambda value: moneyless_number(value, 2), lambda value: moneyless_number(value, 2)),
+        ("Tallos confirmados", "tallos_confirmados", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+        ("Precio USD/tallo", "precio_usd_tallo", lambda value: moneyless_number(value, 4), lambda value: moneyless_number(value, 4)),
+        ("Pedidos", "pedidos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+    ]
+    for label, key, formatter, delta_formatter in specs:
+        base_value = float(base.get(key, 0) or 0)
+        compare_value = float(compare.get(key, 0) or 0)
+        delta = compare_value - base_value
+        delta_pct = delta / base_value if base_value > 0 else np.nan
+        rows.append(
+            {
+                "Metrica": label,
+                f"Ano base {context['base_year']}": formatter(base_value),
+                f"Ano comparativo {context['compare_year']}": formatter(compare_value),
+                "Diferencia": delta_formatter(delta),
+                "Variacion %": percent(delta_pct),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def product_comparison_display(product_compare: pd.DataFrame, base_year: int, compare_year: int, rows: int = 18) -> pd.DataFrame:
+    if product_compare.empty:
+        return pd.DataFrame()
+    out = product_compare.head(rows).copy()
+    out = out.rename(
+        columns={
+            "producto": "Producto",
+            "ventas_base": f"USD {base_year}",
+            "ventas_compare": f"USD {compare_year}",
+            "delta_usd": "Dif. USD",
+            "delta_usd_pct": "Var. USD %",
+            "tallos_base": f"Tallos {base_year}",
+            "tallos_compare": f"Tallos {compare_year}",
+            "delta_tallos": "Dif. tallos",
+            "delta_tallos_pct": "Var. tallos %",
+            "share_compare": f"Share tallos {compare_year}",
+        }
+    )
+    cols = [
+        "Producto",
+        f"USD {base_year}",
+        f"USD {compare_year}",
+        "Dif. USD",
+        "Var. USD %",
+        f"Tallos {base_year}",
+        f"Tallos {compare_year}",
+        "Dif. tallos",
+        "Var. tallos %",
+        f"Share tallos {compare_year}",
+    ]
+    out = out[[col for col in cols if col in out.columns]]
+    for col in [f"USD {base_year}", f"USD {compare_year}", "Dif. USD", f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos", "Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"]:
+        if col in out.columns:
+            digits = 4 if col in {"Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"} else 2
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(digits)
+    return out
+
+
+def client_sales_display(view: pd.DataFrame, rows: int = 30, ascending: bool = True) -> pd.DataFrame:
+    if view.empty or "cod_cliente" not in view.columns:
+        return pd.DataFrame()
+    company_col = "NomCompania" if "NomCompania" in view.columns else ("cliente" if "cliente" in view.columns else None)
+    group_cols = ["cod_cliente"] + ([company_col] if company_col else [])
+    out = (
+        view.groupby(group_cols, dropna=False, as_index=False)
+        .agg(
+            ventas_usd=("ventas_usd", "sum"),
+            tallos_confirmados=("tallos_confirmados", "sum"),
+            pedidos=("pedidos", "sum") if "pedidos" in view.columns else ("ventas_usd", "size"),
+        )
+        .sort_values(["ventas_usd", "tallos_confirmados"], ascending=[ascending, ascending])
+        .head(rows)
+    )
+    out["precio_usd_tallo"] = (out["ventas_usd"] / out["tallos_confirmados"].replace(0, np.nan)).fillna(0)
+    out = out.rename(
+        columns={
+            "cod_cliente": "Cod. cliente",
+            "cliente": "Cliente",
+            "NomCompania": "Compania",
+            "ventas_usd": "Facturacion USD",
+            "tallos_confirmados": "Tallos",
+            "precio_usd_tallo": "Precio USD/tallo",
+            "pedidos": "Pedidos",
+        }
+    )
+    for col in ["Facturacion USD", "Tallos", "Precio USD/tallo", "Pedidos"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(4 if col == "Precio USD/tallo" else 2)
+    cols = ["Cod. cliente", "Compania", "Cliente", "Facturacion USD", "Tallos", "Precio USD/tallo", "Pedidos"]
+    return out[[col for col in cols if col in out.columns]]
+
+
+def growth_by_dimension_display(
+    view: pd.DataFrame,
+    base_year: int,
+    compare_year: int,
+    group_cols: list[str],
+    label_cols: list[str],
+    rows: int = 30,
+) -> pd.DataFrame:
+    if view.empty or not group_cols or any(col not in view.columns for col in group_cols):
+        return pd.DataFrame()
+    work = view[pd.to_numeric(view["anio"], errors="coerce").isin([int(base_year), int(compare_year)])].copy()
+    if work.empty:
+        return pd.DataFrame()
+    grouped = work.groupby(["anio"] + group_cols, dropna=False, as_index=False).agg(
+        ventas_usd=("ventas_usd", "sum"),
+        tallos_confirmados=("tallos_confirmados", "sum"),
+    )
+    base = grouped[pd.to_numeric(grouped["anio"], errors="coerce").eq(int(base_year))].drop(columns=["anio"])
+    comp = grouped[pd.to_numeric(grouped["anio"], errors="coerce").eq(int(compare_year))].drop(columns=["anio"])
+    merged = base.merge(comp, on=group_cols, how="outer", suffixes=("_base", "_compare")).fillna(0)
+    merged["delta_usd"] = merged["ventas_usd_compare"] - merged["ventas_usd_base"]
+    merged["delta_usd_pct"] = np.where(merged["ventas_usd_base"] > 0, merged["delta_usd"] / merged["ventas_usd_base"], np.nan)
+    merged["delta_tallos"] = merged["tallos_confirmados_compare"] - merged["tallos_confirmados_base"]
+    merged["delta_tallos_pct"] = np.where(merged["tallos_confirmados_base"] > 0, merged["delta_tallos"] / merged["tallos_confirmados_base"], np.nan)
+    merged["precio_compare"] = (merged["ventas_usd_compare"] / merged["tallos_confirmados_compare"].replace(0, np.nan)).fillna(0)
+    merged = merged.sort_values(["ventas_usd_compare", "delta_usd"], ascending=[False, False]).head(rows)
+    rename = {
+        "pais": "Pais",
+        "cod_cliente": "Cod. cliente",
+        "cliente": "Cliente",
+        "NomCompania": "Compania",
+        "ventas_usd_base": f"USD {base_year}",
+        "ventas_usd_compare": f"USD {compare_year}",
+        "delta_usd": "Crecimiento USD",
+        "delta_usd_pct": "Crecimiento %",
+        "tallos_confirmados_base": f"Tallos {base_year}",
+        "tallos_confirmados_compare": f"Tallos {compare_year}",
+        "delta_tallos": "Crecimiento tallos",
+        "delta_tallos_pct": "Crec. tallos %",
+        "precio_compare": f"Precio {compare_year}",
+    }
+    out = merged.rename(columns=rename)
+    cols = [rename.get(col, col) for col in label_cols] + [
+        f"USD {base_year}",
+        f"USD {compare_year}",
+        "Crecimiento USD",
+        "Crecimiento %",
+        f"Tallos {base_year}",
+        f"Tallos {compare_year}",
+        "Crecimiento tallos",
+        "Crec. tallos %",
+        f"Precio {compare_year}",
+    ]
+    out = out[[col for col in cols if col in out.columns]]
+    for col in [f"USD {base_year}", f"USD {compare_year}", "Crecimiento USD", f"Tallos {base_year}", f"Tallos {compare_year}", "Crecimiento tallos", "Crecimiento %", "Crec. tallos %", f"Precio {compare_year}"]:
+        if col in out.columns:
+            digits = 4 if col == f"Precio {compare_year}" else 4 if col in {"Crecimiento %", "Crec. tallos %"} else 2
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(digits)
+    return out
+
+
+def sales_scope_summary(
+    view: pd.DataFrame,
+    clients: list[str] | None,
+    products: list[str] | None,
+    countries: list[str] | None = None,
+    companies: list[str] | None = None,
+) -> dict[str, str]:
+    client_count = view["cod_cliente"].nunique() if "cod_cliente" in view.columns else 0
+    product_count = view["producto"].nunique() if "producto" in view.columns else 0
+    company_count = view["NomCompania"].nunique() if "NomCompania" in view.columns else 0
+    selected_clients = selected_values(clients)
+    selected_products = selected_values(products)
+    selected_countries = selected_values(countries)
+    selected_companies = selected_values(companies)
+    if selected_clients and {"cod_cliente", "cliente"}.issubset(view.columns):
+        names = (
+            view[["cod_cliente", "cliente"]]
+            .drop_duplicates()
+            .sort_values(["cliente", "cod_cliente"])
+            .head(4)
+            .apply(lambda row: f"{row['cliente']} | {row['cod_cliente']}", axis=1)
+            .tolist()
+        )
+        client_label = ", ".join(names)
+        if len(selected_clients) > 4:
+            client_label += f" + {len(selected_clients) - 4} mas"
+    else:
+        client_label = f"Todos los clientes visibles ({moneyless_number(client_count)})"
+    product_label = selected_label(selected_products, f"Todos los productos visibles ({moneyless_number(product_count)})")
+    country_count = view["pais"].nunique() if "pais" in view.columns else 0
+    country_label = selected_label(selected_countries, f"Todos los paises visibles ({moneyless_number(country_count)})")
+    company_label = selected_label(selected_companies, f"Todas las companias visibles ({moneyless_number(company_count)})")
+    return {
+        "clientes": client_label,
+        "companias": company_label,
+        "productos": product_label,
+        "paises": country_label,
+        "clientes_count": moneyless_number(client_count),
+        "companias_count": moneyless_number(company_count),
+        "productos_count": moneyless_number(product_count),
+        "paises_count": moneyless_number(country_count),
+    }
+
+
+def _pdf_escape(text: object) -> str:
+    clean = re.sub(r"\s+", " ", str(text)).strip()
+    clean = clean.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return clean
+
+
+def _pdf_text(content: list[str], x: int, y: int, text: object, size: int = 10, color: tuple[float, float, float] = (0.09, 0.13, 0.18), font: str = "F1") -> None:
+    r, g, b = color
+    content.append(f"{r:.3f} {g:.3f} {b:.3f} rg BT /{font} {size} Tf {x} {y} Td ({_pdf_escape(text)}) Tj ET")
+
+
+def _pdf_rect(content: list[str], x: int, y: int, w: int, h: int, color: tuple[float, float, float]) -> None:
+    r, g, b = color
+    content.append(f"{r:.3f} {g:.3f} {b:.3f} rg {x} {y} {w} {h} re f")
+
+
+def _pdf_stroked_rect(
+    content: list[str],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    fill: tuple[float, float, float],
+    stroke: tuple[float, float, float] = (0.86, 0.89, 0.93),
+    width: float = 0.8,
+) -> None:
+    fr, fg, fb = fill
+    sr, sg, sb = stroke
+    content.append(f"{width:.2f} w {fr:.3f} {fg:.3f} {fb:.3f} rg {sr:.3f} {sg:.3f} {sb:.3f} RG {x} {y} {w} {h} re B")
+
+
+def _pdf_logo_image(path: Path | None = None) -> tuple[bytes, int, int, str] | None:
+    path = path or resolve_logo_path()
+    if path is None:
+        return None
+    if not path.exists():
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img = img.convert("RGBA")
+            img.thumbnail((220, 90))
+            header_bg = Image.new("RGBA", img.size, (128, 0, 32, 255))
+            header_bg.alpha_composite(img)
+            rgb = header_bg.convert("RGB")
+            return zlib.compress(rgb.tobytes()), rgb.width, rgb.height, "FlateDecode"
+    except Exception:
+        return None
+
+
+def _pdf_logo(content: list[str], x: int, y: int, w: int, h: int) -> None:
+    content.append(f"q {w} 0 0 {h} {x} {y} cm /Logo Do Q")
+
+
+def _pdf_line(content: list[str], x1: float, y1: float, x2: float, y2: float, color: tuple[float, float, float], width: float = 1.0) -> None:
+    r, g, b = color
+    content.append(f"{width:.2f} w {r:.3f} {g:.3f} {b:.3f} RG {x1:.1f} {y1:.1f} m {x2:.1f} {y2:.1f} l S")
+
+
+def _pdf_polygon(content: list[str], points: list[tuple[float, float]], color: tuple[float, float, float]) -> None:
+    if not points:
+        return
+    r, g, b = color
+    first = points[0]
+    rest = " ".join(f"{px:.1f} {py:.1f} l" for px, py in points[1:])
+    content.append(f"{r:.3f} {g:.3f} {b:.3f} rg {first[0]:.1f} {first[1]:.1f} m {rest} h f")
+
+
+def _pdf_short_number(value: float) -> str:
+    value = float(value or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value >= 1_000_000:
+        return f"{sign}{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{sign}{value / 1_000:.0f}K"
+    if value >= 10:
+        return f"{sign}{value:.0f}"
+    return f"{sign}{value:.2f}"
+
+
+def _pdf_panel(content: list[str], x: int, y: int, w: int, h: int, title: str, note: str = "") -> None:
+    _pdf_stroked_rect(content, x, y, w, h, (1, 1, 1), (0.86, 0.89, 0.93), 0.9)
+    _pdf_rect(content, x, y + h - 5, w, 5, (0.50, 0.00, 0.13))
+    _pdf_text(content, x + 12, y + h - 22, title, 11, (0.09, 0.13, 0.18), "F2")
+    if note:
+        _pdf_text(content, x + 12, y + h - 36, note[:88], 7, (0.38, 0.43, 0.49))
+
+
+def _pdf_table(
+    content: list[str],
+    x: int,
+    y: int,
+    w: int,
+    headers: list[str],
+    rows: list[dict[str, object]],
+    widths: list[int],
+    row_h: int = 15,
+    font_size: int = 7,
+) -> int:
+    _pdf_rect(content, x, y - 3, w, row_h + 4, (0.94, 0.91, 0.92))
+    cx = x
+    for header, width in zip(headers, widths):
+        _pdf_text(content, cx + 4, y + 1, header[:18], font_size, (0.09, 0.13, 0.18), "F2")
+        cx += width
+    y -= row_h
+    for idx, row in enumerate(rows):
+        if idx % 2 == 0:
+            _pdf_rect(content, x, y - 3, w, row_h, (0.98, 0.99, 1.00))
+        cx = x
+        for header, width in zip(headers, widths):
+            _pdf_text(content, cx + 4, y, str(row.get(header, ""))[: max(8, int(width / 5))], font_size, (0.18, 0.22, 0.28))
+            cx += width
+        y -= row_h
+    _pdf_line(content, x, y + row_h - 2, x + w, y + row_h - 2, (0.86, 0.89, 0.93), 0.6)
+    return y
+
+
+def _pdf_comparison_cards(content: list[str], x: int, y: int, cards: list[dict[str, object]], base_year: int, compare_year: int) -> None:
+    card_w = 124
+    card_h = 78
+    gap = 8
+    for idx, card in enumerate(cards):
+        cx = x + idx * (card_w + gap)
+        delta = card.get("delta_pct")
+        positive = pd.notna(delta) and float(delta) >= 0
+        accent = (0.00, 0.53, 0.33) if positive else (0.73, 0.13, 0.16)
+        if delta is None or pd.isna(delta):
+            accent = (0.46, 0.50, 0.56)
+            delta_text = "sin base"
+        else:
+            delta_text = f"{float(delta):+.1%}"
+        _pdf_stroked_rect(content, cx, y - card_h, card_w, card_h, (0.97, 0.98, 0.99), (0.86, 0.89, 0.93), 0.8)
+        _pdf_rect(content, cx, y - 5, card_w, 5, (0.50, 0.00, 0.13))
+        _pdf_text(content, cx + 10, y - 20, str(card["title"]), 8, (0.38, 0.43, 0.49), "F2")
+        _pdf_text(content, cx + 10, y - 36, f"{base_year}: {card['base']}", 8, (0.18, 0.22, 0.28))
+        _pdf_text(content, cx + 10, y - 51, f"{compare_year}: {card['compare']}", 8, (0.09, 0.13, 0.18), "F2")
+        _pdf_rect(content, cx + 10, y - 70, 46, 13, accent)
+        _pdf_text(content, cx + 15, y - 67, delta_text, 7, (1, 1, 1), "F2")
+
+
+def _pdf_bar_chart(
+    content: list[str],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    labels: list[str],
+    base_values: list[float],
+    compare_values: list[float],
+    title: str,
+    base_year: int,
+    compare_year: int,
+    x_title: str = "",
+    y_title: str = "",
+) -> None:
+    _pdf_panel(content, x, y, w, h, title)
+    plot_x = x + 46
+    plot_y = y + 32
+    plot_w = w - 62
+    plot_h = h - 76
+    max_value = max(base_values + compare_values + [1])
+    tick_max = max_value * 1.12
+    for tick_idx in range(5):
+        value = tick_max * tick_idx / 4
+        ty = plot_y + plot_h * tick_idx / 4
+        _pdf_line(content, plot_x, ty, plot_x + plot_w, ty, (0.91, 0.93, 0.95), 0.45)
+        _pdf_text(content, x + 8, int(ty - 3), _pdf_short_number(value), 6, (0.38, 0.43, 0.49))
+    _pdf_line(content, plot_x, plot_y, plot_x + plot_w, plot_y, (0.74, 0.78, 0.83), 0.8)
+    _pdf_line(content, plot_x, plot_y, plot_x, plot_y + plot_h, (0.74, 0.78, 0.83), 0.8)
+    if y_title:
+        _pdf_text(content, plot_x, y + h - 49, y_title, 7, (0.38, 0.43, 0.49), "F2")
+    if x_title:
+        _pdf_text(content, plot_x + int(plot_w / 2) - 18, y + 11, x_title, 7, (0.38, 0.43, 0.49), "F2")
+    group_w = plot_w / max(len(labels), 1)
+    bar_w = min(14, max(5, group_w / 5))
+    for idx, label in enumerate(labels):
+        gx = plot_x + idx * group_w + group_w * 0.30
+        bh = (base_values[idx] / tick_max) * plot_h
+        ch = (compare_values[idx] / tick_max) * plot_h
+        _pdf_rect(content, int(gx), int(plot_y), int(bar_w), int(bh), (0.50, 0.00, 0.13))
+        _pdf_rect(content, int(gx + bar_w + 4), int(plot_y), int(bar_w), int(ch), (0.31, 0.47, 0.65))
+        _pdf_text(content, int(plot_x + idx * group_w + 2), y + 20, label[:10], 6, (0.38, 0.43, 0.49))
+    legend_y = y + h - 36
+    _pdf_rect(content, x + w - 104, legend_y, 8, 8, (0.50, 0.00, 0.13))
+    _pdf_text(content, x + w - 92, legend_y, str(base_year), 7, (0.38, 0.43, 0.49))
+    _pdf_rect(content, x + w - 54, legend_y, 8, 8, (0.31, 0.47, 0.65))
+    _pdf_text(content, x + w - 42, legend_y, str(compare_year), 7, (0.38, 0.43, 0.49))
+
+
+def _pdf_line_chart(
+    content: list[str],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    weekly: pd.DataFrame,
+    metric: str,
+    title: str,
+    base_year: int,
+    compare_year: int,
+    x_title: str = "Semana ISO",
+    y_title: str = "",
+) -> None:
+    _pdf_panel(content, x, y, w, h, title)
+    plot_x = x + 46
+    plot_y = y + 32
+    plot_w = w - 62
+    plot_h = h - 76
+    frame = weekly[pd.to_numeric(weekly["anio"], errors="coerce").isin([base_year, compare_year])].copy() if not weekly.empty else pd.DataFrame()
+    if frame.empty or metric not in frame.columns:
+        _pdf_text(content, x + 20, y + h / 2, "Sin datos para la grafica", 8, (0.38, 0.43, 0.49))
+        return
+    max_value = max(float(frame[metric].max()), 1.0) * 1.12
+    min_week = max(int(pd.to_numeric(frame["semana_iso"], errors="coerce").min()), 1)
+    max_week = max(int(pd.to_numeric(frame["semana_iso"], errors="coerce").max()), min_week + 1)
+    for tick_idx in range(5):
+        value = max_value * tick_idx / 4
+        ty = plot_y + plot_h * tick_idx / 4
+        _pdf_line(content, plot_x, ty, plot_x + plot_w, ty, (0.91, 0.93, 0.95), 0.45)
+        _pdf_text(content, x + 8, int(ty - 3), _pdf_short_number(value), 6, (0.38, 0.43, 0.49))
+    _pdf_line(content, plot_x, plot_y, plot_x + plot_w, plot_y, (0.74, 0.78, 0.83), 0.8)
+    _pdf_line(content, plot_x, plot_y, plot_x, plot_y + plot_h, (0.74, 0.78, 0.83), 0.8)
+    if y_title:
+        _pdf_text(content, plot_x, y + h - 49, y_title, 7, (0.38, 0.43, 0.49), "F2")
+    _pdf_text(content, plot_x + int(plot_w / 2) - 18, y + 11, x_title, 7, (0.38, 0.43, 0.49), "F2")
+    for tick_idx in range(5):
+        week = int(round(min_week + (max_week - min_week) * tick_idx / 4))
+        tx = plot_x + plot_w * tick_idx / 4
+        _pdf_line(content, tx, plot_y, tx, plot_y - 3, (0.74, 0.78, 0.83), 0.6)
+        _pdf_text(content, int(tx - 5), y + 21, str(week), 6, (0.38, 0.43, 0.49))
+    colors = {base_year: (0.50, 0.00, 0.13), compare_year: (0.31, 0.47, 0.65)}
+    for year in [base_year, compare_year]:
+        subset = frame[pd.to_numeric(frame["anio"], errors="coerce").eq(year)].sort_values("semana_iso")
+        points = []
+        for row in subset.itertuples(index=False):
+            week = int(getattr(row, "semana_iso"))
+            value = float(getattr(row, metric))
+            px_x = plot_x + ((week - min_week) / max(max_week - min_week, 1)) * plot_w
+            px_y = plot_y + (value / max_value) * plot_h
+            points.append((px_x, px_y))
+        for left, right in zip(points, points[1:]):
+            _pdf_line(content, left[0], left[1], right[0], right[1], colors[year], 1.6)
+    legend_y = y + h - 36
+    _pdf_rect(content, x + w - 104, legend_y, 8, 8, colors[base_year])
+    _pdf_text(content, x + w - 92, legend_y, str(base_year), 7, (0.38, 0.43, 0.49))
+    _pdf_rect(content, x + w - 54, legend_y, 8, 8, colors[compare_year])
+    _pdf_text(content, x + w - 42, legend_y, str(compare_year), 7, (0.38, 0.43, 0.49))
+
+
+def _pdf_monthly_bar_chart(
+    content: list[str],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    monthly: pd.DataFrame,
+    base_year: int,
+    compare_year: int,
+) -> None:
+    _pdf_panel(content, x, y, w, h, "Facturacion USD por mes")
+    plot_x = x + 46
+    plot_y = y + 32
+    plot_w = w - 62
+    plot_h = h - 76
+    frame = monthly.copy() if monthly is not None else pd.DataFrame()
+    if frame.empty or "ventas_usd" not in frame.columns:
+        _pdf_text(content, x + 20, y + h / 2, "Sin datos para la grafica", 8, (0.38, 0.43, 0.49))
+        return
+    base_label = f"Ano base {base_year}"
+    compare_label = f"Ano comparativo {compare_year}"
+    months = frame[["mes_num", "Mes"]].drop_duplicates().sort_values("mes_num").head(12)
+    max_value = max(float(frame["ventas_usd"].max()), 1.0) * 1.12
+    for tick_idx in range(5):
+        value = max_value * tick_idx / 4
+        ty = plot_y + plot_h * tick_idx / 4
+        _pdf_line(content, plot_x, ty, plot_x + plot_w, ty, (0.91, 0.93, 0.95), 0.45)
+        _pdf_text(content, x + 8, int(ty - 3), _pdf_short_number(value), 6, (0.38, 0.43, 0.49))
+    _pdf_line(content, plot_x, plot_y, plot_x + plot_w, plot_y, (0.74, 0.78, 0.83), 0.8)
+    _pdf_line(content, plot_x, plot_y, plot_x, plot_y + plot_h, (0.74, 0.78, 0.83), 0.8)
+    _pdf_text(content, plot_x, y + h - 49, "Ventas USD", 7, (0.38, 0.43, 0.49), "F2")
+    _pdf_text(content, plot_x + int(plot_w / 2) - 10, y + 11, "Mes", 7, (0.38, 0.43, 0.49), "F2")
+    group_w = plot_w / max(len(months), 1)
+    bar_w = min(9, max(4, group_w / 5))
+    colors = {base_label: (0.50, 0.00, 0.13), compare_label: (0.31, 0.47, 0.65)}
+    for idx, row in enumerate(months.itertuples(index=False)):
+        gx = plot_x + idx * group_w + group_w * 0.24
+        for offset, label in enumerate([base_label, compare_label]):
+            subset = frame[(frame["ano_label"].eq(label)) & (frame["mes_num"].eq(int(row.mes_num)))]
+            value = float(subset["ventas_usd"].sum()) if not subset.empty else 0.0
+            bh = (value / max_value) * plot_h
+            _pdf_rect(content, int(gx + offset * (bar_w + 3)), int(plot_y), int(bar_w), int(bh), colors[label])
+        _pdf_text(content, int(plot_x + idx * group_w + 1), y + 20, str(row.Mes)[:3], 6, (0.38, 0.43, 0.49))
+    legend_y = y + h - 36
+    _pdf_rect(content, x + w - 118, legend_y, 8, 8, colors[base_label])
+    _pdf_text(content, x + w - 106, legend_y, str(base_year), 7, (0.38, 0.43, 0.49))
+    _pdf_rect(content, x + w - 64, legend_y, 8, 8, colors[compare_label])
+    _pdf_text(content, x + w - 52, legend_y, str(compare_year), 7, (0.38, 0.43, 0.49))
+
+
+def _pdf_pie_chart(content: list[str], x: int, y: int, w: int, h: int, mix: pd.DataFrame, compare_year: int) -> None:
+    _pdf_panel(content, x, y, w, h, f"Mix de tallos {compare_year}")
+    frame = mix.copy() if mix is not None else pd.DataFrame()
+    if frame.empty or "tallos_compare" not in frame.columns:
+        _pdf_text(content, x + 20, y + h / 2, "Sin datos para la torta", 8, (0.38, 0.43, 0.49))
+        return
+    frame = frame.sort_values("tallos_compare", ascending=False).head(8)
+    total = float(frame["tallos_compare"].sum())
+    if total <= 0:
+        _pdf_text(content, x + 20, y + h / 2, "Sin tallos para la torta", 8, (0.38, 0.43, 0.49))
+        return
+    colors = [(0.50, 0.00, 0.13), (0.31, 0.47, 0.65), (0.35, 0.63, 0.31), (0.95, 0.56, 0.17), (0.69, 0.48, 0.63), (0.60, 0.64, 0.69), (0.88, 0.34, 0.35), (0.46, 0.72, 0.70)]
+    cx = x + 88
+    cy = y + 78
+    radius = min(54, h / 3)
+    start = -math.pi / 2
+    for idx, row in enumerate(frame.itertuples(index=False)):
+        value = float(getattr(row, "tallos_compare"))
+        angle = (value / total) * math.tau
+        steps = max(4, int(angle / math.tau * 42))
+        points = [(cx, cy)]
+        for step in range(steps + 1):
+            a = start + angle * step / steps
+            points.append((cx + math.cos(a) * radius, cy + math.sin(a) * radius))
+        _pdf_polygon(content, points, colors[idx % len(colors)])
+        start += angle
+    _pdf_rect(content, int(cx - 24), int(cy - 24), 48, 48, (1, 1, 1))
+    _pdf_text(content, int(cx - 17), int(cy + 3), "Mix", 9, (0.09, 0.13, 0.18), "F2")
+    _pdf_text(content, int(cx - 22), int(cy - 11), "tallos", 7, (0.38, 0.43, 0.49))
+    legend_x = x + 168
+    legend_y = y + h - 48
+    for idx, row in enumerate(frame.itertuples(index=False)):
+        product = str(getattr(row, "producto"))[:18]
+        share = float(getattr(row, "tallos_compare")) / total
+        yy = legend_y - idx * 14
+        _pdf_rect(content, legend_x, yy, 8, 8, colors[idx % len(colors)])
+        _pdf_text(content, legend_x + 12, yy, f"{product} {percent(share)}", 7, (0.18, 0.22, 0.28))
+
+
+def build_sales_report_pdf(
+    context: dict[str, object],
+    scope: dict[str, str],
+    weekly: pd.DataFrame | None = None,
+    report_type: str = "summary",
+    view: pd.DataFrame | None = None,
+) -> bytes:
+    """Generate a compact native PDF without external dependencies."""
+    metric_table = sales_metric_comparison_display(context)
+    product_table = product_comparison_display(context["product_compare"], context["base_year"], context["compare_year"], rows=10)
+    weekly = weekly if weekly is not None else pd.DataFrame()
+    base_year = int(context["base_year"])
+    compare_year = int(context["compare_year"])
+    pages: list[str] = []
+
+    def new_page() -> list[str]:
+        c: list[str] = []
+        _pdf_rect(c, 0, 770, 595, 72, (0.50, 0.00, 0.13))
+        if _pdf_logo_image() is not None:
+            _pdf_logo(c, 456, 789, 104, 28)
+        _pdf_text(c, 36, 808, "Informe ejecutivo de Ventas Generales", 18, (1, 1, 1), "F2")
+        _pdf_text(c, 36, 790, f"Ano base {context['base_year']} vs ano comparativo {context['compare_year']}", 10, (0.94, 0.91, 0.92))
+        return c
+
+    c = new_page()
+    y = 735
+    _pdf_text(c, 36, y, f"Companias: {scope.get('companias', 'todas')} | Clientes: {scope['clientes']}", 10, (0.18, 0.22, 0.28), "F2")
+    y -= 16
+    _pdf_text(c, 36, y, f"Paises: {scope.get('paises', 'todos')} | Productos: {scope['productos']} | Semanas: {context.get('week_text', 'todas')}", 9, (0.38, 0.43, 0.49))
+    y -= 34
+
+    top_products = context["product_compare"].head(6).copy()
+    _pdf_bar_chart(
+        c,
+        36,
+        y - 160,
+        174,
+        150,
+        ["Ventas"],
+        [float(context["base_metrics"]["ventas_usd"])],
+        [float(context["compare_metrics"]["ventas_usd"])],
+        "Ventas generales USD",
+        base_year,
+        compare_year,
+        "Ano",
+        "Ventas USD",
+    )
+    if not top_products.empty:
+        _pdf_bar_chart(
+            c,
+            248,
+            y - 160,
+            294,
+            150,
+            top_products["producto"].astype(str).str.slice(0, 10).tolist(),
+            top_products["ventas_base"].astype(float).tolist(),
+            top_products["ventas_compare"].astype(float).tolist(),
+            "Ventas por producto",
+            base_year,
+            compare_year,
+            "Producto",
+            "Ventas USD",
+    )
+    y -= 190
+
+    _pdf_monthly_bar_chart(c, 36, y - 154, 248, 144, context.get("monthly_data", pd.DataFrame()), base_year, compare_year)
+    _pdf_pie_chart(c, 308, y - 154, 248, 144, context.get("mix_data", pd.DataFrame()), compare_year)
+    y -= 184
+
+    base_metrics = context["base_metrics"]
+    compare_metrics = context["compare_metrics"]
+    card_specs = [
+        ("Ventas USD", "ventas_usd", lambda value: moneyless_number(value, 2)),
+        ("Tallos confirmados", "tallos_confirmados", lambda value: moneyless_number(value)),
+        ("Precio promedio", "precio_usd_tallo", lambda value: moneyless_number(value, 4)),
+        ("Pedidos", "pedidos", lambda value: moneyless_number(value)),
+    ]
+    comparison_cards = []
+    for title, metric, formatter in card_specs:
+        base_value = float(base_metrics.get(metric, 0) or 0)
+        compare_value = float(compare_metrics.get(metric, 0) or 0)
+        comparison_cards.append(
+            {
+                "title": title,
+                "base": formatter(base_value),
+                "compare": formatter(compare_value),
+                "delta_pct": (compare_value - base_value) / base_value if base_value > 0 else np.nan,
+            }
+        )
+    _pdf_comparison_cards(c, 36, y, comparison_cards, base_year, compare_year)
+    y -= 104
+
+    _pdf_text(c, 36, y, "Comparativo general", 13, (0.09, 0.13, 0.18), "F2")
+    y -= 20
+    headers = metric_table.columns.tolist()
+    widths = [112, 104, 116, 92, 72]
+    x0 = 36
+    y = _pdf_table(c, x0, y, 520, headers, metric_table.to_dict("records"), widths, row_h=16, font_size=7)
+
+    if report_type == "summary":
+        y -= 18
+        _pdf_stroked_rect(c, 36, y - 76, 520, 92, (1, 1, 1))
+        _pdf_rect(c, 36, y + 11, 520, 5, (0.50, 0.00, 0.13))
+        _pdf_text(c, 50, y - 6, "Lectura estrategica", 13, (0.09, 0.13, 0.18), "F2")
+        y -= 24
+        for item in context.get("insights", [])[:4]:
+            _pdf_text(c, 52, y, f"- {item}", 8, (0.18, 0.22, 0.28))
+            y -= 14
+        pages.append("\n".join(c))
+        return _assemble_pdf_pages(pages, logo=_pdf_logo_image())
+
+    y -= 18
+    _pdf_text(c, 36, y, "Top productos por comparativo", 13, (0.09, 0.13, 0.18), "F2")
+    y -= 20
+    prod_cols = product_table.columns.tolist()[:6]
+    prod_widths = [92, 82, 82, 82, 58, 82]
+    y = _pdf_table(c, x0, y, 520, prod_cols, product_table.to_dict("records"), prod_widths, row_h=15, font_size=7)
+
+    pages.append("\n".join(c))
+    c = new_page()
+    y = 735
+    _pdf_line_chart(c, 36, y - 130, 500, 130, weekly, "tallos_confirmados", "Tallos confirmados por semana", base_year, compare_year, "Semana ISO", "Tallos confirmados")
+    y -= 180
+    _pdf_line_chart(c, 36, y - 130, 500, 130, weekly, "precio_usd_tallo", "Precio USD/tallo por semana", base_year, compare_year, "Semana ISO", "USD/tallo")
+    y -= 176
+
+    _pdf_text(c, 36, y, "Insights", 13, (0.09, 0.13, 0.18), "F2")
+    y -= 18
+    for item in context.get("insights", [])[:5]:
+        _pdf_text(c, 48, y, f"- {item}", 8, (0.18, 0.22, 0.28))
+        y -= 14
+    pages.append("\n".join(c))
+
+    if view is not None and not view.empty:
+        c = new_page()
+        y = 735
+        _pdf_text(c, 36, y, "Tablas ejecutivas del dashboard", 13, (0.09, 0.13, 0.18), "F2")
+        y -= 22
+        client_table = client_sales_display(view, rows=10, ascending=False)
+        client_cols = [col for col in ["Compania", "Cliente", "Facturacion USD", "Tallos", "Precio USD/tallo"] if col in client_table.columns]
+        if client_cols:
+            _pdf_panel(c, 36, y - 172, 520, 178, "Clientes/companias por facturacion", "Orden descendente segun filtros activos.")
+            _pdf_table(c, 48, y - 36, 496, client_cols, client_table[client_cols].to_dict("records"), [110, 136, 92, 82, 76][: len(client_cols)], row_h=13, font_size=6)
+            y -= 204
+        country_table = growth_by_dimension_display(view, base_year, compare_year, ["pais"], ["pais"], rows=8)
+        country_cols = country_table.columns.tolist()[:5]
+        if country_cols:
+            _pdf_panel(c, 36, y - 148, 248, 154, "Crecimiento por pais", "Facturacion y variacion.")
+            _pdf_table(c, 48, y - 36, 224, country_cols, country_table[country_cols].to_dict("records"), [54, 48, 48, 42, 32][: len(country_cols)], row_h=13, font_size=6)
+        company_cols_group = ["NomCompania"] if "NomCompania" in view.columns else ["cod_cliente", "cliente"]
+        company_table = growth_by_dimension_display(view, base_year, compare_year, company_cols_group, company_cols_group, rows=8)
+        company_cols = company_table.columns.tolist()[:5]
+        if company_cols:
+            _pdf_panel(c, 308, y - 148, 248, 154, "Crecimiento por compania", "Comparativo base vs actual.")
+            _pdf_table(c, 320, y - 36, 224, company_cols, company_table[company_cols].to_dict("records"), [70, 44, 44, 38, 28][: len(company_cols)], row_h=13, font_size=6)
+        pages.append("\n".join(c))
+
+    return _assemble_pdf_pages(pages, logo=_pdf_logo_image())
+
+
+def _assemble_pdf_pages(pages: list[str], logo: tuple[bytes, int, int, str] | None = None) -> bytes:
+
+    objects: list[bytes] = []
+    pages_kids = []
+    bold_font_obj = len(pages) * 2 + 4
+    logo_obj = bold_font_obj + 1 if logo is not None else None
+    for i, page_content in enumerate(pages):
+        stream = page_content.encode("latin-1", errors="replace")
+        content_obj = 5 + i * 2
+        page_obj = 4 + i * 2
+        pages_kids.append(f"{page_obj} 0 R")
+        xobject = f" /XObject << /Logo {logo_obj} 0 R >>" if logo_obj is not None else ""
+        objects.append(f"{page_obj} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 {bold_font_obj} 0 R >>{xobject} >> /Contents {content_obj} 0 R >> endobj\n".encode("latin-1"))
+        objects.append(f"{content_obj} 0 obj << /Length {len(stream)} >> stream\n".encode("latin-1") + stream + b"\nendstream endobj\n")
+    base_objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        f"2 0 obj << /Type /Pages /Kids [{' '.join(pages_kids)}] /Count {len(pages)} >> endobj\n".encode("latin-1"),
+        b"3 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+        f"{bold_font_obj} 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >> endobj\n".encode("latin-1"),
+    ]
+    extra_objects = []
+    if logo is not None and logo_obj is not None:
+        img_bytes, img_w, img_h, img_filter = logo
+        extra_objects.append(
+            f"{logo_obj} 0 obj << /Type /XObject /Subtype /Image /Width {img_w} /Height {img_h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /{img_filter} /Length {len(img_bytes)} >> stream\n".encode("latin-1")
+            + img_bytes
+            + b"\nendstream endobj\n"
+        )
+    all_objects = base_objects[:3] + objects + [base_objects[3]] + extra_objects
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in all_objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+    xref_pos = len(pdf)
+    pdf.extend(f"xref\n0 {len(all_objects) + 1}\n0000000000 65535 f \n".encode("latin-1"))
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
+    pdf.extend(f"trailer << /Size {len(all_objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF".encode("latin-1"))
+    return bytes(pdf)
 
 
 def build_sales_report_html_v2(context: dict[str, object]) -> str:
@@ -5273,8 +6233,8 @@ def build_sales_report_html_v2(context: dict[str, object]) -> str:
     product_html = context["product_bar_fig"].to_html(full_html=False, include_plotlyjs=False)
     consolidated_html = context["consolidated_fig"].to_html(full_html=False, include_plotlyjs=False)
     insights_html = "".join(f"<li>{item}</li>" for item in context["insights"])
-    consolidated_table = context["consolidated_table"].copy()
-    consolidated_table["Total USD"] = consolidated_table["Total USD"].map(lambda value: moneyless_number(value, 2))
+    metric_table = sales_metric_comparison_display(context)
+    product_table = product_comparison_display(context["product_compare"], context["base_year"], context["compare_year"], rows=14)
 
     return f"""
     <html><head><meta charset="utf-8">{style}</head><body>
@@ -5292,11 +6252,15 @@ def build_sales_report_html_v2(context: dict[str, object]) -> str:
     </div>
     <div class="grid2">
       <div class="panel"><h3>Tallos por producto</h3>{product_html}</div>
-      <div class="panel"><h3>Consolidado y proyeccion</h3>{consolidated_html}</div>
+      <div class="panel"><h3>Consolidado real</h3>{consolidated_html}</div>
     </div>
     <div class="panel">
-      <h2>Tabla consolidada</h2>
-      {consolidated_table.to_html(index=False, escape=False)}
+      <h2>Comparativo general</h2>
+      {metric_table.to_html(index=False, escape=False)}
+    </div>
+    <div class="panel">
+      <h2>Comparativo por producto</h2>
+      {product_table.to_html(index=False, escape=False)}
     </div>
     <div class="panel">
       <h2>Insights automaticos</h2>
@@ -5316,7 +6280,9 @@ def render_ventas_generales_tab_v2(
     compare_year: int | None,
     years: list[int] | None,
     week_range: list[int] | None,
+    companies: list[str] | None,
     clients: list[str] | None,
+    countries: list[str] | None,
     products: list[str] | None,
 ) -> html.Div:
     """Executive sales tab with yearly comparison and weekly context."""
@@ -5324,7 +6290,7 @@ def render_ventas_generales_tab_v2(
     if sales.empty:
         return html.Div("No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.", className="table-panel")
 
-    view = filter_general_sales_frame(sales, years, week_range, clients, products)
+    view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies)
     if view.empty:
         available_years = sorted(pd.to_numeric(sales["anio"], errors="coerce").dropna().astype(int).unique().tolist()) if "anio" in sales.columns else []
         years_text = ", ".join(map(str, available_years)) if available_years else "sin anos disponibles"
@@ -5332,7 +6298,7 @@ def render_ventas_generales_tab_v2(
             [
                 html.Div("Ventas generales", className="panel-title"),
                 panel_note(
-                    f"No hay ventas para los filtros seleccionados. Años disponibles en esta base: {years_text}. "
+                    f"No hay ventas para los filtros seleccionados. AÃ±os disponibles en esta base: {years_text}. "
                     "Revisa el rango de semanas, el cliente o el producto seleccionado."
                 ),
             ],
@@ -5351,10 +6317,6 @@ def render_ventas_generales_tab_v2(
     tallos_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Tallos confirmados")
     apply_common_layout(tallos_fig, 370)
 
-    ventas_fig = px.line(weekly, x="semana_iso", y="ventas_usd", color="anio", markers=True, title="Ventas USD por semana")
-    ventas_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Ventas USD")
-    apply_common_layout(ventas_fig, 370)
-
     precio_fig = px.line(weekly, x="semana_iso", y="precio_usd_tallo", color="anio", markers=True, title="Precio promedio USD/tallo por semana")
     precio_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="USD/tallo")
     apply_common_layout(precio_fig, 345)
@@ -5365,74 +6327,252 @@ def render_ventas_generales_tab_v2(
     annual_display["USD/tallo"] = annual_display["USD/tallo"].map(lambda value: moneyless_number(value, 4))
     weeks_text = f"{int(week_range[0])}-{int(week_range[1])}" if week_range and len(week_range) == 2 else "todas"
 
-    export_button = html.Button(
-        "Exportar informe ejecutivo",
-        id="general-sales-export-report",
-        n_clicks=0,
-        type="button",
-        style={"border": "1px solid #800020", "background": "#800020", "color": "white", "borderRadius": "6px", "padding": "10px 14px", "fontWeight": "700", "cursor": "pointer"},
+    export_buttons = html.Div(
+        [
+            html.Button(
+                "PDF 1 pagina",
+                id="general-sales-export-summary",
+                n_clicks=0,
+                type="button",
+                className="executive-button secondary",
+            ),
+            html.Button(
+                "PDF completo",
+                id="general-sales-export-full",
+                n_clicks=0,
+                type="button",
+                className="executive-button primary",
+            ),
+        ],
+        className="executive-button-group",
     )
 
+    annual_cards = context["annual_cards"] if context.get("ok") else annual.copy()
     executive_metrics = [
-        make_card("Facturacion base", moneyless_number(context["base_metrics"]["ventas_usd"] if context.get("ok") else ventas, 2), f"Ano {base_year if base_year is not None else 'seleccionado'}"),
-        make_card("Facturacion comparativa", moneyless_number(context["compare_metrics"]["ventas_usd"] if context.get("ok") else ventas, 2), f"Ano {compare_year if compare_year is not None else 'seleccionado'}"),
-        make_card("Diferencia USD", moneyless_number(context["compare_real_delta"] if context.get("ok") else 0, 2), "comparacion real"),
-        make_card("Crecimiento", percent(context["compare_real_pct"]) if context.get("ok") else "0.0%", f"{context['compare_real_mult']:.2f}x" if context.get("ok") and pd.notna(context.get("compare_real_mult")) else "sin dato"),
+        make_year_comparison_card("Ventas USD", annual_cards, "ventas_usd", lambda value: moneyless_number(value, 2), "real por ano"),
+        make_year_comparison_card("Tallos confirmados", annual_cards, "tallos_confirmados", lambda value: moneyless_number(value), "misma ventana"),
+        make_year_comparison_card("Precio promedio", annual_cards, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/tallo"),
+        make_year_comparison_card("Pedidos", annual_cards, "pedidos", lambda value: moneyless_number(value), "ordenes agregadas"),
     ]
+    metric_compare_table = sales_metric_comparison_display(context)
+    product_compare_table = product_comparison_display(
+        context["product_compare"] if context.get("ok") else pd.DataFrame(),
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        rows=20,
+    )
+    scope = sales_scope_summary(view, clients, products, countries, companies)
+    logo_uri = logo_data_uri()
+    strategic_items = context["insights"] if context.get("ok") else ["No hay suficientes datos para construir la comparacion ejecutiva."]
+    strategic_cards = [
+        html.Div(
+            [
+                html.Div(f"{idx:02d}", className="strategy-index"),
+                html.Div(item, className="strategy-text"),
+            ],
+            className="strategy-card",
+        )
+        for idx, item in enumerate(strategic_items[:4], start=1)
+    ]
+    selected_clients = selected_values(clients)
+    client_table_title = "Companias de mayor a menor facturacion" if not selected_clients else "Companias seleccionadas"
+    client_table_note = "Orden descendente por facturacion dentro del filtro actual. La tabla tambien permite ordenar manualmente." if not selected_clients else "Resumen de las companias seleccionadas dentro del filtro actual."
+    client_table = client_sales_display(view, rows=30, ascending=False)
+    country_growth_table = growth_by_dimension_display(
+        view,
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        ["pais"],
+        ["pais"],
+        rows=25,
+    )
+    company_group_cols = ["NomCompania"] if "NomCompania" in view.columns else ["cod_cliente", "cliente"]
+    company_growth_table = growth_by_dimension_display(
+        view,
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        company_group_cols,
+        company_group_cols,
+        rows=30,
+    )
+    client_growth_table = growth_by_dimension_display(
+        view,
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
+        ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
+        rows=30,
+    )
 
     report_panel = html.Div(
         [
             html.Div(
                 [
-                    html.Div("Informe ejecutivo comercial", className="panel-title"),
-                    panel_note("Compara dos anos seleccionados sobre el mismo alcance filtrado. Mantiene la lectura semanal y agrega un resumen ejecutivo de facturacion, mix y consolidado."),
-                    export_button,
-                ]
+                    html.Div(
+                        [
+                            html.Img(src=logo_uri, className="executive-logo") if logo_uri else html.Div("La Gaitana", className="executive-logo-text"),
+                            html.Div("Ventas generales", className="executive-kicker"),
+                            html.Div("Informe ejecutivo comercial", className="executive-title"),
+                            html.Div(
+                                f"Ano base {context.get('base_year', base_year)} vs ano comparativo {context.get('compare_year', compare_year)} | semanas {weeks_text}",
+                                className="executive-subtitle",
+                            ),
+                        ]
+                    ),
+                    html.Div(export_buttons, className="executive-actions"),
+                ],
+                className="sales-executive-header",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Companias", className="scope-label"), html.Div(scope["companias"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Clientes", className="scope-label"), html.Div(scope["clientes"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Paises", className="scope-label"), html.Div(scope["paises"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Productos", className="scope-label"), html.Div(scope["productos"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Clientes visibles", className="scope-label"), html.Div(scope["clientes_count"], className="scope-number")], className="scope-card"),
+                ],
+                className="scope-strip",
             ),
             html.Div(executive_metrics, className="metrics-grid"),
             html.Div(
                 [
+                    html.Div(
+                        [
+                            html.Div("Ventas generales USD", className="panel-title"),
+                            panel_note("Comparacion directa de facturacion real entre ano base y ano comparativo."),
+                            dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Ventas generales USD")),
+                        ],
+                        className="panel panel-feature",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Facturacion por producto", className="panel-title"),
+                            panel_note("Barras por producto ordenadas por facturacion del ano comparativo."),
+                            dcc.Graph(figure=context["product_sales_bar_fig"] if context.get("ok") else empty_figure("Facturacion por producto")),
+                        ],
+                        className="panel panel-feature",
+                    ),
+                ],
+                className="grid-2 section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Tallos por producto", className="panel-title"), panel_note("Base vs comparativo por producto para leer cambios de portafolio en volumen."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
+                    html.Div([html.Div("Tallos confirmados por semana", className="panel-title"), panel_note("Evolucion semanal de tallos reales para comparar nivel y estacionalidad entre anos."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
+                ],
+                className="grid-2 section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Evolucion del precio", className="panel-title"), panel_note("Precio promedio ponderado semanal: ventas USD divididas por tallos confirmados."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
                     html.Div([html.Div("Resumen mensual USD", className="panel-title"), panel_note("Comparacion mensual del ano base frente al comparativo."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturacion USD por mes"))], className="panel"),
+                ],
+                className="grid-2 section-gap",
+            ),
+            html.Div(
+                [
                     html.Div([html.Div("Mix por producto", className="panel-title"), panel_note("Producto dominante del ano comparativo y su participacion en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix por producto"))], className="panel"),
+                    html.Div(
+                        [
+                            html.Div("Lectura estratÃ©gica", className="panel-title"),
+                            panel_note("Resumen ejecutivo calculado con los filtros actuales."),
+                            html.Div(strategic_cards, className="strategy-grid"),
+                        ],
+                        className="strategy-panel",
+                    ),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Tallos por producto", className="panel-title"), panel_note("Base vs comparativo por producto. La tabla de apoyo muestra la variacion absoluta y porcentual."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel"),
-                    html.Div([html.Div("Consolidado y proyeccion", className="panel-title"), panel_note("Real del ano base, real del comparativo y proyeccion simple anualizada del comparativo."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Consolidado y proyeccion USD"))], className="panel"),
+                    html.Div(
+                        [
+                            html.Div("Crecimiento por pais", className="panel-title"),
+                            panel_note("Ordenado por facturacion del ano comparativo de mayor a menor. La tabla permite reordenar y reiniciar filtros."),
+                            make_table(
+                                country_growth_table,
+                                12,
+                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                table_id="ventas-crecimiento-pais",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Crecimiento por compania", className="panel-title"),
+                            panel_note("Ordenado por facturacion del ano comparativo de mayor a menor. La tabla permite reordenar y reiniciar filtros."),
+                            make_table(
+                                company_growth_table,
+                                12,
+                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                table_id="ventas-crecimiento-compania",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
                 ],
-                className="grid-2 section-gap",
+                className="executive-table-grid section-gap",
             ),
             html.Div(
                 [
-                    html.Div("Tabla resumida consolidado / proyeccion", className="panel-title"),
-                    panel_note("Ano, tipo de dato y total USD para lectura ejecutiva rapida."),
-                    make_table(context["consolidated_table"] if context.get("ok") else pd.DataFrame(), 8),
+                    html.Div(
+                        [
+                            html.Div("Crecimiento por cliente", className="panel-title"),
+                            panel_note("Clientes ordenados por facturacion del ano comparativo de mayor a menor."),
+                            make_table(
+                                client_growth_table,
+                                12,
+                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                table_id="ventas-crecimiento-cliente",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Comparativo general", className="panel-title"),
+                            panel_note("Valores reales de los dos anos seleccionados, diferencia absoluta y variacion porcentual."),
+                            make_table(metric_compare_table, 8, table_id="ventas-comparativo-general"),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Comparativo por producto", className="panel-title"),
+                            panel_note("Productos ordenados por USD del ano comparativo. Incluye ventas, tallos, diferencias y participacion."),
+                            make_table(
+                                product_compare_table,
+                                12,
+                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                table_id="ventas-comparativo-producto",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
                 ],
-                className="table-panel section-gap",
+                className="executive-table-grid section-gap",
             ),
             html.Div(
                 [
-                    html.Div("Insights automaticos", className="panel-title"),
-                    panel_note("Frases ejecutivas calculadas automaticamente a partir de la comparacion seleccionada."),
-                    html.Ul([html.Li(item) for item in (context["insights"] if context.get("ok") else ["No hay suficientes datos para construir la comparacion ejecutiva."])], className="insights-list"),
+                    html.Div(client_table_title, className="panel-title"),
+                    panel_note(client_table_note),
+                    make_table(client_table, 15, sort_by=[{"column_id": "Facturacion USD", "direction": "desc"}], table_id="ventas-clientes-facturacion"),
                 ],
                 className="table-panel section-gap",
             ),
         ],
-        className="table-panel",
+        className="sales-executive-panel",
     )
 
     weekly_panel = html.Div(
         [
-            html.Div("Lectura semanal complementaria", className="panel-title"),
-            panel_note("Mantiene el foco semanal para validar nivel y estacionalidad dentro del informe."),
-            html.Div([html.Div(dcc.Graph(figure=tallos_fig), className="panel"), html.Div(dcc.Graph(figure=ventas_fig), className="panel")], className="grid-2 section-gap"),
+            html.Div("Resumen anual complementario", className="panel-title"),
+            panel_note("Totales del periodo semanal seleccionado; el precio no es promedio simple, se pondera por tallos."),
             html.Div(
                 [
-                    html.Div(dcc.Graph(figure=precio_fig), className="panel"),
-                    html.Div([html.Div("Resumen por ano", className="panel-title"), panel_note("Totales del periodo semanal seleccionado; el precio no es promedio simple, se pondera por tallos."), make_table(annual_display, 8)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Resumen por ano", className="panel-title"), make_table(annual_display, 8)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Consolidado real", className="panel-title"), panel_note("Real del ano base frente al real del ano comparativo. No incluye proyecciones anualizadas."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Consolidado real USD"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -5463,10 +6603,9 @@ def render_visualizador_clientes_general(
     color_view: str = "period_total",
     internal_detail: str = "color",
 ):
-    hist = data.get("historico_visualizador_comercial", data.get("historico_confirmado", pd.DataFrame()))
-    if hist.empty:
+    if selected_code is None:
         return html.Div(
-            "Falta historico_visualizador_comercial.csv o historico_confirmado.csv para construir el visualizador por SKU operativo.",
+            "Selecciona un cliente para cargar el visualizador detallado. La consulta se ejecuta solo por cliente para evitar traer todo el historico.",
             className="table-panel",
         )
 
@@ -5546,8 +6685,9 @@ def render_visualizador_clientes_general(
     apply_common_layout(sku_fig, 520)
 
     composition = visual_color_composition(view, sku_table, sku_filter, color_view or "period_total", analysis_week, internal_detail or "color")
+    composition_title, composition_note, _ = visual_composition_context(sku_filter, sku_table)
     if composition.empty:
-        comp_fig = empty_figure("Composicion interna de colores del SKU")
+        comp_fig = empty_figure(composition_title)
     else:
         comp_fig = px.bar(
             composition,
@@ -5556,7 +6696,7 @@ def render_visualizador_clientes_general(
             color="color_interno",
             color_discrete_map=color_map_for(composition, "color_interno"),
             hover_data=["sku_operativo", "tallos_confirmados", "ventas_usd", "precio_usd_tallo"],
-            title="Composicion interna de colores del SKU",
+            title=composition_title,
         )
         comp_fig.update_layout(xaxis_title="Color interno", yaxis_title="Participacion", showlegend=False)
         apply_common_layout(comp_fig, 420)
@@ -5589,9 +6729,9 @@ def render_visualizador_clientes_general(
     if tipo_selected == {"SOLIDO"}:
         view_note = "Vista solidos: el color participa en la identidad del SKU operativo."
     elif tipo_selected and "SOLIDO" not in tipo_selected:
-        view_note = "Vista no solidos: el ranking prioriza la estructura del pedido; el color queda como composicion interna."
+        view_note = "Vista de estructuras: el ranking prioriza el tipo real del pedido; el color queda como composicion interna."
     else:
-        view_note = "Vista todos los tipos: no se mezclan solidos y no solidos como producto + color."
+        view_note = "Vista todos los tipos: SOLIDO se lee como SKU producto/color; los demas tipos conservan su estructura de pedido."
     internal_note = {
         "color": "Detalle interno por color.",
         "color_variedad": "Detalle interno por color y variedad.",
@@ -5617,7 +6757,7 @@ def render_visualizador_clientes_general(
             html.Div(
                 [
                     html.Div([html.Div("Ranking de SKUs operativos", className="panel-title"), make_table(format_operational_display(sku_table), 12)], className="table-panel no-top-margin"),
-                    html.Div([html.Div("Composicion interna por color", className="panel-title"), make_table(format_operational_display(composition), 12)], className="table-panel no-top-margin"),
+                    html.Div([html.Div(composition_title, className="panel-title"), panel_note(composition_note), make_table(format_operational_display(composition), 12)], className="table-panel no-top-margin"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -5664,1914 +6804,6 @@ def sku_treemap(df: pd.DataFrame, selected_code: str, top_n: int) -> go.Figure:
     return apply_common_layout(fig, 520)
 
 
-def cluster_natural_reading(
-    clusters: pd.DataFrame,
-    cluster_summary: pd.DataFrame,
-    block_profile: pd.DataFrame,
-    differentiators: pd.DataFrame,
-    tipo_mix: pd.DataFrame,
-) -> html.Div:
-    if clusters.empty:
-        return html.Div("No hay clusters visibles para construir la lectura.", className="reading-text")
-
-    markets = sorted(clusters["mercado_cluster"].dropna().astype(str).unique()) if "mercado_cluster" in clusters.columns else []
-    market_label = ", ".join(markets[:3]) + (f" y {len(markets) - 3} mas" if len(markets) > 3 else "")
-    n_clients = clusters["cod_cliente"].nunique() if "cod_cliente" in clusters.columns else len(clusters)
-    n_clusters = clusters["cluster_id"].nunique() if "cluster_id" in clusters.columns else 0
-    tallos = clusters["tallos_total"].sum() if "tallos_total" in clusters.columns else 0
-
-    top_product = _top_values(clusters, "producto_dominante", value_col="tallos_total", n=3)
-    top_color = _top_values(clusters, "color_dominante", value_col="tallos_total", n=3)
-    top_type = _top_values(clusters, "tipo_pedido_dominante", value_col="tallos_total", n=3)
-
-    block_text = "sin bloque dominante claro"
-    if not block_profile.empty and "bloque_que_mas_diferencia" in block_profile.columns:
-        block_counts = block_profile["bloque_que_mas_diferencia"].dropna().astype(str).value_counts()
-        if not block_counts.empty:
-            block_text = ", ".join([f"{idx} ({val})" for idx, val in block_counts.head(3).items()])
-
-    strongest_cluster = ""
-    if not cluster_summary.empty:
-        top_cluster = cluster_summary.sort_values(["clientes", "tallos"], ascending=False).iloc[0]
-        strongest_cluster = (
-            f"El cluster con mas clientes es {top_cluster.get('cluster_id', 'sin_cluster')} "
-            f"({top_cluster.get('nombre_cluster', 'sin nombre')}), con "
-            f"{moneyless_number(top_cluster.get('clientes', 0))} clientes."
-        )
-
-    diff_text = ""
-    if not differentiators.empty:
-        top_diff = differentiators.sort_values("importancia_modelo", ascending=False).head(5)
-        readable = top_diff.get("lectura_variable", top_diff.get("variable", pd.Series(dtype=str))).dropna().astype(str).tolist()
-        if readable:
-            diff_text = "Variables que mas explican la separacion: " + "; ".join(readable[:5]) + "."
-
-    type_text = ""
-    if not tipo_mix.empty and "tipo_pedido_dominante" in tipo_mix.columns:
-        type_counts = tipo_mix.groupby("tipo_pedido_dominante", dropna=False)["clientes"].sum().sort_values(ascending=False)
-        if not type_counts.empty:
-            type_text = "Tipo de pedido dominante en los clusters visibles: " + ", ".join(
-                [f"{idx} ({int(val)} clientes)" for idx, val in type_counts.head(4).items()]
-            ) + "."
-
-    operations = []
-    if "cv_volumen" in clusters.columns:
-        cv_avg = pd.to_numeric(clusters["cv_volumen"], errors="coerce").mean()
-        if pd.notna(cv_avg):
-            operations.append(f"variabilidad promedio {moneyless_number(cv_avg, 2)}")
-    if "share_top3_color" in clusters.columns:
-        color_avg = pd.to_numeric(clusters["share_top3_color"], errors="coerce").mean()
-        if pd.notna(color_avg):
-            operations.append(f"concentracion color top 3 {percent(color_avg)}")
-    if "share_top1_tipo_pedido" in clusters.columns:
-        type_avg = pd.to_numeric(clusters["share_top1_tipo_pedido"], errors="coerce").mean()
-        if pd.notna(type_avg):
-            operations.append(f"concentracion tipo pedido {percent(type_avg)}")
-
-    typology_paragraphs = []
-    if not cluster_summary.empty:
-        visible_summary = cluster_summary.sort_values(["clientes", "tallos"], ascending=False).head(8).copy()
-        for _, cluster_row in visible_summary.iterrows():
-            cluster_id = str(cluster_row.get("cluster_id", "sin_cluster"))
-            cluster_clients = clusters[clusters["cluster_id"].astype(str).eq(cluster_id)].copy()
-            if cluster_clients.empty:
-                continue
-            cluster_block = block_profile[block_profile["cluster_id"].astype(str).eq(cluster_id)].copy() if not block_profile.empty else pd.DataFrame()
-            cluster_diff = differentiators[differentiators["cluster_id"].astype(str).eq(cluster_id)].copy() if not differentiators.empty else pd.DataFrame()
-            products = _top_values(cluster_clients, "producto_dominante", value_col="tallos_total", n=2)
-            colors = _top_values(cluster_clients, "color_dominante", value_col="tallos_total", n=2)
-            types = _top_values(cluster_clients, "tipo_pedido_dominante", value_col="tallos_total", n=2)
-            block = ""
-            block_vars = ""
-            if not cluster_block.empty:
-                block = str(cluster_block.iloc[0].get("bloque_que_mas_diferencia", "") or "")
-                block_vars = str(cluster_block.iloc[0].get("variables_clave_bloque", "") or "")
-            diff_vars = []
-            if not cluster_diff.empty:
-                diff_vars = cluster_diff.sort_values("importancia_modelo", ascending=False)["lectura_variable"].dropna().astype(str).head(3).tolist()
-            avg_cv = pd.to_numeric(cluster_clients.get("cv_volumen", pd.Series(dtype=float)), errors="coerce").mean()
-            avg_color = pd.to_numeric(cluster_clients.get("share_top3_color", pd.Series(dtype=float)), errors="coerce").mean()
-            avg_type = pd.to_numeric(cluster_clients.get("share_top1_tipo_pedido", pd.Series(dtype=float)), errors="coerce").mean()
-            if pd.notna(avg_cv) and avg_cv <= 0.55:
-                constancy = "bastante constantes"
-            elif pd.notna(avg_cv) and avg_cv <= 1.0:
-                constancy = "de constancia media"
-            else:
-                constancy = "mas variables"
-            if pd.notna(avg_color) and avg_color >= 0.75:
-                color_style = "muy concentrados en pocos colores"
-            elif pd.notna(avg_color) and avg_color >= 0.50:
-                color_style = "con una mezcla de colores moderadamente concentrada"
-            else:
-                color_style = "con mezcla de colores amplia"
-            if pd.notna(avg_type) and avg_type >= 0.85:
-                type_style = "compran casi siempre el mismo tipo de pedido"
-            elif pd.notna(avg_type) and avg_type >= 0.60:
-                type_style = "tienen un formato de pedido dominante, aunque con algunas variaciones"
-            else:
-                type_style = "mezclan varios formatos de pedido"
-            commercial_use = []
-            if constancy == "bastante constantes" and pd.notna(avg_color) and avg_color >= 0.60 and pd.notna(avg_type) and avg_type >= 0.70:
-                commercial_use.append("son buenos candidatos para ofertas recurrentes, acuerdos por programa y planeacion anticipada")
-            elif constancy == "bastante constantes":
-                commercial_use.append("conviene trabajarlos con seguimiento comercial periodico, porque repiten compra aunque su mix puede variar")
-            else:
-                commercial_use.append("conviene tratarlos como clientes de oportunidad o campana, validando mix antes de anticipar compromisos")
-            if block == "color":
-                commercial_use.append("la conversacion comercial debe partir del color dominante y sustitutos cercanos")
-            elif block == "producto":
-                commercial_use.append("la conversacion comercial debe partir del portafolio/producto dominante")
-            elif block == "tipo_pedido":
-                commercial_use.append("la oportunidad esta en vender por formato operativo, no solo por producto")
-            elif block == "constancia":
-                commercial_use.append("la prioridad es entender ritmo de compra y semanas activas")
-            if pd.notna(avg_color) and avg_color >= 0.75:
-                commercial_use.append("sirven para propuestas muy enfocadas en pocos colores")
-            if pd.notna(avg_type) and avg_type >= 0.85:
-                commercial_use.append("pueden recibir ofertas empaquetadas por el mismo tipo de pedido")
-
-            typology_paragraphs.append(
-                (
-                    f"{cluster_id}: {moneyless_number(cluster_clients['cod_cliente'].nunique())} clientes "
-                    f"{constancy}, {color_style} y que {type_style}. "
-                    f"Predominan productos como {', '.join(products) if products else 'sin producto claro'}, "
-                    f"colores como {', '.join(colors) if colors else 'sin color claro'} y tipos de pedido "
-                    f"{', '.join(types) if types else 'sin tipo claro'}. "
-                    f"El bloque que mas los separa es {block or 'no identificado'}"
-                    f"{f' ({block_vars})' if block_vars else ''}. "
-                    f"Variables clave: {', '.join(diff_vars) if diff_vars else 'sin variables diferenciadoras claras'}. "
-                    f"Insight comercial: {'; '.join(commercial_use)}."
-                )
-            )
-
-    paragraphs = [
-        f"Lectura para {market_label or 'los mercados visibles'}: hay {moneyless_number(n_clients)} clientes distribuidos en {moneyless_number(n_clusters)} clusters, con {moneyless_number(tallos)} tallos analizados.",
-        strongest_cluster,
-        f"Los bloques que mas diferencian los clusters visibles son: {block_text}.",
-        f"Los productos dominantes mas frecuentes son {', '.join(top_product) if top_product else 'sin informacion'}; los colores dominantes mas frecuentes son {', '.join(top_color) if top_color else 'sin informacion'}; y los tipos de pedido mas frecuentes son {', '.join(top_type) if top_type else 'sin informacion'}.",
-        type_text,
-        diff_text,
-        "Indicadores operativos visibles: " + "; ".join(operations) + "." if operations else "",
-    ]
-    paragraphs = [p for p in paragraphs if p]
-    children = [html.P(p) for p in paragraphs]
-    if typology_paragraphs:
-        children.append(html.P("Tipos de clientes encontrados en los clusters visibles:"))
-        children.extend([html.P(p) for p in typology_paragraphs])
-    return html.Div(children, className="reading-text")
-
-
-def cluster_reading_guide() -> html.Div:
-    return html.Div(
-        [
-            html.Div("Guia para leer y usar el informe de clusters", className="panel-title"),
-            html.Div(
-                [
-                    html.P("1. Selecciona Ano de cluster. Cada ano corresponde a un modelo recalculado con pedidos de ese periodo; no es un filtro sobre un unico modelo historico."),
-                    html.P("2. Filtra por Mercado. Los clusters fueron calculados dentro de cada mercado, por eso no conviene comparar directamente un cluster de USA/Canada contra uno de Asia sin contexto."),
-                    html.P("3. Luego filtra por Cluster. La vista de clientes muestra quienes pertenecen al grupo y que comparten: color, producto, tipo de pedido, constancia, volumen y cumplimiento."),
-                    html.P("4. Usa 'Bloque principal' para entender por que existe el cluster. Si el bloque es color, los clientes se parecen por composicion/concentracion de color; si es producto, por portafolio; si es tipo_pedido, por formato operativo; si es constancia, por ritmo de compra."),
-                    html.P("5. Usa 'Cambio de clientes entre anos' para observar cambios de tipologia, producto o color; no compares directamente el numero del cluster entre corridas anuales."),
-                    html.P("6. Usa las tablas de clientes y similares para priorizar cuentas, replicar ofertas o preparar programas recurrentes dentro del mismo mercado."),
-                ],
-                className="reading-text",
-            ),
-        ],
-        className="reading-panel",
-    )
-
-
-def panel_note(text: str) -> html.Div:
-    return html.Div(text, className="metric-detail")
-
-
-def build_cluster_commercial_actions(clusters: pd.DataFrame, block_profile: pd.DataFrame) -> pd.DataFrame:
-    if clusters.empty:
-        return pd.DataFrame()
-    rows = []
-    for keys, frame in clusters.groupby(["mercado_cluster", "cluster_id", "nombre_cluster"], dropna=False):
-        mercado, cluster_id, nombre = keys
-        block = ""
-        if not block_profile.empty:
-            match = block_profile[block_profile["cluster_id"].astype(str).eq(str(cluster_id))]
-            if not match.empty:
-                block = str(match.iloc[0].get("bloque_que_mas_diferencia", "") or "")
-        products = _top_values(frame, "producto_dominante", value_col="tallos_total", n=2)
-        colors = _top_values(frame, "color_dominante", value_col="tallos_total", n=2)
-        types = _top_values(frame, "tipo_pedido_dominante", value_col="tallos_total", n=2)
-        avg_cv = pd.to_numeric(frame.get("cv_volumen", pd.Series(dtype=float)), errors="coerce").mean()
-        avg_color = pd.to_numeric(frame.get("share_top3_color", pd.Series(dtype=float)), errors="coerce").mean()
-        avg_type = pd.to_numeric(frame.get("share_top1_tipo_pedido", pd.Series(dtype=float)), errors="coerce").mean()
-        avg_score = pd.to_numeric(frame.get("score_compra_terminada", pd.Series(dtype=float)), errors="coerce").mean()
-        avg_complexity = pd.to_numeric(frame.get("complejidad_operativa_score", pd.Series(dtype=float)), errors="coerce").mean()
-        avg_recent = pd.to_numeric(frame.get("variacion_reciente_vs_previa", pd.Series(dtype=float)), errors="coerce").mean()
-        if pd.notna(avg_cv) and avg_cv <= 0.55:
-            ritmo = "constantes"
-        elif pd.notna(avg_cv) and avg_cv <= 1.0:
-            ritmo = "intermedios"
-        else:
-            ritmo = "variables"
-        if pd.notna(avg_color) and avg_color >= 0.75:
-            color_profile = "muy concentrados en color"
-        elif pd.notna(avg_color) and avg_color >= 0.50:
-            color_profile = "color moderadamente concentrado"
-        else:
-            color_profile = "mix de color amplio"
-        if pd.notna(avg_type) and avg_type >= 0.85:
-            type_profile = "formato operativo repetitivo"
-        elif pd.notna(avg_type) and avg_type >= 0.60:
-            type_profile = "formato dominante con variaciones"
-        else:
-            type_profile = "formatos variados"
-
-        if ritmo == "constantes" and color_profile != "mix de color amplio" and type_profile == "formato operativo repetitivo":
-            oportunidad = "programas recurrentes, preventa y ofertas cerradas por color/producto/formato"
-            accion = "proponer portafolio fijo, calendario comercial y sustitutos controlados"
-        elif block == "producto":
-            oportunidad = "venta cruzada alrededor del producto dominante"
-            accion = "ofrecer extensiones de producto, colores cercanos y paquetes por familia"
-        elif block == "color":
-            oportunidad = "campanas por color y manejo de sustitutos"
-            accion = "segmentar ofertas por color dominante y disponibilidad de colores equivalentes"
-        elif block == "tipo_pedido":
-            oportunidad = "ofertas por formato operativo"
-            accion = "vender estructuras similares segun SOLIDO/SURTIDO/BOUQUET/BQT/COMBO/RAINBOW/BULK y no solo por variedad"
-        elif ritmo == "variables":
-            oportunidad = "venta oportunistica y validacion comercial previa"
-            accion = "usar como lista de prospeccion/seguimiento, evitando comprometer compra anticipada sin confirmacion"
-        else:
-            oportunidad = "seguimiento comercial por comportamiento parecido"
-            accion = "comparar clientes espejo y replicar ofertas probadas en el mismo cluster"
-
-        if ritmo == "variables":
-            riesgo = "alta variabilidad; validar pedido antes de anticipar compra"
-        elif pd.notna(avg_score) and avg_score < 55:
-            riesgo = "score bajo para compra terminada; usar como lectura comercial antes que compromiso operativo"
-        elif color_profile == "mix de color amplio":
-            riesgo = "mix amplio; evitar ofertas demasiado cerradas en un solo color"
-        else:
-            riesgo = "riesgo operativo moderado; revisar disponibilidad y cumplimiento"
-        if pd.notna(avg_complexity) and avg_complexity >= 60:
-            accion_operativa = "preparar estructura, sustitutos y validacion de armado antes de confirmar oferta"
-        elif type_profile == "formato operativo repetitivo":
-            accion_operativa = "estandarizar presentacion recurrente y validar disponibilidad del formato dominante"
-        else:
-            accion_operativa = "revisar composicion antes de comprometer disponibilidad"
-        if ritmo == "constantes":
-            accion_planeacion = "incorporar demanda base al plan y revisar excepciones por color o producto"
-        elif pd.notna(avg_recent) and avg_recent > 0.20:
-            accion_planeacion = "monitorear crecimiento reciente y elevar cobertura solo con confirmacion comercial"
-        else:
-            accion_planeacion = "planear bajo escenarios y evitar reservar volumen rigido"
-
-        rows.append(
-            {
-                "mercado": mercado,
-                "cluster": cluster_id,
-                "nombre_cluster": nombre,
-                "clientes": frame["cod_cliente"].nunique(),
-                "tallos": frame["tallos_total"].sum(),
-                "ventas_usd": frame["ventas_usd_total"].sum() if "ventas_usd_total" in frame.columns else np.nan,
-                "perfil_comercial": f"{ritmo}, {color_profile}, {type_profile}",
-                "producto_base": ", ".join(products) if products else "sin_info",
-                "color_base": ", ".join(colors) if colors else "sin_info",
-                "tipo_pedido_base": ", ".join(types) if types else "sin_info",
-                "bloque_que_explica": block or "sin_info",
-                "oportunidad_comercial": oportunidad,
-                "accion_comercial": accion,
-                "riesgo_principal": riesgo,
-                "accion_operativa": accion_operativa,
-                "accion_planeacion": accion_planeacion,
-            }
-        )
-    return pd.DataFrame(rows).sort_values(["mercado", "clientes"], ascending=[True, False])
-
-
-def build_cluster_benchmark_table(clusters: pd.DataFrame) -> pd.DataFrame:
-    """Compara cada cluster con el promedio de clientes de su propio mercado."""
-    if clusters.empty:
-        return pd.DataFrame()
-    metrics = [
-        ("tallos_total", "Volumen por cliente"),
-        ("semanas_activas", "Semanas activas"),
-        ("cv_volumen", "Variabilidad semanal"),
-        ("share_top3_color", "Concentracion color top 3"),
-        ("share_top5_sku", "Concentracion SKU top 5"),
-        ("share_top1_tipo_pedido", "Concentracion tipo pedido"),
-        ("ventas_usd_total", "Ventas USD por cliente"),
-        ("variacion_reciente_vs_previa", "Cambio reciente vs previo"),
-        ("complejidad_operativa_score", "Complejidad operativa"),
-    ]
-    present = [(col, label) for col, label in metrics if col in clusters.columns]
-    rows = []
-    for (market, cluster_id, name), frame in clusters.groupby(
-        ["mercado_cluster", "cluster_id", "nombre_cluster"], dropna=False
-    ):
-        market_frame = clusters[clusters["mercado_cluster"].astype(str).eq(str(market))]
-        for col, label in present:
-            cluster_value = pd.to_numeric(frame[col], errors="coerce").mean()
-            market_value = pd.to_numeric(market_frame[col], errors="coerce").mean()
-            if pd.isna(cluster_value) or pd.isna(market_value):
-                continue
-            delta = cluster_value - market_value
-            rows.append(
-                {
-                    "Cluster": cluster_id,
-                    "Indicador": label,
-                    "Valor cluster": cluster_value,
-                    "Promedio mercado": market_value,
-                    "Diferencia": delta,
-                    "Lectura": "Por encima del mercado" if delta > 0 else "Por debajo del mercado",
-                }
-            )
-    table = pd.DataFrame(rows)
-    if table.empty:
-        return table
-    table["relevancia"] = table.groupby("Indicador")["Diferencia"].transform(lambda s: s.abs())
-    return table.sort_values(["Cluster", "relevancia"], ascending=[True, False]).drop(columns="relevancia")
-
-
-def build_cluster_year_change_section(
-    current: pd.DataFrame,
-    selected_year: str | None,
-    bundles: dict[str, dict[str, pd.DataFrame]] | None,
-) -> html.Div:
-    """Muestra cambios de tipologia contra la corrida anual previa disponible."""
-    if not selected_year or not str(selected_year).isdigit() or not bundles:
-        return html.Div()
-    previous_years = sorted(
-        int(year) for year in bundles if str(year).isdigit() and int(year) < int(selected_year)
-    )
-    if not previous_years:
-        return html.Div(
-            [
-                html.Div("Cambio de clientes entre anos", className="panel-title"),
-                panel_note("Ejecuta clusters de un ano anterior para habilitar la comparacion de cambios comerciales."),
-            ],
-            className="table-panel section-gap",
-        )
-    previous_year = str(previous_years[-1])
-    previous = bundles.get(previous_year, {}).get("clusters", pd.DataFrame()).copy()
-    if previous.empty or current.empty:
-        return html.Div()
-    markets = set(current["mercado_cluster"].astype(str))
-    previous = previous[previous["mercado_cluster"].astype(str).isin(markets)].copy()
-    fields = [
-        "cod_cliente", "cliente", "mercado_cluster", "cluster_id", "nombre_cluster",
-        "producto_dominante", "color_dominante", "tipo_pedido_dominante", "tallos_total",
-    ]
-    left = previous[[col for col in fields if col in previous.columns]].copy()
-    right = current[[col for col in fields if col in current.columns]].copy()
-    change = left.merge(right, on=["cod_cliente", "mercado_cluster"], suffixes=(f"_{previous_year}", f"_{selected_year}"))
-    if change.empty:
-        return html.Div()
-    before = f"nombre_cluster_{previous_year}"
-    after = f"nombre_cluster_{selected_year}"
-    change["cambio_tipologia"] = np.where(change[before].eq(change[after]), "Mantiene tipologia", "Cambia tipologia")
-    summary = (
-        change.groupby("cambio_tipologia", as_index=False)["cod_cliente"]
-        .nunique()
-        .rename(columns={"cod_cliente": "clientes"})
-    )
-    fig = px.bar(
-        summary,
-        x="cambio_tipologia",
-        y="clientes",
-        color="cambio_tipologia",
-        title=f"Clientes comparables: {previous_year} vs {selected_year}",
-    )
-    apply_common_layout(fig, 350)
-    detail_cols = [
-        "cod_cliente", f"cliente_{selected_year}", "mercado_cluster", "cambio_tipologia",
-        before, after,
-        f"producto_dominante_{previous_year}", f"producto_dominante_{selected_year}",
-        f"color_dominante_{previous_year}", f"color_dominante_{selected_year}",
-        f"tipo_pedido_dominante_{previous_year}", f"tipo_pedido_dominante_{selected_year}",
-        f"tallos_total_{previous_year}", f"tallos_total_{selected_year}",
-    ]
-    detail = change[[col for col in detail_cols if col in change.columns]].sort_values("cambio_tipologia")
-    return html.Div(
-        [
-            html.Div("Cambio de clientes entre anos", className="panel-title"),
-            panel_note(
-                f"Compara clientes presentes en {previous_year} y {selected_year}. "
-                "La tipologia es comparable; el identificador del cluster se recalcula dentro de cada ano."
-            ),
-            html.Div(dcc.Graph(figure=fig), className="panel"),
-            make_table(detail.head(300), 14),
-        ],
-        className="table-panel section-gap",
-    )
-
-
-def build_cluster_variable_explanation(differentiators: pd.DataFrame) -> pd.DataFrame:
-    """Convierte variables diferenciadoras en una lectura ejecutiva inicial."""
-    if differentiators.empty:
-        return pd.DataFrame()
-    meaning = {
-        "share_top1_color": "Peso del color principal en la compra.",
-        "share_top3_color": "Concentracion del volumen en los tres colores principales.",
-        "entropia_color_norm": "Diversidad de colores comprados.",
-        "share_top1_producto": "Dependencia del producto principal.",
-        "share_top3_producto": "Concentracion en el portafolio principal.",
-        "entropia_producto_norm": "Diversidad de productos comprados.",
-        "share_top1_tipo_pedido": "Concentracion en un formato de pedido.",
-        "pct_semanas_activas": "Frecuencia con que el cliente compra en el ano.",
-        "cv_volumen": "Variabilidad del volumen semanal.",
-        "tallos_total": "Tamano total de la cuenta en tallos.",
-    }
-    business = {
-        "color": "Ayuda a definir ofertas y disponibilidad por color.",
-        "producto": "Orienta el portafolio que conviene ofrecer al grupo.",
-        "tipo_pedido": "Indica si la propuesta debe plantearse por formato operativo.",
-        "constancia": "Distingue programas recurrentes de compras de oportunidad.",
-        "volumen": "Permite priorizar cuentas por impacto comercial.",
-        "operacion": "Aporta restricciones de presentacion y servicio.",
-        "sku": "Identifica repeticion de configuraciones comerciales.",
-    }
-    table = differentiators.copy()
-    table = table.sort_values("importancia_modelo", ascending=False)
-    if "cluster_id" in table.columns and table["cluster_id"].nunique() > 1:
-        table = table.groupby("cluster_id", group_keys=False).head(3)
-    else:
-        table = table.head(8)
-    table["Variable"] = table.get("lectura_variable", table["variable"])
-    table["Importancia"] = pd.to_numeric(table["importancia_modelo"], errors="coerce").fillna(0)
-    table["Que significa"] = table["variable"].map(meaning).fillna(table["Variable"])
-    table["Lectura de negocio"] = table["bloque_variable"].map(business).fillna(
-        "Describe una diferencia relevante frente al mercado."
-    )
-    if "lectura" in table.columns:
-        table["Lectura de negocio"] = table["Lectura de negocio"] + " Resultado: " + table["lectura"].fillna("").astype(str) + "."
-    cols = ["Variable", "Importancia", "Que significa", "Lectura de negocio"]
-    if "cluster_id" in table.columns and differentiators["cluster_id"].nunique() > 1:
-        table["Cluster"] = table["cluster_id"]
-        cols = ["Cluster"] + cols
-    return table[cols].reset_index(drop=True)
-
-
-def render_clusters_tab(
-    data: dict[str, pd.DataFrame],
-    filtered: pd.DataFrame,
-    selected_code: str | None,
-    top_n: int,
-    market_filter: list[str] | str | None = None,
-    cluster_filter: list[str] | str | None = None,
-    cluster_year: str | None = None,
-    cluster_bundles: dict[str, dict[str, pd.DataFrame]] | None = None,
-):
-    clusters = data["clusters"].copy()
-    if clusters.empty:
-        return html.Div("No hay clusters_clientes.csv disponible.", className="table-panel")
-
-    profile_keys = [
-        "cod_cliente",
-        "tallos_total",
-        "semanas_activas",
-        "pct_semanas_activas",
-        "cv_volumen",
-        "segmento_cliente",
-        "recomendacion_compra",
-    ]
-    profile_slice = data["perfil"][[col for col in profile_keys if col in data["perfil"].columns]].copy()
-    if "cod_cliente" in profile_slice.columns:
-        clusters = clusters.merge(profile_slice, on="cod_cliente", how="left", suffixes=("", "_perfil"))
-        for col in ["tallos_total", "semanas_activas", "pct_semanas_activas", "cv_volumen", "segmento_cliente", "recomendacion_compra"]:
-            perfil_col = f"{col}_perfil"
-            if perfil_col in clusters.columns:
-                if col in clusters.columns:
-                    clusters[col] = clusters[col].where(clusters[col].notna(), clusters[perfil_col])
-                else:
-                    clusters[col] = clusters[perfil_col]
-
-    if "mercado_cluster" not in clusters.columns:
-        clusters["mercado_cluster"] = "SIN_MERCADO"
-    if "metodo_cluster" not in clusters.columns:
-        clusters["metodo_cluster"] = "SIN_METODO"
-    if "nombre_cluster" not in clusters.columns:
-        clusters["nombre_cluster"] = clusters.get("cluster_id", "SIN_CLUSTER")
-    if "score_compra_terminada_operativo" in clusters.columns and "score_compra_terminada" not in clusters.columns:
-        clusters["score_compra_terminada"] = clusters["score_compra_terminada_operativo"]
-    for col in ["score_compra_terminada", "score_color", "score_sku_terminado", "cumplimiento_tallos", "tallos_total"]:
-        if col not in clusters.columns:
-            clusters[col] = 0
-
-    market_values = selected_values(market_filter)
-    if market_values:
-        clusters = clusters[clusters["mercado_cluster"].astype(str).isin(market_values)].copy()
-    cluster_values = selected_values(cluster_filter)
-    if cluster_values:
-        clusters = clusters[clusters["cluster_id"].astype(str).isin(cluster_values)].copy()
-
-    valid_codes = set(filtered["cod_cliente"]) if not filtered.empty else set()
-    if selected_code:
-        clusters = clusters[clusters["cod_cliente"] == selected_code].copy()
-    elif valid_codes:
-        clusters = clusters[clusters["cod_cliente"].isin(valid_codes)].copy()
-
-    if clusters.empty:
-        return html.Div("No hay clientes de cluster para los filtros seleccionados.", className="table-panel")
-
-    feature_cols = [
-        col
-        for col in [
-            "tallos_total",
-            "semanas_activas",
-            "pct_semanas_activas",
-            "tallos_promedio_semana",
-            "cv_volumen",
-            "cumplimiento_tallos",
-            "share_top3_color",
-            "share_top5_sku",
-            "share_top1_tipo_pedido",
-            "tallos_x_ramo_promedio",
-            "ramos_x_caja_promedio",
-            "score_compra_terminada",
-        ]
-        if col in clusters.columns
-    ]
-
-    cluster_summary = (
-        clusters.groupby(["mercado_cluster", "cluster_id", "nombre_cluster", "metodo_cluster"], dropna=False, as_index=False)
-        .agg(
-            clientes=("cod_cliente", "nunique"),
-            tallos=("tallos_total", "sum"),
-            score_promedio=("score_compra_terminada", "mean"),
-            color_promedio=("share_top3_color", "mean") if "share_top3_color" in clusters.columns else ("score_color", "mean"),
-            sku_promedio=("share_top5_sku", "mean") if "share_top5_sku" in clusters.columns else ("score_sku_terminado", "mean"),
-            cv_volumen_promedio=("cv_volumen", "mean") if "cv_volumen" in clusters.columns else ("tallos_total", "mean"),
-            cumplimiento_promedio=("cumplimiento_tallos", "mean"),
-        )
-        .sort_values("clientes", ascending=False)
-    )
-    summary_keys = ["mercado_cluster", "cluster_id", "nombre_cluster", "metodo_cluster"]
-    optional_summary = {
-        "ventas_usd_total": ("ventas_usd", "sum"),
-        "variacion_reciente_vs_previa": ("cambio_reciente_promedio", "mean"),
-        "complejidad_operativa_score": ("complejidad_promedio", "mean"),
-    }
-    for source_col, (target_col, operation) in optional_summary.items():
-        if source_col in clusters.columns:
-            add = clusters.groupby(summary_keys, dropna=False, as_index=False).agg(**{target_col: (source_col, operation)})
-            cluster_summary = cluster_summary.merge(add, on=summary_keys, how="left")
-
-    visible_cluster_ids = set(clusters["cluster_id"].astype(str))
-    differentiators = data.get("cluster_diff", pd.DataFrame()).copy()
-    if not differentiators.empty:
-        differentiators = differentiators[differentiators["cluster_id"].astype(str).isin(visible_cluster_ids)].copy()
-        if market_values and "mercado_cluster" in differentiators.columns:
-            differentiators = differentiators[differentiators["mercado_cluster"].astype(str).isin(market_values)].copy()
-        differentiators = differentiators.sort_values(["cluster_id", "importancia_modelo"], ascending=[True, False])
-    else:
-        cluster_profiles = (
-            clusters.groupby(["mercado_cluster", "cluster_id", "nombre_cluster"], dropna=False)[feature_cols]
-            .mean()
-            .reset_index()
-        ) if feature_cols else pd.DataFrame()
-        market_profiles = (
-            clusters.groupby("mercado_cluster", dropna=False)[feature_cols]
-            .mean()
-            .reset_index()
-            .rename(columns={col: f"{col}_mercado" for col in feature_cols})
-        ) if feature_cols else pd.DataFrame()
-        if not cluster_profiles.empty:
-            diff = cluster_profiles.merge(market_profiles, on="mercado_cluster", how="left")
-            labels = {
-                "tallos_total": "Volumen total cliente",
-                "semanas_activas": "Frecuencia",
-                "pct_semanas_activas": "Constancia",
-                "tallos_promedio_semana": "Volumen semanal",
-                "cv_volumen": "Variabilidad semanal",
-                "cumplimiento_tallos": "Cumplimiento",
-                "share_top3_color": "Concentracion en colores",
-                "share_top5_sku": "Repeticion SKU operativo",
-                "share_top1_tipo_pedido": "Concentracion tipo pedido",
-                "tallos_x_ramo_promedio": "Tallos por ramo",
-                "ramos_x_caja_promedio": "Ramos por caja",
-                "score_compra_terminada": "Score compra terminada",
-            }
-            rows = []
-            for row in diff.to_dict("records"):
-                for col in feature_cols:
-                    cluster_value = float(row.get(col, 0) or 0)
-                    market_value = float(row.get(f"{col}_mercado", 0) or 0)
-                    delta = cluster_value - market_value
-                    if abs(delta) <= 1e-9:
-                        continue
-                    rows.append(
-                        {
-                            "mercado_cluster": row["mercado_cluster"],
-                            "cluster_id": row["cluster_id"],
-                            "nombre_cluster": row["nombre_cluster"],
-                            "bloque_variable": "perfil",
-                            "lectura_variable": labels.get(col, col),
-                            "valor_cluster": cluster_value,
-                            "promedio_mercado": market_value,
-                            "diferencia": delta,
-                            "importancia_modelo": abs(delta),
-                            "lectura": "mas alto que mercado" if delta > 0 else "mas bajo que mercado",
-                        }
-                    )
-            differentiators = pd.DataFrame(rows).sort_values(["cluster_id", "importancia_modelo"], ascending=[True, False]) if rows else pd.DataFrame()
-
-    block_profile = data.get("cluster_blocks", pd.DataFrame()).copy()
-    if not block_profile.empty:
-        block_profile = block_profile[block_profile["cluster_id"].astype(str).isin(visible_cluster_ids)].copy()
-    commercial_actions = build_cluster_commercial_actions(clusters, block_profile)
-    explanation_table = build_cluster_variable_explanation(differentiators)
-    benchmark_table = build_cluster_benchmark_table(clusters)
-
-    tipo_mix = pd.DataFrame()
-    if "tipo_pedido_dominante" in clusters.columns:
-        tipo_mix = (
-            clusters.groupby(["mercado_cluster", "cluster_id", "nombre_cluster", "tipo_pedido_dominante"], dropna=False, as_index=False)
-            .agg(clientes=("cod_cliente", "nunique"), tallos=("tallos_total", "sum"), concentracion_tipo=("share_top1_tipo_pedido", "mean"))
-            .sort_values(["mercado_cluster", "cluster_id", "clientes"], ascending=[True, True, False])
-        )
-
-    scatter = px.scatter(
-        clusters,
-        x="share_top3_color" if "share_top3_color" in clusters.columns else "score_color",
-        y="share_top5_sku" if "share_top5_sku" in clusters.columns else "score_sku_terminado",
-        size="tallos_total",
-        color="nombre_cluster",
-        facet_col="mercado_cluster" if clusters["mercado_cluster"].nunique() <= 5 else None,
-        color_discrete_map=color_map_for(clusters, "nombre_cluster"),
-        hover_data=[
-            col
-            for col in [
-                "cod_cliente",
-                "cliente",
-                "mercado_cluster",
-                "metodo_cluster",
-                "cluster_id",
-                "producto_dominante",
-                "color_dominante",
-                "tipo_pedido_dominante",
-                "segmento_cliente",
-                "recomendacion_compra",
-                "score_compra_terminada",
-            ]
-            if col in clusters.columns
-        ],
-        title="Clusters por mercado: concentracion de color vs concentracion de SKU",
-    )
-    apply_common_layout(scatter, 500)
-
-    tree = px.treemap(
-        cluster_summary,
-        path=["mercado_cluster", "nombre_cluster"],
-        values="clientes",
-        color="score_promedio",
-        color_continuous_scale=[CORPORATE_BURGUNDY, "#B07AA1", "#4E79A7", "#59A14F"],
-        title="Tamano de clusters por mercado",
-    )
-    apply_common_layout(tree, 500)
-
-    bars = px.bar(
-        cluster_summary.head(max(top_n, 10)),
-        x="clientes",
-        y="cluster_id",
-        orientation="h",
-        color="mercado_cluster",
-        color_discrete_map=color_map_for(cluster_summary, "mercado_cluster"),
-        hover_data=["nombre_cluster", "metodo_cluster", "score_promedio", "cv_volumen_promedio"],
-        title="Clusters con mas clientes",
-    )
-    bars.update_layout(yaxis={"categoryorder": "total ascending"})
-    apply_common_layout(bars, 460)
-
-    method_market = (
-        clusters.groupby(["mercado_cluster", "metodo_cluster"], dropna=False, as_index=False)
-        .agg(clientes=("cod_cliente", "nunique"), tallos=("tallos_total", "sum"))
-        .sort_values("clientes", ascending=False)
-    )
-    heat = px.density_heatmap(
-        method_market,
-        x="mercado_cluster",
-        y="metodo_cluster",
-        z="clientes",
-        histfunc="sum",
-        text_auto=True,
-        color_continuous_scale="Blues",
-        title="Metodo seleccionado por mercado",
-    )
-    heat.update_layout(xaxis_tickangle=-35)
-    apply_common_layout(heat, 500)
-
-    if tipo_mix.empty:
-        tipo_fig = empty_figure("Tipo de pedido dominante por cluster")
-    else:
-        tipo_fig = px.bar(
-            tipo_mix,
-            x="cluster_id",
-            y="clientes",
-            color="tipo_pedido_dominante",
-            facet_col="mercado_cluster" if tipo_mix["mercado_cluster"].nunique() <= 5 else None,
-            hover_data=["nombre_cluster", "tallos", "concentracion_tipo"],
-            title="Tipo de pedido dominante dentro de cada cluster",
-        )
-        tipo_fig.update_layout(xaxis_tickangle=-35)
-        apply_common_layout(tipo_fig, 500)
-
-    if differentiators.empty:
-        diff_fig = empty_figure("Variables que diferencian cada cluster")
-        diff_table = differentiators
-    else:
-        top_diff = differentiators.groupby("cluster_id", group_keys=False).head(5).copy()
-        y_col = "lectura_variable" if "lectura_variable" in top_diff.columns else "variable"
-        color_col = "bloque_variable" if "bloque_variable" in top_diff.columns else "cluster_id"
-        diff_fig = px.bar(
-            top_diff,
-            x="diferencia_estandarizada" if "diferencia_estandarizada" in top_diff.columns else "diferencia",
-            y=y_col,
-            color=color_col,
-            orientation="h",
-            facet_col="mercado_cluster" if top_diff["mercado_cluster"].nunique() <= 3 else None,
-            hover_data=["nombre_cluster", "valor_cluster", "promedio_mercado", "lectura"],
-            title="Variables que mas diferencian cada cluster contra su mercado",
-        )
-        diff_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        apply_common_layout(diff_fig, 560)
-        diff_table = differentiators.drop(columns=["diferencia_abs"], errors="ignore").head(160)
-
-    if block_profile.empty or "bloque_que_mas_diferencia" not in block_profile.columns:
-        block_fig = empty_figure("Bloque que mas explica cada cluster")
-    else:
-        block_fig = px.bar(
-            block_profile,
-            x="cluster_id",
-            y="clientes",
-            color="bloque_que_mas_diferencia",
-            facet_col="mercado_cluster" if block_profile["mercado_cluster"].nunique() <= 5 else None,
-            hover_data=["nombre_cluster", "variables_clave_bloque", "tipo_pedido_dominante_cluster", "producto_dominante_cluster", "color_dominante_cluster"],
-            title="Bloque principal que diferencia cada cluster",
-        )
-        block_fig.update_layout(xaxis_tickangle=-35)
-        apply_common_layout(block_fig, 500)
-
-    eval_table = data.get("cluster_eval", pd.DataFrame()).copy()
-    if not eval_table.empty:
-        for col in ["silhouette", "calinski_harabasz", "clientes"]:
-            if col in eval_table.columns:
-                eval_table[col] = pd.to_numeric(eval_table[col], errors="coerce")
-        eval_table = eval_table.sort_values(["mercado_cluster", "silhouette", "calinski_harabasz"], ascending=[True, False, False])
-        eval_table = eval_table.head(80)
-
-    similar = data.get("similares", pd.DataFrame()).copy()
-    if not similar.empty:
-        if selected_code:
-            similar = similar[similar["cod_cliente_base"] == selected_code].copy()
-        else:
-            visible_codes = set(clusters["cod_cliente"].astype(str))
-            similar = similar[similar["cod_cliente_base"].astype(str).isin(visible_codes)].copy()
-        similar_cols = [
-            "mercado_cluster",
-            "cluster_id_base",
-            "nombre_cluster_base",
-            "cod_cliente_base",
-            "cliente_base",
-            "cod_cliente_similar",
-            "cliente_similar",
-            "mismo_cluster",
-            "similitud_total",
-            "razon_cluster",
-            "producto_base",
-            "producto_similar",
-            "color_base",
-            "color_similar",
-            "tipo_pedido_base",
-            "tipo_pedido_similar",
-        ]
-        similar = similar[[col for col in similar_cols if col in similar.columns]].head(400)
-
-    client_cols = [
-        "mercado_cluster",
-        "metodo_cluster",
-        "cluster_id",
-        "nombre_cluster",
-        "cod_cliente",
-        "cliente",
-        "pais_principal",
-        "segmento_cliente",
-        "recomendacion_compra",
-        "score_compra_terminada",
-        "share_top3_color",
-        "share_top5_sku",
-        "share_top1_tipo_pedido",
-        "tallos_x_ramo_promedio",
-        "ramos_x_caja_promedio",
-        "producto_dominante",
-        "color_dominante",
-        "tipo_pedido_dominante",
-        "cv_volumen",
-        "cumplimiento_tallos",
-        "tallos_total",
-        "ventas_usd_total",
-        "participacion_tallos_mercado",
-        "variacion_reciente_vs_previa",
-        "complejidad_operativa",
-        "complejidad_operativa_score",
-    ]
-    clients_table = clusters[[col for col in client_cols if col in clusters.columns]].sort_values(
-        ["mercado_cluster", "cluster_id", "tallos_total"], ascending=[True, True, False]
-    )
-    year_change_section = build_cluster_year_change_section(clusters, cluster_year, cluster_bundles)
-    natural_reading = cluster_natural_reading(clusters, cluster_summary, block_profile, differentiators, tipo_mix)
-    periodo = data.get("cluster_periodo", pd.DataFrame())
-    period_label = "corrida seleccionada"
-    if not periodo.empty and "fecha_min" in periodo.columns and "fecha_max" in periodo.columns:
-        min_date = pd.to_datetime(periodo.iloc[0]["fecha_min"], errors="coerce")
-        max_date = pd.to_datetime(periodo.iloc[0]["fecha_max"], errors="coerce")
-        if pd.notna(min_date) and pd.notna(max_date):
-            period_label = f"{min_date:%Y-%m-%d} a {max_date:%Y-%m-%d}"
-    clients_table_display = clients_table.copy()
-    rename_clients = {
-        "mercado_cluster": "mercado",
-        "cluster_id": "cluster",
-        "nombre_cluster": "tipo_cluster",
-        "cod_cliente": "cod",
-        "pais_principal": "pais",
-        "score_compra_terminada": "score",
-        "share_top3_color": "concentracion_color_top3",
-        "share_top5_sku": "repeticion_sku_top5",
-        "share_top1_tipo_pedido": "concentracion_tipo_pedido",
-        "tallos_x_ramo_promedio": "tallos_ramo",
-        "ramos_x_caja_promedio": "ramos_caja",
-        "cv_volumen": "variabilidad",
-        "cumplimiento_tallos": "cumplimiento",
-        "tallos_total": "tallos",
-        "ventas_usd_total": "ventas_usd",
-        "participacion_tallos_mercado": "participacion_mercado",
-        "variacion_reciente_vs_previa": "cambio_reciente",
-        "complejidad_operativa": "complejidad",
-        "complejidad_operativa_score": "score_complejidad",
-    }
-    clients_table_display = clients_table_display.rename(columns={k: v for k, v in rename_clients.items() if k in clients_table_display.columns})
-    representative_clients = (
-        clients_table.sort_values(["cluster_id", "tallos_total"], ascending=[True, False])
-        .groupby("cluster_id", group_keys=False)
-        .head(5)
-        .rename(columns={k: v for k, v in rename_clients.items() if k in clients_table.columns})
-    )
-    missing_market = (
-        clusters["mercado_cluster"].astype(str).eq("05_OTROS").all()
-        and "pais_principal" in clusters.columns
-        and clusters["pais_principal"].fillna("sin_info").astype(str).str.lower().eq("sin_info").all()
-    )
-    market_warning = html.Div()
-    if missing_market:
-        market_warning = html.Div(
-            "Esta corrida no contiene pais en la entrada y agrupa todos los clientes como OTROS. Regenera descriptivos y clusters despues de actualizar la base para habilitar la lectura real por mercado.",
-            className="table-panel section-gap",
-        )
-
-    if clients_table.empty:
-        client_rank_fig = empty_figure("Clientes del cluster por volumen")
-        client_mix_fig = empty_figure("Composicion de clientes visibles")
-    else:
-        rank = clients_table.sort_values("tallos_total", ascending=False).head(max(top_n, 20)).copy()
-        rank["cliente_label"] = rank["cod_cliente"].astype(str) + " | " + rank["cliente"].astype(str).str.slice(0, 28)
-        client_rank_fig = px.bar(
-            rank,
-            x="tallos_total",
-            y="cliente_label",
-            color="cluster_id",
-            orientation="h",
-            hover_data=[
-                col
-                for col in [
-                    "mercado_cluster",
-                    "nombre_cluster",
-                    "producto_dominante",
-                    "color_dominante",
-                    "tipo_pedido_dominante",
-                    "share_top3_color",
-                    "share_top1_tipo_pedido",
-                    "pct_semanas_activas",
-                    "cv_volumen",
-                ]
-                if col in rank.columns
-            ],
-            title="Clientes dentro del cluster por volumen",
-        )
-        client_rank_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        apply_common_layout(client_rank_fig, 560)
-
-        mix_parts = []
-        for col, label in [
-            ("producto_dominante", "Producto dominante"),
-            ("color_dominante", "Color dominante"),
-            ("tipo_pedido_dominante", "Tipo pedido dominante"),
-        ]:
-            if col in clients_table.columns:
-                tmp = (
-                    clients_table.groupby([col], dropna=False, as_index=False)
-                    .agg(clientes=("cod_cliente", "nunique"), tallos=("tallos_total", "sum"))
-                    .sort_values("clientes", ascending=False)
-                    .head(10)
-                )
-                tmp["dimension"] = label
-                tmp = tmp.rename(columns={col: "valor"})
-                mix_parts.append(tmp)
-        client_mix = pd.concat(mix_parts, ignore_index=True) if mix_parts else pd.DataFrame()
-        if client_mix.empty:
-            client_mix_fig = empty_figure("Composicion de clientes visibles")
-        else:
-            client_mix_fig = px.bar(
-                client_mix,
-                x="clientes",
-                y="valor",
-                color="dimension",
-                facet_col="dimension",
-                orientation="h",
-                hover_data=["tallos"],
-                title="Composicion descriptiva de los clientes visibles",
-            )
-            client_mix_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-            apply_common_layout(client_mix_fig, 520)
-
-    metric_cards = [
-        make_card("Ano cluster", str(cluster_year or "sin dato"), period_label),
-        make_card("Clusters", moneyless_number(cluster_summary["cluster_id"].nunique()), "en filtro actual"),
-        make_card("Clientes", moneyless_number(clusters["cod_cliente"].nunique()), "asignados"),
-        make_card("Mercados", moneyless_number(clusters["mercado_cluster"].nunique()), "grupos definidos"),
-        make_card("Tallos", moneyless_number(clusters["tallos_total"].sum()), "volumen analizado"),
-    ]
-    if "ventas_usd_total" in clusters.columns:
-        metric_cards.append(make_card("Ventas USD", moneyless_number(clusters["ventas_usd_total"].sum(), 2), "valor del grupo"))
-    if "complejidad_operativa_score" in clusters.columns:
-        metric_cards.append(
-            make_card("Complejidad", moneyless_number(clusters["complejidad_operativa_score"].mean(), 1), "promedio 0-100")
-        )
-    metric_cards.append(
-        make_card(
-            "Metodo elegido",
-            str(method_market.sort_values("clientes", ascending=False).iloc[0]["metodo_cluster"]),
-            "mercado visible principal",
-        )
-    )
-
-    return html.Div(
-        [
-            market_warning,
-            html.Div(metric_cards, className="metrics-grid"),
-            html.Div(
-                [
-                    html.Div("Resumen ejecutivo de los tipos de clientes visibles", className="panel-title"),
-                    panel_note("Esta lectura describe clientes agrupados dentro del mercado seleccionado. Selecciona un solo cluster para convertirla en ficha de accion."),
-                    natural_reading,
-                ],
-                className="reading-panel section-gap",
-            ),
-            html.Div(
-                [
-                    html.Div("Riesgos, oportunidades y acciones recomendadas", className="panel-title"),
-                    panel_note("Usa esta tabla para llevar la segmentacion a gestion comercial, operacion y planeacion."),
-                    make_table(commercial_actions, 12),
-                ],
-                className="table-panel",
-            ),
-            html.Div(
-                [
-                    html.Div("Variables que explican el cluster seleccionado", className="panel-title"),
-                    panel_note("Muestra las variables que separan el grupo frente a clientes del mismo mercado. Son las razones del agrupamiento que deben validarse comercialmente."),
-                    make_table(explanation_table, 12),
-                ],
-                className="table-panel",
-            ),
-            html.Div(
-                [
-                    html.Div("Cluster frente al promedio de su mercado", className="panel-title"),
-                    panel_note("Permite distinguir si el grupo compra mas, compra con mayor regularidad, concentra su mix o exige una operacion mas compleja."),
-                    make_table(benchmark_table, 12),
-                ],
-                className="table-panel",
-            ),
-            html.Div(
-                [
-                    html.Div([dcc.Graph(figure=diff_fig), panel_note("Las barras mas largas identifican los atributos que mas diferencian el grupo frente a su mercado.")], className="panel"),
-                    html.Div([dcc.Graph(figure=tipo_fig), panel_note("Indica si la gestion del cluster debe orientarse a SOLIDO, SURTIDO, SURTIDO_M, BOUQUET, BQT, COMBO, RAINBOW u otro formato.")], className="panel"),
-                ],
-                className="grid-2 section-gap",
-            ),
-            html.Div(
-                [
-                    html.Div([dcc.Graph(figure=client_rank_fig), panel_note("Prioriza las cuentas que explican mayor volumen dentro del grupo.")], className="panel"),
-                ],
-                className="section-gap",
-            ),
-            html.Div(
-                [
-                    html.Div("Clientes representativos del cluster", className="panel-title"),
-                    panel_note("Muestra las cuentas de mayor volumen de cada grupo y sus rasgos dominantes para preparar oferta y seguimiento."),
-                    make_table(representative_clients, 15),
-                ],
-                className="table-panel",
-            ),
-            html.Div(
-                [
-                    html.Div("Clientes parecidos dentro del mercado", className="panel-title"),
-                    panel_note("Clientes espejo para replicar ofertas o validar sustitutos; la similitud se calcula sobre los mismos atributos usados para segmentar."),
-                    make_table(similar, 12),
-                ],
-                className="table-panel",
-            ),
-            year_change_section,
-            html.Details(
-                [
-                    html.Summary("Como leer este informe"),
-                    cluster_reading_guide(),
-                ],
-                className="table-panel section-gap",
-            ),
-            html.Details(
-                [
-                    html.Summary("Analisis descriptivo y tecnico adicional"),
-                    html.Div([html.Div(dcc.Graph(figure=scatter), className="panel"), html.Div(dcc.Graph(figure=tree), className="panel")], className="grid-2 section-gap"),
-                    html.Div([html.Div(dcc.Graph(figure=bars), className="panel"), html.Div(dcc.Graph(figure=block_fig), className="panel")], className="grid-2 section-gap"),
-                    html.Div([html.Div(dcc.Graph(figure=client_mix_fig), className="panel"), html.Div(dcc.Graph(figure=heat), className="panel")], className="grid-2 section-gap"),
-                    html.Div([html.Div("Clientes del cluster seleccionado", className="panel-title"), make_table(clients_table_display.head(800), 18)], className="table-panel"),
-                    html.Div([html.Div("Resumen cuantitativo de clusters", className="panel-title"), make_table(cluster_summary, 12)], className="table-panel"),
-                    html.Div([html.Div("Perfil por bloques", className="panel-title"), make_table(block_profile, 12)], className="table-panel"),
-                    html.Div([html.Div("Detalle de variables diferenciadoras", className="panel-title"), make_table(diff_table, 12)], className="table-panel"),
-                    html.Div([html.Div("Tipo de pedido dominante", className="panel-title"), make_table(tipo_mix.head(120), 12)], className="table-panel"),
-                    html.Div([html.Div("Evaluacion de metodos por mercado", className="panel-title"), make_table(eval_table, 12)], className="table-panel"),
-                ],
-                className="table-panel section-gap",
-            ),
-        ]
-    )
-
-
-def render_comprador_tab(
-    data: dict[str, pd.DataFrame],
-    filtered: pd.DataFrame,
-    selected_code: str | None,
-    top_n: int,
-    week_offset: int = 0,
-    visible_weeks: int = 4,
-):
-    valid_codes = set(filtered["cod_cliente"]) if not filtered.empty else set()
-    cruce = data["cruce"].copy()
-    if not cruce.empty and selected_code:
-        cruce = cruce[cruce["cod_cliente"] == selected_code].copy()
-    elif not cruce.empty and valid_codes:
-        cruce = cruce[cruce["cod_cliente"].isin(valid_codes)].copy()
-    cruce = apply_future_window(cruce, week_offset, visible_weeks)
-
-    if cruce.empty:
-        return html.Div("No hay cruce_forecast_inventario.csv para construir la vista de comprador.", className="table-panel")
-
-    cruce["tallos_prioridad_compra_cliente"] = pd.to_numeric(cruce["tallos_prioridad_compra_cliente"], errors="coerce").fillna(0)
-    cruce["tallos_estimados"] = pd.to_numeric(cruce["tallos_estimados"], errors="coerce").fillna(0)
-    compra = cruce[cruce["tallos_prioridad_compra_cliente"] > 0].copy()
-    if compra.empty:
-        compra = cruce.sort_values("tallos_estimados", ascending=False).head(200).copy()
-
-    by_priority = compra.groupby("prioridad_compra", dropna=False, as_index=False)["tallos_prioridad_compra_cliente"].sum()
-    priority_fig = px.bar(
-        by_priority.sort_values("tallos_prioridad_compra_cliente", ascending=False),
-        x="prioridad_compra",
-        y="tallos_prioridad_compra_cliente",
-        color="prioridad_compra",
-        color_discrete_map=color_map_for(by_priority, "prioridad_compra"),
-        title="Compra recomendada por prioridad",
-    )
-    priority_fig.update_layout(xaxis_tickangle=-30)
-    apply_common_layout(priority_fig, 380)
-
-    by_day = compra.groupby(["fecha_forecast", "prioridad_compra"], dropna=False, as_index=False)["tallos_prioridad_compra_cliente"].sum()
-    day_fig = px.area(by_day, x="fecha_forecast", y="tallos_prioridad_compra_cliente", color="prioridad_compra", color_discrete_map=color_map_for(by_day, "prioridad_compra"), title="Necesidad de compra por fecha")
-    apply_common_layout(day_fig, 400)
-
-    by_item = (
-        compra.groupby(["producto", "variedad", "color", "grado", "tipo_caja"], dropna=False, as_index=False)
-        .agg(
-            tallos_a_comprar=("tallos_prioridad_compra_cliente", "sum"),
-            demanda=("tallos_estimados", "sum"),
-            inventario_color=("inventario_color_total", "sum") if "inventario_color_total" in compra.columns else ("inventario_total", "sum"),
-            share_no_usa=("share_variedad_demanda_no_usa", "max") if "share_variedad_demanda_no_usa" in compra.columns else ("tallos_estimados", "sum"),
-        )
-        .sort_values("tallos_a_comprar", ascending=False)
-        .head(max(top_n, 15))
-    )
-    by_item["item"] = (
-        by_item["producto"].astype(str)
-        + " | "
-        + by_item["variedad"].astype(str)
-        + " | "
-        + by_item["color"].astype(str)
-        + " | "
-        + by_item["grado"].astype(str)
-        + " | "
-        + by_item["tipo_caja"].astype(str)
-    )
-    item_fig = px.bar(
-        by_item,
-        x="tallos_a_comprar",
-        y="item",
-        orientation="h",
-        color="share_no_usa",
-        color_continuous_scale=[CORPORATE_BURGUNDY, "#B07AA1", "#4E79A7", "#59A14F"],
-        title="Compra por variedad demandada por clientes no USA",
-    )
-    item_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-    apply_common_layout(item_fig, 560)
-
-    by_client = (
-        compra.groupby(["cod_cliente", "cliente", "recomendacion_compra"], dropna=False, as_index=False)
-        .agg(tallos_a_comprar=("tallos_prioridad_compra_cliente", "sum"), demanda=("tallos_estimados", "sum"))
-        .sort_values("tallos_a_comprar", ascending=False)
-        .head(max(top_n, 15))
-    )
-    client_fig = px.bar(
-        by_client,
-        x="tallos_a_comprar",
-        y="cliente",
-        orientation="h",
-        color="recomendacion_compra",
-        color_discrete_map=color_map_for(by_client, "recomendacion_compra"),
-        title="Clientes que explican la compra",
-    )
-    client_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-    apply_common_layout(client_fig, 560)
-
-    action_cols = [
-        "fecha_forecast",
-        "prioridad_compra",
-        "riesgo_disponibilidad",
-        "riesgo_variedad",
-        "criterio_compra_variedad",
-        "cod_cliente",
-        "cliente",
-        "pais",
-        "tipo_pedido_operativo",
-        "producto",
-        "variedad",
-        "color",
-        "grado",
-        "tipo_caja",
-        "tallos_estimados",
-        "inventario_color_total",
-        "inventario_variedad_total",
-        "faltante_proyectado_item",
-        "share_variedad_demanda_no_usa",
-        "ranking_variedad_no_usa",
-        "tallos_prioridad_compra_cliente",
-        "score_compra_terminada",
-        "recomendacion_compra",
-    ]
-    action_table = compra.sort_values(["tallos_prioridad_compra_cliente", "tallos_estimados"], ascending=False)
-    action_table = action_table[[col for col in action_cols if col in action_table.columns]].head(500)
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    make_card("Tallos a comprar", moneyless_number(compra["tallos_prioridad_compra_cliente"].sum()), "prioridad cliente"),
-                    make_card("Lineas accionables", moneyless_number(len(compra)), "detalle fecha item"),
-                    make_card("Clientes afectados", moneyless_number(compra["cod_cliente"].nunique()), "con necesidad"),
-                    make_card("Ventana", f"{visible_weeks} semanas", window_detail(data["cruce"], week_offset, visible_weeks)),
-                ],
-                className="metrics-grid",
-            ),
-            html.Div([html.Div(dcc.Graph(figure=priority_fig), className="panel"), html.Div(dcc.Graph(figure=day_fig), className="panel")], className="grid-2"),
-            html.Div([html.Div(dcc.Graph(figure=item_fig), className="panel"), html.Div(dcc.Graph(figure=client_fig), className="panel")], className="grid-2 section-gap"),
-            html.Div([html.Div("Lista de compra accionable", className="panel-title"), make_table(action_table, 18)], className="table-panel"),
-        ]
-    )
-
-
-def render_colores_tab(
-    data: dict[str, pd.DataFrame],
-    filtered: pd.DataFrame,
-    selected_code: str | None,
-    top_n: int,
-    week_offset: int = 0,
-    visible_weeks: int = 4,
-    product_filter: str | None = None,
-    color_filter: str | None = None,
-):
-    cruce = data["cruce"].copy()
-    inventario_color = data.get("inventario_color", pd.DataFrame()).copy()
-    valid_codes = set(filtered["cod_cliente"]) if not filtered.empty else set()
-
-    if selected_code and not cruce.empty:
-        cruce = cruce[cruce["cod_cliente"] == selected_code].copy()
-    elif valid_codes and not cruce.empty:
-        cruce = cruce[cruce["cod_cliente"].isin(valid_codes)].copy()
-
-    for frame_name in ["cruce", "inventario_color"]:
-        frame = cruce if frame_name == "cruce" else inventario_color
-        if frame.empty:
-            continue
-        if product_filter and "producto" in frame.columns:
-            frame = frame[frame["producto"].astype(str).eq(str(product_filter))].copy()
-        if color_filter and "color" in frame.columns:
-            frame = frame[frame["color"].astype(str).eq(str(color_filter))].copy()
-        if frame_name == "cruce":
-            cruce = frame
-        else:
-            inventario_color = frame
-
-    reference = cruce if not cruce.empty else inventario_color
-    start, end = future_window_bounds(reference, week_offset, visible_weeks)
-    cruce = apply_future_window(cruce, week_offset, visible_weeks)
-    if not inventario_color.empty and start is not None and end is not None:
-        dates = pd.to_datetime(inventario_color["fecha_forecast"], errors="coerce")
-        inventario_color = inventario_color[(dates >= start) & (dates <= end)].copy()
-
-    if cruce.empty and inventario_color.empty:
-        return html.Div("No hay inventario proyectado o demanda cruzada para los filtros seleccionados.", className="table-panel")
-
-    if not cruce.empty:
-        for col in ["tallos_estimados", "inventario_total", "inventario_color_total", "faltante_proyectado_item", "tallos_prioridad_compra_cliente", "score_compra_terminada"]:
-            if col in cruce.columns:
-                cruce[col] = pd.to_numeric(cruce[col], errors="coerce").fillna(0)
-
-    if not inventario_color.empty:
-        for col in ["inventario_color_total", "faltante_color_proyectado", "sobrante_color_proyectado"]:
-            if col in inventario_color.columns:
-                inventario_color[col] = pd.to_numeric(inventario_color[col], errors="coerce").fillna(0)
-        color_balance = inventario_color.copy()
-        color_balance["inventario_final_proyectado"] = color_balance["inventario_color_total"]
-        color_balance["faltante_color"] = color_balance.get("faltante_color_proyectado", color_balance["inventario_final_proyectado"].clip(upper=0).abs())
-        color_balance["sobrante_color"] = color_balance.get("sobrante_color_proyectado", color_balance["inventario_final_proyectado"].clip(lower=0))
-    else:
-        keys = ["fecha_forecast", "producto", "color", "grado"]
-        color_balance = (
-            cruce.groupby(keys, dropna=False, as_index=False)
-            .agg(
-                inventario_final_proyectado=("inventario_color_total", "first") if "inventario_color_total" in cruce.columns else ("inventario_total", "first"),
-                demanda=("tallos_estimados", "sum"),
-            )
-        )
-        color_balance["faltante_color"] = color_balance["inventario_final_proyectado"].clip(upper=0).abs()
-        color_balance["sobrante_color"] = color_balance["inventario_final_proyectado"].clip(lower=0)
-
-    demand_by_color = pd.DataFrame()
-    if not cruce.empty:
-        demand_by_color = (
-            cruce.groupby(["fecha_forecast", "producto", "color", "grado"], dropna=False, as_index=False)
-            .agg(
-                demanda=("tallos_estimados", "sum"),
-                clientes=("cod_cliente", "nunique"),
-                pedidos_reales=("fuente_demanda", lambda s: int(s.astype(str).str.contains("PENDIENTE", case=False, na=False).sum())),
-                tallos_prioridad=("tallos_prioridad_compra_cliente", "sum") if "tallos_prioridad_compra_cliente" in cruce.columns else ("tallos_estimados", "sum"),
-            )
-        )
-        merge_keys = ["fecha_forecast", "producto", "color", "grado"]
-        color_balance = color_balance.merge(demand_by_color, on=merge_keys, how="left", suffixes=("", "_demanda"))
-        if "demanda_demanda" in color_balance.columns:
-            color_balance["demanda"] = color_balance["demanda"].fillna(color_balance["demanda_demanda"])
-            color_balance = color_balance.drop(columns=["demanda_demanda"])
-
-    for col in ["demanda", "clientes", "pedidos_reales", "tallos_prioridad"]:
-        if col not in color_balance.columns:
-            color_balance[col] = 0
-        color_balance[col] = pd.to_numeric(color_balance[col], errors="coerce").fillna(0)
-    color_balance["fecha_forecast"] = pd.to_datetime(color_balance["fecha_forecast"], errors="coerce")
-    color_balance = add_week_columns(color_balance, "fecha_forecast")
-    color_balance["estado_color"] = np.select(
-        [
-            color_balance["inventario_final_proyectado"] < 0,
-            color_balance["inventario_final_proyectado"] > 0,
-        ],
-        ["FALTANTE", "SOBRANTE"],
-        default="NEUTRO",
-    )
-
-    faltantes = color_balance[color_balance["inventario_final_proyectado"] < 0].copy()
-    balance_day = color_balance.groupby(["fecha_forecast", "estado_color"], dropna=False, as_index=False).agg(
-        tallos=("inventario_final_proyectado", "sum"),
-        faltante=("faltante_color", "sum"),
-        demanda=("demanda", "sum"),
-    )
-    day_fig = px.area(
-        balance_day,
-        x="fecha_forecast",
-        y="faltante",
-        color="estado_color",
-        color_discrete_map=color_map_for(balance_day, "estado_color"),
-        title="Faltantes diarios por inventario final proyectado",
-    )
-    apply_common_layout(day_fig, 400)
-
-    top_color = (
-        faltantes.groupby(["producto", "color", "grado"], dropna=False, as_index=False)
-        .agg(faltante=("faltante_color", "sum"), demanda=("demanda", "sum"), dias_faltante=("fecha_forecast", "nunique"))
-        .sort_values("faltante", ascending=False)
-        .head(max(top_n, 15))
-    )
-    top_color["item"] = top_color["producto"].astype(str) + " | " + top_color["color"].astype(str) + " | " + top_color["grado"].astype(str)
-    color_fig = px.bar(
-        top_color,
-        x="faltante",
-        y="item",
-        orientation="h",
-        color="color",
-        color_discrete_map=color_map_for(top_color, "color"),
-        hover_data=["demanda", "dias_faltante"],
-        title="Colores con mas faltante proyectado",
-    )
-    color_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-    apply_common_layout(color_fig, 520)
-
-    if cruce.empty:
-        variety_fig = empty_figure("Variedades que explican faltantes")
-        client_fig = empty_figure("Clientes que explican necesidad")
-        variety_table = pd.DataFrame()
-        client_table = pd.DataFrame()
-        order_table = pd.DataFrame()
-    else:
-        shortage_keys = faltantes[["fecha_forecast", "producto", "color", "grado"]].drop_duplicates()
-        shortage_lines = cruce.merge(shortage_keys, on=["fecha_forecast", "producto", "color", "grado"], how="inner")
-        variety_table = (
-            shortage_lines.groupby(["producto", "variedad", "color", "grado"], dropna=False, as_index=False)
-            .agg(
-                demanda=("tallos_estimados", "sum"),
-                clientes=("cod_cliente", "nunique"),
-                compra_prioridad=("tallos_prioridad_compra_cliente", "sum") if "tallos_prioridad_compra_cliente" in shortage_lines.columns else ("tallos_estimados", "sum"),
-                score_promedio=("score_compra_terminada", "mean"),
-            )
-            .sort_values(["compra_prioridad", "demanda"], ascending=False)
-            .head(max(top_n, 20))
-        )
-        variety_table["item"] = variety_table["producto"].astype(str) + " | " + variety_table["variedad"].astype(str) + " | " + variety_table["color"].astype(str)
-        variety_fig = px.bar(
-            variety_table,
-            x="demanda",
-            y="item",
-            orientation="h",
-            color="color",
-            color_discrete_map=color_map_for(variety_table, "color"),
-            hover_data=["compra_prioridad", "clientes", "score_promedio"],
-            title="Variedades mas demandadas dentro de colores faltantes",
-        )
-        variety_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        apply_common_layout(variety_fig, 540)
-
-        client_group_cols = [col for col in ["cod_cliente", "cliente", "pais", "recomendacion_compra"] if col in shortage_lines.columns]
-        client_table = (
-            shortage_lines.groupby(client_group_cols, dropna=False, as_index=False)
-            .agg(
-                demanda=("tallos_estimados", "sum"),
-                compra_prioridad=("tallos_prioridad_compra_cliente", "sum") if "tallos_prioridad_compra_cliente" in shortage_lines.columns else ("tallos_estimados", "sum"),
-                lineas=("color", "size"),
-                colores=("color", "nunique"),
-                score=("score_compra_terminada", "mean"),
-            )
-            .sort_values(["compra_prioridad", "score", "demanda"], ascending=False)
-            .head(max(top_n, 20))
-        ) if client_group_cols else pd.DataFrame()
-        client_color = "recomendacion_compra" if "recomendacion_compra" in client_table.columns else None
-        client_y = "cliente" if "cliente" in client_table.columns else ("cod_cliente" if "cod_cliente" in client_table.columns else None)
-        client_fig = (
-            px.bar(
-                client_table,
-                x="compra_prioridad",
-                y=client_y,
-                orientation="h",
-                color=client_color,
-                color_discrete_map=color_map_for(client_table, client_color) if client_color else None,
-                title="Clientes recomendados para explicar la compra",
-            )
-            if client_y
-            else empty_figure("Clientes que explican necesidad")
-        )
-        client_fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        apply_common_layout(client_fig, 540)
-
-        order_cols = [
-            "fecha_forecast",
-            "semana_label",
-            "cod_cliente",
-            "cliente",
-            "pais",
-            "fuente_demanda",
-            "tipo_pedido_operativo",
-            "enfoque_analisis_operativo",
-            "producto",
-            "variedad",
-            "color",
-            "grado",
-            "tipo_caja",
-            "tallos_estimados",
-            "inventario_color_total",
-            "inventario_total",
-            "faltante_proyectado_item",
-            "tallos_prioridad_compra_cliente",
-            "prioridad_compra",
-            "score_compra_terminada",
-            "recomendacion_compra",
-        ]
-        shortage_lines = add_week_columns(shortage_lines, "fecha_forecast")
-        order_table = shortage_lines[[col for col in order_cols if col in shortage_lines.columns]].sort_values(
-            ["tallos_prioridad_compra_cliente", "tallos_estimados"], ascending=False
-        ).head(600)
-
-    color_table_cols = [
-        "fecha_forecast",
-        "semana_label",
-        "producto",
-        "color",
-        "grado",
-        "inventario_final_proyectado",
-        "faltante_color",
-        "sobrante_color",
-        "demanda",
-        "clientes",
-        "pedidos_reales",
-        "estado_color",
-    ]
-    color_table = color_balance[[col for col in color_table_cols if col in color_balance.columns]].sort_values(
-        ["faltante_color", "demanda"], ascending=False
-    ).head(600)
-
-    product_label = product_filter or "todos"
-    color_label = color_filter or "todos"
-    return html.Div(
-        [
-            html.Div(
-                [
-                    make_card("Faltante proyectado", moneyless_number(faltantes["faltante_color"].sum() if not faltantes.empty else 0), "suma de diferencias negativas dia a dia"),
-                    make_card("Colores faltantes", moneyless_number(faltantes[["producto", "color", "grado"]].drop_duplicates().shape[0] if not faltantes.empty else 0), "producto color grado"),
-                    make_card("Clientes en faltantes", moneyless_number(order_table["cod_cliente"].nunique() if not order_table.empty and "cod_cliente" in order_table.columns else 0), "demanda asociada"),
-                    make_card("Filtro", f"{product_label} / {color_label}", window_detail(reference, week_offset, visible_weeks)),
-                ],
-                className="metrics-grid",
-            ),
-            html.Div([html.Div(dcc.Graph(figure=day_fig), className="panel"), html.Div(dcc.Graph(figure=color_fig), className="panel")], className="grid-2"),
-            html.Div([html.Div(dcc.Graph(figure=variety_fig), className="panel"), html.Div(dcc.Graph(figure=client_fig), className="panel")], className="grid-2 section-gap"),
-            html.Div([html.Div("Inventario final proyectado por dia, producto, color y grado", className="panel-title"), make_table(color_table, 16)], className="table-panel"),
-            html.Div([html.Div("Variedades que explican faltantes", className="panel-title"), make_table(variety_table.drop(columns=["item"], errors="ignore"), 14)], className="table-panel"),
-            html.Div([html.Div("Clientes recomendados para compra", className="panel-title"), make_table(client_table, 14)], className="table-panel"),
-            html.Div([html.Div("Pedidos y lineas que contienen esos colores", className="panel-title"), make_table(order_table, 16)], className="table-panel"),
-        ]
-    )
-
-
-def render_demanda_tab(
-    data: dict[str, pd.DataFrame],
-    filtered: pd.DataFrame,
-    selected_code: str | None,
-    top_n: int,
-    compare_mode: str = "none",
-    solid_product: str | None = None,
-    week_offset: int = 0,
-    visible_weeks: int = 4,
-    history_weeks: int = 26,
-    analysis_scope: str = "solidos",
-):
-    valid_codes = set(filtered["cod_cliente"]) if not filtered.empty else set()
-    demanda = filter_operational_scope(data["demanda"], analysis_scope, solid_product)
-    cruce = filter_operational_scope(data["cruce"], analysis_scope, solid_product)
-    historico_source = data["historico_solidos"] if analysis_scope == "solidos" else data.get("historico_confirmado", data["historico_solidos"])
-    historico = filter_operational_scope(historico_source, analysis_scope, solid_product)
-    if selected_code:
-        demanda = demanda[demanda["cod_cliente"] == selected_code] if not demanda.empty else demanda
-        cruce = cruce[cruce["cod_cliente"] == selected_code] if not cruce.empty else cruce
-        historico = historico[historico["cod_cliente"] == selected_code] if not historico.empty else historico
-    elif valid_codes:
-        demanda = demanda[demanda["cod_cliente"].isin(valid_codes)] if not demanda.empty else demanda
-        cruce = cruce[cruce["cod_cliente"].isin(valid_codes)] if not cruce.empty else cruce
-        historico = historico[historico["cod_cliente"].isin(valid_codes)] if not historico.empty else historico
-
-    start, end = future_window_bounds(demanda, week_offset, visible_weeks)
-    demanda = apply_future_window(demanda, week_offset, visible_weeks)
-    cruce = apply_future_window(cruce, week_offset, visible_weeks)
-    if start is not None:
-        hist_start = start - pd.Timedelta(weeks=3)
-        hist_end = start - pd.Timedelta(days=1)
-        hist_dates = pd.to_datetime(historico["fecha"], errors="coerce") if not historico.empty else pd.Series(dtype="datetime64[ns]")
-        historico_reciente = historico[(hist_dates >= hist_start) & (hist_dates <= hist_end)].copy() if not historico.empty else historico
-    else:
-        historico_reciente = historico.head(0).copy()
-
-    demanda = add_week_columns(demanda, "fecha_forecast")
-    cruce = add_week_columns(cruce, "fecha_forecast")
-    historico_reciente = add_week_columns(historico_reciente, "fecha")
-    scope_title, scope_detail = scope_label(analysis_scope)
-
-    if demanda.empty:
-        demand_line = empty_figure(f"Demanda futura - {scope_title}")
-        demand_week = empty_figure(f"Demanda por semana - {scope_title}")
-        demand_mix = empty_figure(f"Composicion - {scope_title}")
-    else:
-        by_date = demanda.groupby(["fecha_forecast", "fecha_semana", "semana_label", "fuente_demanda"], as_index=False)["tallos_estimados"].sum()
-        demand_line = px.area(
-            by_date,
-            x="fecha_forecast",
-            y="tallos_estimados",
-            color="fuente_demanda",
-            color_discrete_map=color_map_for(by_date, "fuente_demanda"),
-            hover_data=["fecha_semana", "semana_label"],
-            title=f"Demanda futura por fecha, semana y fuente - {scope_title}",
-        )
-        apply_common_layout(demand_line, 400)
-
-        by_week = demanda.groupby(["semana_label", "fuente_demanda"], as_index=False)["tallos_estimados"].sum()
-        demand_week = px.bar(
-            by_week,
-            x="semana_label",
-            y="tallos_estimados",
-            color="fuente_demanda",
-            color_discrete_map=color_map_for(by_week, "fuente_demanda"),
-            barmode="group",
-            title=f"Demanda futura por semana - {scope_title}",
-        )
-        demand_week.update_layout(xaxis_tickangle=-35)
-        apply_common_layout(demand_week, 400)
-
-        mix_path = ["familia_analisis_operativa", "tipo_pedido_operativo", "producto", "color"]
-        mix_path = [col for col in mix_path if col in demanda.columns]
-        mix = (
-            demanda.groupby(mix_path, dropna=False, as_index=False)["tallos_estimados"]
-            .sum()
-            .sort_values("tallos_estimados", ascending=False)
-            .head(max(top_n, 15))
-        )
-        demand_mix = px.sunburst(mix, path=mix_path, values="tallos_estimados", title=f"Composicion de demanda - {scope_title}")
-        apply_common_layout(demand_mix, 480)
-
-    if historico_reciente.empty:
-        recent_line = empty_figure(f"Demanda real ultimas 3 semanas - {scope_title}")
-    else:
-        recent = historico_reciente.groupby(["fecha", "fecha_semana", "semana_label", "producto"], dropna=False, as_index=False)["tallos_historicos"].sum()
-        recent_line = px.line(
-            recent,
-            x="fecha",
-            y="tallos_historicos",
-            color="producto",
-            color_discrete_map=color_map_for(recent, "producto"),
-            markers=True,
-            hover_data=["fecha_semana", "semana_label"],
-            title=f"Demanda real recibida en las 3 semanas previas - {scope_title}",
-        )
-        apply_common_layout(recent_line, 400)
-
-    if cruce.empty:
-        risk = empty_figure("Riesgo de disponibilidad")
-        priority = empty_figure("Prioridad de compra")
-        cruce_table = pd.DataFrame()
-    else:
-        risk_df = cruce.groupby(["riesgo_disponibilidad"], dropna=False, as_index=False).agg(
-            tallos=("tallos_estimados", "sum"),
-            faltante=("faltante_proyectado_item", "sum"),
-        )
-        risk = px.bar(risk_df, x="riesgo_disponibilidad", y=["tallos", "faltante"], barmode="group", title="Riesgo de disponibilidad")
-        risk.update_layout(xaxis_tickangle=-35)
-        apply_common_layout(risk, 380)
-
-        priority_df = cruce.groupby(["prioridad_compra"], dropna=False, as_index=False)["tallos_prioridad_compra_cliente"].sum()
-        priority = px.bar(priority_df, x="prioridad_compra", y="tallos_prioridad_compra_cliente", color="prioridad_compra", color_discrete_map=color_map_for(priority_df, "prioridad_compra"), title="Tallos sugeridos por prioridad de compra")
-        priority.update_layout(xaxis_tickangle=-35)
-        apply_common_layout(priority, 380)
-
-        cruce_table = (
-            cruce.sort_values(["tallos_prioridad_compra_cliente", "tallos_estimados"], ascending=False)
-            .head(200)[
-                [
-                    col
-                    for col in [
-                        "fecha_forecast",
-                        "fecha_semana",
-                        "semana_label",
-                        "cod_cliente",
-                        "cliente",
-                        "tipo_pedido_operativo",
-                        "familia_analisis_operativa",
-                        "enfoque_analisis_operativo",
-                        "rol_color_operativo",
-                        "producto",
-                        "variedad",
-                        "color",
-                        "grado",
-                        "tallos_estimados",
-                        "inventario_total",
-                        "riesgo_disponibilidad",
-                        "tallos_prioridad_compra_cliente",
-                        "prioridad_compra",
-                    ]
-                    if col in cruce.columns
-                ]
-            ]
-        )
-
-    last_year_section = []
-    if compare_mode and compare_mode != "none":
-        last_year_section = build_last_year_demand_section(data, demanda, historico, compare_mode)
-
-    detail_cols = [
-        "fecha_forecast",
-        "fecha_semana",
-        "semana_label",
-        "cod_cliente",
-        "cliente",
-        "tipo_pedido_operativo",
-        "familia_analisis_operativa",
-        "enfoque_analisis_operativo",
-        "rol_color_operativo",
-        "producto",
-        "variedad",
-        "color",
-        "grado",
-        "tipo_caja",
-        "fuente_demanda",
-        "tallos_estimados",
-        "confianza_estimacion",
-        "recomendacion_compra",
-    ]
-    demand_detail = demanda[[col for col in detail_cols if col in demanda.columns]].sort_values(
-        ["fecha_forecast", "tallos_estimados"], ascending=[True, False]
-    ).head(500) if not demanda.empty else pd.DataFrame()
-    producto_label = solid_product if solid_product else "todos los productos"
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    make_card("Lectura", scope_title, scope_detail),
-                    make_card("Producto", producto_label, "filtro opcional"),
-                    make_card("Lineas demanda", moneyless_number(len(demanda)), "forecast + pendientes"),
-                    make_card("Tallos demanda", moneyless_number(demanda["tallos_estimados"].sum() if not demanda.empty else 0), "periodo futuro"),
-                    make_card("Lineas inventario", moneyless_number(len(cruce)), "cruce disponible"),
-                    make_card(
-                        "Ventana",
-                        f"{visible_weeks} semanas",
-                        window_detail(filter_operational_scope(data["demanda"], analysis_scope, solid_product), week_offset, visible_weeks),
-                    ),
-                ],
-                className="metrics-grid",
-            ),
-            html.Div([html.Div(dcc.Graph(figure=recent_line), className="panel"), html.Div(dcc.Graph(figure=demand_line), className="panel")], className="grid-2"),
-            html.Div([html.Div(dcc.Graph(figure=demand_week), className="panel"), html.Div(dcc.Graph(figure=demand_mix), className="panel")], className="grid-2 section-gap"),
-            *last_year_section,
-            html.Div([html.Div(dcc.Graph(figure=risk), className="panel"), html.Div(dcc.Graph(figure=priority), className="panel")], className="grid-2 section-gap"),
-            html.Div([html.Div("Detalle demanda futura", className="panel-title"), make_table(demand_detail, 15)], className="table-panel"),
-            html.Div([html.Div("Detalle priorizado inventario", className="panel-title"), make_table(cruce_table, 12)], className="table-panel"),
-        ]
-    )
-
-
-def build_last_year_demand_section(data: dict[str, pd.DataFrame], demanda: pd.DataFrame, historico: pd.DataFrame, compare_mode: str):
-    if demanda.empty or historico.empty:
-        return [html.Div("No hay demanda o historico solido para comparar contra ano anterior.", className="table-panel")]
-
-    demand_week = demanda.copy()
-    demand_week["anio_forecast"] = demand_week["fecha_forecast"].dt.isocalendar().year.astype(int)
-    demand_week["semana_iso"] = demand_week["fecha_forecast"].dt.isocalendar().week.astype(int)
-    demand_week["anio_comparacion"] = demand_week["anio_forecast"] - 1
-
-    future = (
-        demand_week.groupby(["anio_forecast", "anio_comparacion", "semana_iso"], as_index=False)["tallos_estimados"]
-        .sum()
-        .rename(columns={"tallos_estimados": "demanda_modelo_final"})
-    )
-    if compare_mode == "same_dates":
-        start = demanda["fecha_forecast"].min() - pd.DateOffset(years=1)
-        end = demanda["fecha_forecast"].max() - pd.DateOffset(years=1)
-        hist = historico[(historico["fecha"] >= start) & (historico["fecha"] <= end)].copy()
-        if hist.empty:
-            return [html.Div("No hay historico solido para las mismas fechas del ano anterior.", className="table-panel")]
-        hist["fecha_forecast"] = hist["fecha"] + pd.DateOffset(years=1)
-        hist = add_week_columns(hist, "fecha_forecast")
-        history = (
-            hist.groupby(["fecha_forecast", "semana_label"], as_index=False)["tallos_historicos"]
-            .sum()
-            .rename(columns={"tallos_historicos": "tallos_anio_anterior"})
-        )
-        future_dates = demanda.groupby(["fecha_forecast", "semana_label"], as_index=False)["tallos_estimados"].sum().rename(columns={"tallos_estimados": "demanda_modelo_final"})
-        comp = future_dates.merge(history, on=["fecha_forecast", "semana_label"], how="left")
-        comp["periodo_label"] = comp["fecha_forecast"].dt.strftime("%Y-%m-%d") + " | " + comp["semana_label"]
-        title = "Demanda solida vs ano anterior por mismas fechas"
-        table_label = "Comparacion por mismas fechas del ano anterior"
-    else:
-        history = (
-            historico.groupby(["anio_iso", "semana_iso"], as_index=False)["tallos_historicos"]
-            .sum()
-            .rename(columns={"anio_iso": "anio_comparacion", "tallos_historicos": "tallos_anio_anterior"})
-        )
-        comp = future.merge(history, on=["anio_comparacion", "semana_iso"], how="left")
-        comp["periodo_label"] = comp["anio_forecast"].astype(str) + "-W" + comp["semana_iso"].astype(str).str.zfill(2)
-        title = "Demanda solida vs ano anterior por mismas semanas"
-        table_label = "Comparacion por mismas semanas del ano anterior"
-
-    comp["tallos_anio_anterior"] = comp["tallos_anio_anterior"].fillna(0)
-    comp["diferencia_vs_anio_anterior"] = comp["demanda_modelo_final"] - comp["tallos_anio_anterior"]
-    comp["pct_vs_anio_anterior"] = np.where(
-        comp["tallos_anio_anterior"] > 0,
-        comp["diferencia_vs_anio_anterior"] / comp["tallos_anio_anterior"],
-        np.nan,
-    )
-    long = comp.melt(
-        id_vars=[col for col in ["periodo_label", "semana_label", "anio_forecast", "anio_comparacion", "semana_iso", "fecha_forecast"] if col in comp.columns],
-        value_vars=["demanda_modelo_final", "tallos_anio_anterior"],
-        var_name="serie",
-        value_name="tallos",
-    )
-    line = px.line(long, x="periodo_label", y="tallos", color="serie", markers=True, title=title)
-    line.update_layout(xaxis_tickangle=-35)
-    apply_common_layout(line, 430)
-
-    gap = px.bar(
-        comp,
-        x="periodo_label",
-        y="diferencia_vs_anio_anterior",
-        color="diferencia_vs_anio_anterior",
-        color_continuous_scale="RdBu",
-        title="Diferencia de tallos contra ano anterior",
-    )
-    gap.update_layout(xaxis_tickangle=-35)
-    apply_common_layout(gap, 430)
-
-    detail = comp[
-        [
-            col
-            for col in [
-                "periodo_label",
-                "semana_label",
-                "fecha_forecast",
-                "anio_comparacion",
-                "semana_iso",
-                "demanda_modelo_final",
-                "tallos_anio_anterior",
-                "diferencia_vs_anio_anterior",
-                "pct_vs_anio_anterior",
-            ]
-            if col in comp.columns
-        ]
-    ].sort_values("periodo_label")
-
-    return [
-        html.Div([html.Div(dcc.Graph(figure=line), className="panel"), html.Div(dcc.Graph(figure=gap), className="panel")], className="grid-2 section-gap"),
-        html.Div([html.Div(table_label, className="panel-title"), make_table(detail, 12)], className="table-panel"),
-    ]
-
-
-def render_reserved_module(title: str, message: str) -> html.Div:
-    """Muestra una pestaña reservada sin activar flujos que aun no son oficiales."""
-    return html.Div(
-        [
-            html.Div(title, className="panel-title"),
-            html.Div(message, className="reading-text"),
-        ],
-        className="reading-panel",
-    )
-
-
-def render_estructuras_componentes_tab(
-    data: dict[str, pd.DataFrame],
-    selected_code: str | None,
-    top_n: int,
-    products=None,
-    colors=None,
-    years=None,
-    week_range=None,
-):
-    """Resume la orden regular de un cliente a partir de estructuras confirmadas.
-
-    Esta vista deliberadamente no reemplaza el visualizador general. Identifica
-    las estructuras repetidas y sus componentes habituales para el cliente y
-    periodo seleccionado.
-    """
-    estructura_caja = data.get("estructura_caja", pd.DataFrame()).copy()
-    componentes = data.get("estructura_componentes", pd.DataFrame()).copy()
-    catalogo = data.get("catalogo_estructura_version", pd.DataFrame()).copy()
-
-    if not selected_code:
-        return html.Div(
-            [
-                html.Div("Orden regular del cliente", className="panel-title"),
-                html.Div("Selecciona un cliente en el panel lateral para ver sus estructuras base mas repetidas.", className="reading-text"),
-            ],
-            className="reading-panel",
-        )
-    for name, frame in [("estructura_caja", estructura_caja), ("componentes", componentes), ("catalogo", catalogo)]:
-        if not frame.empty and "cod_cliente" in frame.columns:
-            subset = frame[frame["cod_cliente"].astype(str).eq(str(selected_code))].copy()
-            if name == "estructura_caja":
-                estructura_caja = subset
-            elif name == "componentes":
-                componentes = subset
-            else:
-                catalogo = subset
-
-    if estructura_caja.empty:
-        return html.Div(
-            "No hay estructura_caja.csv disponible. Corre el pipeline descriptivo actualizado para generar estructuras y componentes.",
-            className="table-panel",
-        )
-
-    selected_products = selected_values(products)
-    selected_colors = selected_values(colors)
-    if not componentes.empty and (selected_products or selected_colors):
-        component_scope = componentes.copy()
-        if selected_products and "producto" in component_scope.columns:
-            component_scope = component_scope[component_scope["producto"].astype(str).isin(selected_products)]
-        if selected_colors and "color" in component_scope.columns:
-            component_scope = component_scope[component_scope["color"].astype(str).isin(selected_colors)]
-        valid_structures = component_scope["estructura_caja_id"].dropna().unique() if "estructura_caja_id" in component_scope else []
-        estructura_caja = estructura_caja[estructura_caja["estructura_caja_id"].isin(valid_structures)].copy()
-        componentes = componentes[componentes["estructura_caja_id"].isin(valid_structures)].copy()
-    if "fecha" in estructura_caja.columns:
-        estructura_caja["fecha"] = pd.to_datetime(estructura_caja["fecha"], errors="coerce")
-        date_scope = estructura_caja.copy()
-        if years:
-            date_scope = date_scope[date_scope["fecha"].dt.year.isin([int(year) for year in years])]
-        if week_range and len(week_range) == 2:
-            iso_week = date_scope["fecha"].dt.isocalendar().week
-            date_scope = date_scope[iso_week.between(int(week_range[0]), int(week_range[1]))]
-        valid_structures = date_scope["estructura_caja_id"].dropna().unique()
-        estructura_caja = date_scope
-        if not componentes.empty:
-            componentes = componentes[componentes["estructura_caja_id"].isin(valid_structures)].copy()
-    if estructura_caja.empty:
-        return html.Div("No hay ordenes regulares para los filtros seleccionados.", className="table-panel")
-
-    for frame in [estructura_caja, componentes, catalogo]:
-        if not frame.empty:
-            for col in [
-                "tallos_estructura", "ramos_estimados", "tallos_analisis",
-                "participacion_tallos_estructura", "veces_observada",
-                "repeticiones_estructura", "estructuras_componente",
-            ]:
-                if col in frame.columns:
-                    frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
-
-    regular_agg = {
-        "repeticiones": ("repeticiones_estructura", "sum")
-        if "repeticiones_estructura" in estructura_caja.columns
-        else ("estructura_caja_id", "nunique"),
-        "tallos": ("tallos_estructura", "sum"),
-        "ramos_estimados": ("ramos_estimados", "sum"),
-        "versiones": ("composicion_version_id", "nunique"),
-    }
-    regular_structures = (
-        estructura_caja.groupby(["tipo_pedido_operativo", "sku_operativo", "productos", "colores"], dropna=False, as_index=False)
-        .agg(**regular_agg)
-        .sort_values(["repeticiones", "tallos"], ascending=False)
-        .head(max(top_n, 10))
-    )
-    fig_top = px.bar(regular_structures, y="sku_operativo", x="repeticiones", color="tipo_pedido_operativo", color_discrete_map=color_map_for(regular_structures, "tipo_pedido_operativo"), orientation="h", title="Ordenes base mas repetidas")
-    fig_top.update_layout(yaxis=dict(categoryorder="total ascending"))
-    apply_common_layout(fig_top, 430)
-
-    componentes_top = pd.DataFrame()
-    if not componentes.empty:
-        component_agg = {
-            "tallos": ("tallos_analisis", "sum"),
-            "estructuras": ("estructuras_componente", "sum")
-            if "estructuras_componente" in componentes.columns
-            else ("estructura_caja_id", "nunique"),
-        }
-        componentes_top = (
-            componentes.groupby(["tipo_pedido_operativo", "producto", "color", "variedad"], dropna=False, as_index=False)
-            .agg(**component_agg)
-            .sort_values("tallos", ascending=False)
-            .head(max(top_n, 15))
-        )
-
-    total_tallos = estructura_caja["tallos_estructura"].sum() if "tallos_estructura" in estructura_caja.columns else 0
-    regular = regular_structures.iloc[0] if not regular_structures.empty else None
-    regular_name = str(regular["sku_operativo"]) if regular is not None else "sin estructura"
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Div("Orden regular del cliente", className="panel-title"),
-                    html.Div(
-                        "Esta vista resume la estructura que el cliente repite con mayor frecuencia dentro del periodo filtrado. Usa el Visualizador general para explorar el historial completo.",
-                        className="reading-text",
-                    ),
-                ],
-                className="reading-panel",
-            ),
-            html.Div(
-                [
-                    make_card("Orden base", regular_name, "estructura mas repetida"),
-                    make_card("Repeticiones", moneyless_number(regular["repeticiones"] if regular is not None else 0), "en periodo visible"),
-                    make_card(
-                        "Estructuras observadas",
-                        moneyless_number(
-                            estructura_caja["repeticiones_estructura"].sum()
-                            if "repeticiones_estructura" in estructura_caja.columns
-                            else estructura_caja["estructura_caja_id"].nunique()
-                        ),
-                        "confirmadas",
-                    ),
-                    make_card("Tallos", moneyless_number(total_tallos), "periodo filtrado"),
-                ],
-                className="metrics-grid",
-            ),
-            html.Div([html.Div([dcc.Graph(figure=fig_top), panel_note("Ordena las estructuras que mas veces se repiten. La primera barra corresponde a la orden regular identificada para el cliente.")], className="panel")], className="section-gap"),
-            html.Div([html.Div("Estructuras base habituales", className="panel-title"), panel_note("Resumen de las estructuras recurrentes del cliente; sirve para describir su pedido regular sin entrar al detalle de cada orden."), make_table(regular_structures, 12)], className="table-panel"),
-            html.Div([html.Div("Composicion habitual de la orden", className="panel-title"), panel_note("Productos, colores y variedades que componen las estructuras repetidas visibles."), make_table(componentes_top, 15)], className="table-panel"),
-        ]
-    )
-
-
 def _filter_solid_forecast_frame(
     frame: pd.DataFrame,
     start_date: str | None,
@@ -7587,143 +6819,158 @@ def _filter_solid_forecast_frame(
     if frame.empty:
         return frame.copy()
     out = frame.copy()
-    if start_date:
-        out = out[out["week_start"] >= pd.to_datetime(start_date)]
-    if end_date:
-        out = out[out["week_start"] <= pd.to_datetime(end_date)]
+    if "week_start" in out.columns:
+        out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
+        if start_date:
+            out = out[out["week_start"].ge(pd.to_datetime(start_date, errors="coerce"))].copy()
+        if end_date:
+            out = out[out["week_start"].le(pd.to_datetime(end_date, errors="coerce"))].copy()
+    if years and "anio" in out.columns:
+        year_set = {int(year) for year in years if pd.notna(year)}
+        out = out[pd.to_numeric(out["anio"], errors="coerce").astype("Int64").isin(year_set)].copy()
     if week_range and len(week_range) == 2 and "semana_iso" in out.columns:
-        out = out[
-            out["semana_iso"].between(int(week_range[0]), int(week_range[1]), inclusive="both")
-        ]
-    selections = [
-        ("anio", [int(year) for year in (years or [])]),
-        ("mercado_cluster", selected_values(markets)),
-        ("pais", selected_values(countries)),
-        ("cod_cliente", selected_values(clients)),
-        ("producto", selected_values(products)),
-        ("color", selected_values(colors)),
-    ]
-    for col, values in selections:
-        if values and col in out.columns:
-            out = out[out[col].isin(values)]
+        weeks = pd.to_numeric(out["semana_iso"], errors="coerce")
+        out = out[weeks.between(int(week_range[0]), int(week_range[1]))].copy()
+    for col, values in [
+        ("mercado_cluster", markets),
+        ("pais", countries),
+        ("cod_cliente", clients),
+        ("producto", products),
+        ("color", colors),
+    ]:
+        selected = selected_values(values)
+        if selected and col in out.columns:
+            out = out[out[col].astype(str).isin({str(value) for value in selected})].copy()
     return out
 
 
-def valid_validation_window_starts(frame: pd.DataFrame, year: int | None, window_weeks: int = 8) -> list[int]:
-    """Return starts of complete selectable validation windows within an ISO year."""
-    if frame.empty or year is None or "anio" not in frame.columns or "semana_iso" not in frame.columns:
-        return []
-    year_weeks = set(
-        pd.to_numeric(frame.loc[frame["anio"].eq(int(year)), "semana_iso"], errors="coerce")
-        .dropna()
-        .astype(int)
-        .tolist()
-    )
-    return [
-        week
-        for week in sorted(year_weeks)
-        if week + window_weeks - 1 <= 53
-        and all((week + offset) in year_weeks for offset in range(window_weeks))
+def _forecast_wape(frame: pd.DataFrame, group_cols: list[str] | None = None) -> float:
+    if frame.empty or "tallos" not in frame.columns:
+        return np.nan
+    actual = pd.to_numeric(frame["tallos"], errors="coerce").fillna(0)
+    if "error_abs" in frame.columns:
+        error = pd.to_numeric(frame["error_abs"], errors="coerce").fillna(0)
+    elif "prediccion" in frame.columns:
+        predicted = pd.to_numeric(frame["prediccion"], errors="coerce").fillna(0)
+        error = (predicted - actual).abs()
+    else:
+        return np.nan
+    denom = actual.sum()
+    return float(error.sum() / denom) if denom > 0 else np.nan
+
+
+def _normalize_solid_forecast_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    if "week_start" in out.columns:
+        out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce")
+    for col in [
+        "anio",
+        "semana_iso",
+        "tallos",
+        "tallos_estimados",
+        "prediccion",
+        "error_abs",
+        "probabilidad_compra",
+        "volumen_si_compra",
+        "MAE",
+        "RMSE",
+        "WAPE",
+        "MAPE_no_cero",
+        "bias_pct",
+        "tallos_reales",
+        "tallos_predichos",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def build_forecast_notes_table(importance: pd.DataFrame, top_n: int = 12) -> pd.DataFrame:
+    if importance.empty:
+        return pd.DataFrame()
+    out = importance.copy()
+    score_col = "importancia_positiva" if "importancia_positiva" in out.columns else "importancia"
+    if score_col in out.columns:
+        out[score_col] = pd.to_numeric(out[score_col], errors="coerce")
+        out = out.sort_values(score_col, ascending=False)
+    cols = [
+        "etapa_modelo",
+        "bloque",
+        "variable",
+        "descripcion",
+        score_col,
     ]
+    out = out[[col for col in cols if col in out.columns]].head(top_n).copy()
+    rename = {
+        "etapa_modelo": "Etapa",
+        "bloque": "Bloque",
+        "variable": "Variable",
+        "descripcion": "Lectura",
+        score_col: "Importancia",
+    }
+    out = out.rename(columns=rename)
+    if "Importancia" in out.columns:
+        out["Importancia"] = out["Importancia"].map(lambda value: f"{value:.3f}" if pd.notna(value) else "")
+    return out
 
 
-def forecast_reading_guide() -> html.Div:
+def build_forecast_market_importance_table(
+    market_importance: pd.DataFrame,
+    markets,
+    top_n_per_market: int = 5,
+) -> pd.DataFrame:
+    if market_importance.empty:
+        return pd.DataFrame()
+    out = market_importance.copy()
+    selected_markets = selected_values(markets)
+    if selected_markets and "mercado_cluster" in out.columns:
+        out = out[out["mercado_cluster"].astype(str).isin(selected_markets)].copy()
+    score_col = "importancia_positiva" if "importancia_positiva" in out.columns else "importancia"
+    if score_col in out.columns:
+        out[score_col] = pd.to_numeric(out[score_col], errors="coerce")
+        sort_cols = ["mercado_cluster", score_col] if "mercado_cluster" in out.columns else [score_col]
+        out = out.sort_values(sort_cols, ascending=[True, False] if len(sort_cols) == 2 else False)
+    if "mercado_cluster" in out.columns:
+        out = out.groupby("mercado_cluster", group_keys=False).head(top_n_per_market)
+    cols = [
+        "mercado_cluster",
+        "etapa_modelo",
+        "bloque",
+        "variable",
+        "descripcion",
+        score_col,
+    ]
+    out = out[[col for col in cols if col in out.columns]].copy()
+    rename = {
+        "mercado_cluster": "Mercado",
+        "etapa_modelo": "Etapa",
+        "bloque": "Bloque",
+        "variable": "Variable",
+        "descripcion": "Lectura",
+        score_col: "Importancia",
+    }
+    out = out.rename(columns=rename)
+    if "Importancia" in out.columns:
+        out["Importancia"] = out["Importancia"].map(lambda value: f"{value:.3f}" if pd.notna(value) else "")
+    return out
+
+
+def forecast_reading_guide():
     return html.Div(
         [
-            html.Div("Guia para leer el forecast de solidos", className="panel-title"),
+            html.Div("Forecast solidos", className="panel-title"),
             html.Div(
                 [
-                    html.P("1. Alcance comercial: mercado, pais, cliente, producto y color cambian la proyeccion, la validacion y las tablas de demanda."),
-                    html.P("2. Proyeccion futura: elige 2, 5 u 8 semanas segun el plazo en el que vas a tomar decisiones."),
-                    html.P("3. Historia comparativa: selecciona anos y semanas solo para contrastar el comportamiento real contra la linea futura."),
-                    html.P("4. Validacion historica: escoge una ventana ocurrida y revisa WAPE y bias; el backtest final del modelo permanece identificado aparte."),
-                    html.P("5. Escenario comercial: modifica probabilidad o volumen para estudiar una hipotesis de negocio; no reentrena el modelo."),
-                    html.P("El universo es pedido SOLIDO confirmado y la unidad pronosticada es cliente + producto + color + semana. Grado, caja y tallos por ramo no se predicen en esta etapa."),
+                    html.P("La vista usa las tablas de forecast SOLIDO: historia semanal, prediccion futura, backtest y validacion retrospectiva."),
+                    html.P("Los filtros reducen ese mismo universo de forecast por mercado, pais, cliente, producto y color."),
                 ],
                 className="reading-text",
             ),
         ],
         className="reading-panel",
     )
-
-
-def _forecast_wape(frame: pd.DataFrame, grouping: list[str]) -> float:
-    if frame.empty:
-        return np.nan
-    grouped = frame.groupby(grouping, as_index=False).agg(real=("tallos", "sum"), pred=("prediccion", "sum"))
-    total = float(grouped["real"].sum())
-    return float((grouped["real"] - grouped["pred"]).abs().sum() / total) if total > 0 else np.nan
-
-
-def forecast_business_interpretation(block: str, stage: str) -> str:
-    """Traduce bloques predictivos a una accion comprensible para negocio."""
-    action = {
-        "Historia reciente": "Refleja continuidad o cambios recientes en la compra.",
-        "Ocurrencia": "Indica recurrencia y probabilidad de que vuelva a comprar.",
-        "Estacionalidad": "Captura semanas del ano con patrones repetitivos.",
-        "Estacionalidad anual": "Contrasta con la misma temporada del ano anterior.",
-        "Estacionalidad de mercado": "Refleja comportamiento estacional del producto-color en el mercado.",
-        "Producto-color": "Diferencia la demanda esperada por portafolio y color.",
-        "Cliente": "Reconoce patrones propios de la cuenta.",
-        "Perfil cliente": "Incorpora cumplimiento y comportamiento comercial historico.",
-        "Perfil historico": "Representa el volumen habitual de esa combinacion.",
-        "Perfil reciente": "Da contexto al nivel de compra mas reciente.",
-        "Cobertura historica": "Mide cuanta evidencia existe para esa combinacion.",
-        "Destino comercial": "Distingue dinamicas del mercado o pais destino.",
-        "Calendario": "Ubica la prediccion dentro del periodo anual.",
-    }.get(str(block), "Aporta senal para diferenciar el comportamiento esperado.")
-    use = "ocurre la compra" if str(stage) == "probabilidad_compra" else "volumen esperado"
-    return f"{action} Incide en si {use}."
-
-
-def build_forecast_notes_table(importance: pd.DataFrame) -> pd.DataFrame:
-    """Resume predictores globales mas relevantes sin saturar la vista."""
-    if importance.empty:
-        return pd.DataFrame()
-    work = importance.copy()
-    work["Importancia"] = pd.to_numeric(work["importancia_positiva"], errors="coerce").fillna(0)
-    work = work[work["Importancia"] > 0].copy()
-    work = work.sort_values(["etapa_modelo", "Importancia"], ascending=[True, False]).groupby(
-        "etapa_modelo", group_keys=False
-    ).head(4)
-    work["Etapa"] = work["etapa_modelo"].replace(
-        {"probabilidad_compra": "Probabilidad de compra", "volumen_si_compra": "Volumen si compra"}
-    )
-    work["Variable"] = work["variable"]
-    work["Que toma el modelo"] = work["descripcion"]
-    work["Lectura de negocio"] = [
-        forecast_business_interpretation(block, stage)
-        for block, stage in zip(work["bloque"], work["etapa_modelo"])
-    ]
-    return work[["Etapa", "Variable", "Importancia", "Que toma el modelo", "Lectura de negocio"]]
-
-
-def build_forecast_market_importance_table(
-    market_importance: pd.DataFrame,
-    markets,
-) -> pd.DataFrame:
-    """Presenta los predictores mas influyentes del boosting por mercado."""
-    if market_importance.empty:
-        return pd.DataFrame()
-    work = market_importance.copy()
-    selected_markets = selected_values(markets)
-    if selected_markets:
-        work = work[work["mercado_cluster"].astype(str).isin(selected_markets)].copy()
-    work["Importancia"] = pd.to_numeric(work["importancia_positiva"], errors="coerce").fillna(0)
-    work = work[work["Importancia"] > 0].copy()
-    work = work.sort_values(
-        ["mercado_cluster", "etapa_modelo", "Importancia"], ascending=[True, True, False]
-    ).groupby(["mercado_cluster", "etapa_modelo"], group_keys=False).head(2)
-    work["Mercado"] = work["mercado_cluster"].astype(str).str.replace("_", " ", regex=False)
-    work["Etapa"] = work["etapa_modelo"].replace(
-        {"probabilidad_compra": "Probabilidad de compra", "volumen_si_compra": "Volumen si compra"}
-    )
-    work["Variable"] = work["variable"]
-    work["Interpretacion de negocio"] = [
-        forecast_business_interpretation(block, stage)
-        for block, stage in zip(work["bloque"], work["etapa_modelo"])
-    ]
-    return work[["Mercado", "Etapa", "Variable", "Importancia", "Interpretacion de negocio"]]
 
 
 def render_forecast_solidos_tab(
@@ -7752,13 +6999,15 @@ def render_forecast_solidos_tab(
     """Renderiza forecast, backtest, explicabilidad y escenarios comerciales.
 
     Todos los filtros de esta vista operan sobre el universo SOLIDO historico
-    separado de descriptivos y clusters.
+    separado de descriptivos.
     """
-    history = data.get("solid_forecast_weekly", pd.DataFrame())
-    future = data.get("solid_forecast_future", pd.DataFrame())
-    test = data.get("solid_forecast_test", pd.DataFrame())
-    historical_validation = data.get("solid_forecast_historical_validation", pd.DataFrame())
-    evaluation = data.get("solid_forecast_eval", pd.DataFrame()).copy()
+    history = _normalize_solid_forecast_frame(data.get("solid_forecast_weekly", pd.DataFrame()))
+    future = _normalize_solid_forecast_frame(data.get("solid_forecast_future", pd.DataFrame()))
+    test = _normalize_solid_forecast_frame(data.get("solid_forecast_test", pd.DataFrame()))
+    historical_validation = _normalize_solid_forecast_frame(
+        data.get("solid_forecast_historical_validation", pd.DataFrame())
+    )
+    evaluation = _normalize_solid_forecast_frame(data.get("solid_forecast_eval", pd.DataFrame()))
     source = data.get("solid_forecast_source", pd.DataFrame())
     importance = data.get("solid_forecast_importance", pd.DataFrame()).copy()
     market_importance = data.get("solid_forecast_market_importance", pd.DataFrame()).copy()
@@ -8257,7 +7506,7 @@ def render_forecast_solidos_tab(
             html.Div(
                 [
                     html.Div([dcc.Graph(figure=color_fig), panel_note("Descompone el forecast por color. Sirve para preparar oferta y abastecimiento de los colores que explican mayor volumen futuro.")], className="panel"),
-                    html.Div([dcc.Graph(figure=client_fig), panel_note("Prioriza cuentas con mayor volumen previsto en el filtro actual. Confirma primero los clientes con mayor exposición comercial.")], className="panel"),
+                    html.Div([dcc.Graph(figure=client_fig), panel_note("Prioriza cuentas con mayor volumen previsto en el filtro actual. Confirma primero los clientes con mayor exposiciÃ³n comercial.")], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -8325,9 +7574,6 @@ def render_datos_tab(data: dict[str, pd.DataFrame], filtered: pd.DataFrame, sele
     profile_table = filtered[[col for col in profile_cols if col in filtered.columns]].head(500)
 
     estado = data["estado"]
-    clusters = data["clusters"]
-    if selected_code and not clusters.empty:
-        clusters = clusters[clusters["cod_cliente"] == selected_code]
 
     return html.Div(
         [
@@ -8338,12 +7584,11 @@ def render_datos_tab(data: dict[str, pd.DataFrame], filtered: pd.DataFrame, sele
                 ],
                 className="grid-2",
             ),
-            html.Div([html.Div("Cluster del cliente seleccionado", className="panel-title"), make_table(clusters.head(100), 10)], className="table-panel"),
         ]
     )
 
 
 if __name__ == "__main__":
     args = parse_args()
-    app = build_app(Path(args.data_dir), Path(args.forecast_dir), Path(args.clusters_dir))
+    app = build_app(Path(args.data_dir), Path(args.forecast_dir))
     app.run(host=args.host, port=args.port, debug=args.debug)

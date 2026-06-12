@@ -5,25 +5,23 @@
 El proyecto se ejecuta en modulos independientes:
 
 ```text
-bases de datos historicas/historic_sales_acum.csv
+SQL Server 192.168.1.22 / op_sales.fact_sales_line
         |
         +-- run_descriptivos.py ------> resultados/descriptivos/
-        |                                  |
-        |                                  +-- run_clusters.py ------> resultados/clusters/
         |
         +-- run_forecast_solidos.py ---> resultados/forecast_solidos/
 
-app_dash.py consume resultados/descriptivos, resultados/clusters y resultados/forecast_solidos.
+app_dash.py consume resultados/descriptivos, vistas `op_sales` y resultados/forecast_solidos.
 ```
 
-La carpeta obligatoria de entrada es:
+La carpeta local de respaldo/carga inicial es:
 
 ```text
 bases de datos historicas/
   historic_sales_acum.csv
 ```
 
-Esta carpeta ya existe en el proyecto. Las bases anuales pueden conservarse como respaldo, pero el flujo usa el archivo acumulado para evitar duplicar ventas.
+Esta carpeta ya existe en el proyecto. Las bases anuales pueden conservarse como respaldo, pero el flujo oficial carga el acumulado en SQL Server y luego lee `op_sales.fact_sales_line`.
 
 El acumulado oficial debe conservar los campos originales que distinguen
 recetas y surtidos (`TIPORDENEMPAQUE`, `EMPAQUE`, `RECETA`, `BULKBOUQUET`,
@@ -47,10 +45,32 @@ Si `python` no resuelve el entorno del proyecto, reemplazalo por:
 
 ## 1. Preparacion De Bases Historicas
 
-No existe actualmente un script ETL independiente de preparacion. La limpieza se ejecuta dentro de los modulos existentes:
+La preparacion oficial empieza cargando el acumulado local en SQL Server:
 
-- `run_descriptivos.py` limpia la base historica completa, clasifica tipos desde los campos fuente y genera perfiles/SKUs.
-- `run_forecast_solidos.py` limpia y cachea exclusivamente los pedidos `SOLIDO` historicos necesarios para forecast; si la fuente incluye estado filtra `Confirmado`, y si el acumulado de ventas no trae estado interpreta sus lineas como historia observada. Excluye estructuras mixtas como `SURTIDO`, `SURTIDO_M`, `RAINBOW`, `BOUQUET`, `BQT` y `COMBO`.
+```bash
+python cargar_op_sales_sql.py --init-schema
+
+python cargar_op_sales_sql.py \
+  --input "bases de datos historicas/historic_sales_acum.csv" \
+  --start-date 2021-01-01 \
+  --end-date 2026-05-17 \
+  --split-by month
+```
+
+Para validar antes sin escribir en SQL:
+
+```bash
+python cargar_op_sales_sql.py \
+  --input "bases de datos historicas/historic_sales_acum.csv" \
+  --start-date 2021-01-01 \
+  --end-date 2026-05-17 \
+  --dry-run
+```
+
+Luego:
+
+- `run_descriptivos.py` lee `op_sales.fact_sales_line`, clasifica tipos desde los campos fuente y genera perfiles/SKUs.
+- `run_forecast_solidos.py` lee `op_sales.fact_sales_line` y conserva exclusivamente pedidos `SOLIDO` historicos necesarios para forecast.
 
 Validar que la entrada exista:
 
@@ -72,7 +92,6 @@ historica, omite filtros de ano:
 
 ```bash
 python run_descriptivos.py \
-  --historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/descriptivos"
 ```
 
@@ -80,7 +99,6 @@ Para restringir descriptivos a anos seleccionados:
 
 ```bash
 python run_descriptivos.py \
-  --historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/descriptivos" \
   --years 2023 2024
 ```
@@ -89,7 +107,6 @@ Para una sola ventana anual tambien se admite:
 
 ```bash
 python run_descriptivos.py \
-  --historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/descriptivos" \
   --year 2024
 ```
@@ -105,83 +122,29 @@ Salidas principales consumidas por el Dash:
 - `estructura_caja.csv`
 - `estructura_componentes.csv`
 
-`historico_confirmado.csv` conserva `pais`. Esta columna es obligatoria para
-que el modulo de clusters asigne cada cliente a Estados Unidos/Canada, The
-Netherlands, Polonia, Asia u Otros antes de agruparlo.
+`historico_confirmado.csv` conserva `pais` para lectura comercial y forecast.
 
 `historico_visualizador_comercial.csv` conserva tambien lineas monetarias sin
 tallos cuando un cliente registra el valor de venta separado de los componentes
 fisicos del pedido. Esta tabla alimenta tarjetas de ventas y precio del
-Visualizador general; no alimenta clusters, estructuras ni forecast.
+Visualizador general; no alimenta estructuras ni forecast.
 
 `estructura_caja.csv` y `estructura_componentes.csv` son tablas resumidas
 para la vista de orden regular: consolidan por cliente, semana y version de
 estructura, conservando tallos y el numero de repeticiones originales. No son
 un reemplazo del detalle transaccional en `historico_confirmado.csv`.
 
-## 3. Generacion De Clusters
+## 3. Modulo De Clusters Archivado
 
-Clusters siempre exige seleccionar un unico ano. Puede consumir
-`resultados/descriptivos/` aunque esa carpeta tenga toda la historia: antes de
-modelar filtra el ano solicitado y recalcula el perfil del cliente dentro del
-mismo ano.
+Clusters queda fuera del flujo master actual. Su codigo, notebook, informe,
+presentacion y resultados historicos se conservan en:
 
-```bash
-python run_clusters.py \
-  --input-dir "resultados/descriptivos" \
-  --year 2024
+```text
+pruebas antiguas/cluster_archivado_2026-06-09/
 ```
 
-La salida se guarda automaticamente en `resultados/clusters/2024/`. Cuando la
-base incorpore un nuevo ano, por ejemplo `--year 2025`, se creara
-`resultados/clusters/2025/` sin sobrescribir la corrida anterior.
-
-Para generar todos los anos historicos disponibles actualmente para el
-selector del dashboard:
-
-```bash
-for anio in 2021 2022 2023 2024; do
-  python run_clusters.py \
-    --input-dir "resultados/descriptivos" \
-    --year "$anio"
-done
-```
-
-Salidas consumidas por la pestaña `Clusters`:
-
-- `clusters_clientes.csv`
-- `cluster_model_evaluation.csv`
-- `cluster_resumen.csv`
-- `cluster_variables_diferenciadoras.csv`
-- `cluster_perfil_bloques.csv`
-- `cluster_periodo_analisis.csv`
-- `clientes_similares.csv`
-
-La salida de clusters incluye, ademas del perfil usado por el modelo,
-descriptores ejecutivos para el Dash: ventas USD, participacion de tallos en
-el mercado, variacion de las ultimas ocho semanas frente a las ocho previas y
-complejidad operativa. Estos campos describen el segmento; no cambian por si
-solos el peso de la geometria del cluster.
-
-### Criterio Recomendado Para Anos
-
-Los clusters describen tipos de cliente, no demanda futura. Para presentacion
-e interpretacion comercial se calculan siempre sobre un ano coherente y
-explicito, porque evita mezclar clientes o portafolios que cambiaron entre anos.
-
-Recomendacion operativa:
-
-- Descriptivos: cargar todos los anos que se quieren consultar en el dashboard.
-- Clusters: ejecutar `--year ANO` para el ano que se quiere caracterizar comercialmente.
-- Comparacion de estabilidad: ejecutar cada ano requerido; el script lo guarda bajo `resultados/clusters/<ano>/`.
-- El dashboard lee todas las carpetas anuales dentro de `--clusters-dir` y permite cambiar el ano con el filtro `Ano de cluster`.
-
-No se calcula un cluster multianual para presentarlo como anual: el ejecutor
-impide esa ambiguedad al requerir `--year`.
-
-Si se corrige una base anual de origen, se deben volver a ejecutar primero los
-descriptivos y luego los clusters de los anos que se quieran actualizar. No se
-excluye automaticamente ningun ano del flujo.
+No se ejecuta en el dashboard ni en el flujo recomendado mientras no vuelva a
+ser una prioridad del proyecto.
 
 ## 4. Forecast Solidos Historico
 
@@ -189,7 +152,6 @@ El forecast es el unico modulo activo que usa de forma oficial toda la historia 
 
 ```bash
 python run_forecast_solidos.py \
-  --raw-historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/forecast_solidos" \
   --test-weeks 8 \
   --horizon-weeks 8
@@ -227,7 +189,6 @@ Luego de ejecutar los tres modulos:
 ```bash
 python app_dash.py \
   --data-dir "resultados/descriptivos" \
-  --clusters-dir "resultados/clusters" \
   --forecast-dir "resultados/forecast_solidos" \
   --host 127.0.0.1 \
   --port 8050
@@ -241,23 +202,15 @@ http://127.0.0.1:8050/
 
 ### Flujo Completo Recomendado
 
-Este es el flujo para ver toda la historia en descriptivos, clusters del ano
-elegido y forecast historico completo:
+Este es el flujo para ver toda la historia en descriptivos y forecast historico
+completo:
 
 ```bash
 python run_descriptivos.py \
-  --historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/descriptivos" \
   --no-cache
 
-for anio in 2021 2022 2023 2024; do
-  python run_clusters.py \
-    --input-dir "resultados/descriptivos" \
-    --year "$anio"
-done
-
 python run_forecast_solidos.py \
-  --raw-historico "bases de datos historicas/historic_sales_acum.csv" \
   --output "resultados/forecast_solidos" \
   --test-weeks 8 \
   --horizon-weeks 8 \
@@ -265,7 +218,6 @@ python run_forecast_solidos.py \
 
 python app_dash.py \
   --data-dir "resultados/descriptivos" \
-  --clusters-dir "resultados/clusters" \
   --forecast-dir "resultados/forecast_solidos" \
   --host 127.0.0.1 \
   --port 8050
@@ -273,12 +225,11 @@ python app_dash.py \
 
 ### Abrir La Corrida Validada Ya Migrada
 
-La corrida validada de descriptivos y forecast historico ya se encuentra bajo la estructura canonica. Para usar el selector anual, genera al menos una corrida con `run_clusters.py --year ANO` dentro de `resultados/clusters/<ano>/`.
+La corrida validada de descriptivos y forecast historico ya se encuentra bajo la estructura canonica.
 
 ```bash
 python app_dash.py \
   --data-dir "resultados/descriptivos" \
-  --clusters-dir "resultados/clusters" \
   --forecast-dir "resultados/forecast_solidos" \
   --host 127.0.0.1 \
   --port 8067
@@ -291,7 +242,6 @@ Pestanas activas:
 - `Visualizador clientes general`: descriptivo principal.
 - `Ventas generales`: control rapido de tallos confirmados, ventas USD y precio promedio ponderado, filtrable por ano, semana, cliente y producto; consume `ventas_semana_cliente_producto.csv` y evita el detalle operativo pesado.
 - `Estructuras y componentes`: orden regular resumida del cliente seleccionado.
-- `Clusters`: caracterizacion por mercado.
 - `Forecast solidos historico`: estacionalidad, validacion, explicabilidad y escenarios.
 
 En `Forecast solidos historico`, los controles se separan por efecto:
@@ -311,7 +261,6 @@ Pestanas reservadas:
 |---|---|---|
 | `bases de datos historicas/` | Obligatoria | Archivos crudos; no editar mediante el Dash. |
 | `resultados/descriptivos/` | Generada activa | Visualizador y estructuras. |
-| `resultados/clusters/` | Generada activa | Pestaña Clusters. |
 | `resultados/forecast_solidos/` | Generada activa | Pestaña Forecast. |
 | `notebooks/` | Documentacion analitica | Metodologias para estudio/revision. |
 | `pruebas antiguas/` | Archivo legado | Corridas anteriores o pruebas 2026; fuera del flujo oficial. |

@@ -334,7 +334,7 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
     if "moneda_original" not in work.columns:
         work["moneda_original"] = "sin_info"
-    for col in ["pedido", "caja_operativa", "producto", "color", "tipo_pedido_operativo"]:
+    for col in ["pedido", "caja_operativa", "producto", "color", "tipo_caja", "tipo_pedido_operativo", "NomCompania", "pais"]:
         if col not in work.columns:
             work[col] = "sin_info"
 
@@ -361,6 +361,8 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "anio_semana",
             "cod_cliente",
             "cliente",
+            "NomCompania",
+            "pais",
             "tipo_pedido_operativo",
             "producto",
             "color",
@@ -369,11 +371,11 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     ).sort_values(["anio", "semana_iso", "cod_cliente", "tallos_confirmados"], ascending=[True, True, True, False])
 
     outputs["ventas_producto_periodo"] = summarize(
-        ["anio", "semana_iso", "anio_semana", "tipo_pedido_operativo", "producto", "color", "moneda_original"]
+        ["anio", "semana_iso", "anio_semana", "pais", "tipo_pedido_operativo", "producto", "color", "moneda_original"]
     ).sort_values(["anio", "semana_iso", "tallos_confirmados"], ascending=[True, True, False])
 
     outputs["ventas_cliente_periodo"] = summarize(
-        ["anio", "semana_iso", "anio_semana", "cod_cliente", "cliente", "moneda_original"]
+        ["anio", "semana_iso", "anio_semana", "cod_cliente", "cliente", "NomCompania", "pais", "moneda_original"]
     ).sort_values(["anio", "semana_iso", "tallos_confirmados"], ascending=[True, True, False])
 
     outputs["ventas_caja_periodo"] = summarize(
@@ -383,6 +385,8 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "anio_semana",
             "cod_cliente",
             "cliente",
+            "NomCompania",
+            "pais",
             "tipo_pedido_operativo",
             "producto",
             "color",
@@ -415,11 +419,9 @@ def build_repeated_structures(df: pd.DataFrame) -> pd.DataFrame:
         tipo = str(row.get("tipo_pedido_operativo", "")).upper()
         if tipo == "SOLIDO":
             return str(row.get("sku_terminado", "sin_info"))
-        if tipo in {"SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT"}:
-            return str(row.get("receta_programa_key", row.get("receta_estructura_key", row.get("llave_analisis_operativo", "sin_info"))))
-        if tipo == "BULK":
-            return str(row.get("producto_color", row.get("llave_analisis_operativo", "sin_info")))
-        return str(row.get("llave_analisis_operativo", row.get("estructura_pedido", "sin_info")))
+        if tipo in {"RAINBOW", "COMBO", "BOUQUET", "BQT"}:
+            return str(row.get("receta_programa_tamano_key", row.get("receta_programa_key", row.get("sku_composicion", "sin_info"))))
+        return str(row.get("sku_composicion", row.get("receta_estructura_key", row.get("llave_analisis_operativo", "sin_info"))))
 
     work["estructura_accionable"] = work.apply(pick_structure_key, axis=1)
     recent_12["estructura_accionable"] = recent_12.apply(pick_structure_key, axis=1) if not recent_12.empty else pd.Series(dtype="object")
@@ -484,16 +486,16 @@ def build_repeated_structures(df: pd.DataFrame) -> pd.DataFrame:
         [
             tipo.eq("SOLIDO") & base["frecuencia_ultimas_12_semanas"].ge(3) & base["cumplimiento"].lt(0.98),
             tipo.eq("SOLIDO") & base["frecuencia_ultimas_12_semanas"].ge(2),
-            tipo.isin(["SURTIDO", "SURTIDO_M"]) & base["frecuencia_ultimas_12_semanas"].ge(2),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]) & base["frecuencia_ultimas_12_semanas"].ge(2),
-            tipo.eq("BULK") & base["frecuencia_ultimas_12_semanas"].ge(2),
+            tipo.ne("SOLIDO") & base["frecuencia_ultimas_12_semanas"].ge(2),
             base["frecuencia_ultimas_12_semanas"].eq(0),
         ],
-        ["COMPRAR_TERMINADO", "PILOTO", "COMPRAR_COLOR_BASE", "REVISAR_MANUAL", "COMPRAR_COLOR_BASE", "NO_ANTICIPAR"],
+        ["COMPRAR_TERMINADO", "PILOTO", "REVISAR_ESTRUCTURA_PEDIDO", "NO_ANTICIPAR"],
         default="REVISAR_MANUAL",
     )
 
     base = base.rename(columns={"tallos_x_ramo": "tallos_por_ramo"})
+    if "tallos_por_ramo" in base.columns:
+        base["tallos_por_ramo"] = base["tallos_por_ramo"].map(_format_integerish_value)
     preferred = [
         "cod_cliente",
         "cliente",
@@ -580,6 +582,8 @@ def build_typical_week(df: pd.DataFrame) -> pd.DataFrame:
         default="SEMANA_VARIABLE",
     )
     out = out.rename(columns={"semana_iso": "semana", "tallos_x_ramo": "tallos_por_ramo"})
+    if "tallos_por_ramo" in out.columns:
+        out["tallos_por_ramo"] = out["tallos_por_ramo"].map(_format_integerish_value)
     preferred = [
         "cod_cliente",
         "cliente",
@@ -604,21 +608,59 @@ def build_typical_week(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def _format_integerish_value(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "sin_info"}:
+        return ""
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        numeric = float(numeric)
+        if abs(numeric - round(numeric)) < 1e-9:
+            return str(int(round(numeric)))
+        return f"{numeric:g}"
+    return text
+
+
+def _top_join_integerish(series: pd.Series, n: int = 8) -> str:
+    values = pd.Series(series).map(_format_integerish_value)
+    values = values[~values.isin([""])]
+    return ", ".join(values.value_counts().head(n).index)
+
+
+def _solid_sku_series(df: pd.DataFrame) -> pd.Series:
+    fallback = df.get("producto_color", df.get("sku_terminado", pd.Series("sin_info", index=df.index))).astype(str)
+    tallos = (
+        df["tallos_x_ramo"].map(_format_integerish_value)
+        if "tallos_x_ramo" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    with_tallos = fallback + "|" + tallos + "_tallos_ramo"
+    return with_tallos.where(tallos.ne(""), fallback)
+
+
 def _analysis_key_series(df: pd.DataFrame) -> pd.Series:
-    if "sku_operativo" in df.columns:
-        return df["sku_operativo"].astype(str)
     tipo = df["tipo_pedido_operativo"].astype(str).str.upper()
+    solid = _solid_sku_series(df)
+    if "sku_operativo" in df.columns:
+        existing = df["sku_operativo"].astype(str)
+        return existing.where(~tipo.eq("SOLIDO"), solid)
+    recipe_structure = df.get(
+        "receta_programa_tamano_key",
+        df.get("receta_programa_key", df.get("sku_composicion", df.get("receta_estructura_key", pd.Series("sin_info", index=df.index)))),
+    ).astype(str)
+    order_structure = df.get("sku_composicion", recipe_structure).astype(str)
+    non_solid = recipe_structure.where(tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]), order_structure)
     return pd.Series(
         np.select(
             [
                 tipo.eq("SOLIDO"),
-                tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT"]),
-                tipo.eq("BULK"),
+                tipo.ne("SOLIDO"),
             ],
             [
-                df.get("producto_color", df.get("sku_terminado", pd.Series("sin_info", index=df.index))).astype(str),
-                df.get("receta_programa_tamano_key", df.get("receta_programa_key", df.get("sku_composicion", df.get("receta_estructura_key", pd.Series("sin_info", index=df.index))))).astype(str),
-                df.get("producto_color", pd.Series("sin_info", index=df.index)).astype(str),
+                solid,
+                non_solid,
             ],
             default=df.get("llave_analisis_operativo", pd.Series("sin_info", index=df.index)).astype(str),
         ),
@@ -626,7 +668,11 @@ def _analysis_key_series(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def build_operational_sku_summary(df: pd.DataFrame, recent_weeks: int = 12) -> pd.DataFrame:
+def build_operational_sku_summary(
+    df: pd.DataFrame,
+    recent_weeks: int = 12,
+    structure_tables: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
     """Summarize the repeatable operational SKU used by Cliente 360 and forecast.
 
     SOLIDO is grouped by producto+color, with variedad kept as detail only.
@@ -653,7 +699,7 @@ def build_operational_sku_summary(df: pd.DataFrame, recent_weeks: int = 12) -> p
         pedidos_en_ventana=("pedido", "nunique") if "pedido" in recent.columns else ("sku_operativo", "size"),
         instancias_en_ventana=("instancia_pedido_operativo", "nunique") if "instancia_pedido_operativo" in recent.columns else ("sku_operativo", "size"),
         producto=("producto", lambda s: _top_join(s, 4)) if "producto" in recent.columns else ("sku_operativo", "size"),
-        tallos_x_ramo=("tallos_x_ramo", lambda s: _top_join(s, 8)) if "tallos_x_ramo" in recent.columns else ("sku_operativo", "size"),
+        tallos_x_ramo=("tallos_x_ramo", lambda s: _top_join_integerish(s, 8)) if "tallos_x_ramo" in recent.columns else ("sku_operativo", "size"),
         subtipo_pedido_operativo=("subtipo_pedido_operativo", lambda s: _top_join(s, 3)) if "subtipo_pedido_operativo" in recent.columns else ("sku_operativo", "size"),
         tipo_caja=("tipo_caja", lambda s: _top_join(s, 3)) if "tipo_caja" in recent.columns else ("sku_operativo", "size"),
         capuchon=("capuchon", lambda s: _top_join(s, 3)) if "capuchon" in recent.columns else ("sku_operativo", "size"),
@@ -681,11 +727,9 @@ def build_operational_sku_summary(df: pd.DataFrame, recent_weeks: int = 12) -> p
     base["lectura_operativa"] = np.select(
         [
             tipo.eq("SOLIDO"),
-            tipo.isin(["SURTIDO", "SURTIDO_M"]),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]),
-            tipo.eq("BULK"),
+            tipo.ne("SOLIDO"),
         ],
-        ["SKU_TERMINADO_EXACTO", "SKU_MEZCLA_COLOR", "SKU_RECETA_COMPOSICION", "SKU_PRODUCTO_COLOR_BULK"],
+        ["SKU_TERMINADO_EXACTO", "ESTRUCTURA_PEDIDO"],
         default="REVISION_MANUAL",
     )
     base["vigencia_sku"] = np.select(
@@ -701,18 +745,35 @@ def build_operational_sku_summary(df: pd.DataFrame, recent_weeks: int = 12) -> p
         [
             tipo.eq("SOLIDO") & base["frecuencia_en_ventana"].ge(3) & base["cumplimiento"].ge(0.9),
             tipo.eq("SOLIDO") & base["frecuencia_en_ventana"].ge(2),
-            tipo.isin(["SURTIDO", "SURTIDO_M"]) & base["frecuencia_en_ventana"].ge(2),
-            tipo.isin(["RAINBOW", "COMBO", "BOUQUET", "BQT"]) & base["frecuencia_en_ventana"].ge(2),
-            tipo.eq("BULK") & base["frecuencia_en_ventana"].ge(2),
+            tipo.ne("SOLIDO") & base["frecuencia_en_ventana"].ge(2),
         ],
-        ["COMPRAR_TERMINADO", "PILOTO", "COMPRAR_COLOR_BASE", "REVISAR_COMPOSICION", "COMPRAR_COLOR_BASE"],
+        ["COMPRAR_TERMINADO", "PILOTO", "REVISAR_ESTRUCTURA_PEDIDO"],
         default="NO_ANTICIPAR",
     )
     base = base.rename(columns={"tallos_x_ramo": "tallos_por_ramo"})
+    if "tallos_por_ramo" in base.columns:
+        base["tallos_por_ramo"] = base["tallos_por_ramo"].map(_format_integerish_value)
+    reconstructed = _structure_sku_metadata(structure_tables)
+    if not reconstructed.empty:
+        join_keys = [col for col in CLIENT_KEYS + ["sku_operativo", "tipo_pedido_operativo"] if col in base.columns and col in reconstructed.columns]
+        base = base.merge(reconstructed, on=join_keys, how="left")
+        for target, source in [
+            ("producto", "producto_reconstruido"),
+            ("tipo_caja", "tipo_caja_reconstruida"),
+            ("tallos_por_ramo", "tallos_por_ramo_reconstruido"),
+            ("capuchon", "capuchon_reconstruido"),
+            ("comida", "comida_reconstruida"),
+            ("empaque", "empaque_reconstruido"),
+            ("receta", "receta_reconstruida"),
+            ("caja_operativa", "caja_operativa_reconstruida"),
+        ]:
+            base = _fill_blank_from_reconstructed(base, target, source)
     preferred = [
         "cod_cliente", "cliente", "sku_operativo", "lectura_operativa", "tipo_pedido_operativo", "subtipo_pedido_operativo",
         "producto", "empaque", "tipo_caja", "tallos_por_ramo", "tallos_programa_caja", "tallos_componentes_caja",
         "ramos_programa_caja_inferidos", "tallos_programa_ramo", "ramos_x_caja", "fulles", "piezas", "capuchon", "comida", "receta", "caja_operativa", "codempaque", "bulkbouquet",
+        "productos_composicion", "colores_composicion", "variedades_composicion", "lineas_componentes", "composicion_versiones",
+        "composicion_firma_principal", "tallos_promedio_estructura", "ramos_estimados_comercial",
         "tallos_promedio_semana_normal", "porcentaje_semana_normal", "frecuencia_en_ventana", "pedidos_en_ventana", "instancias_en_ventana",
         "cumplimiento", "vigencia_sku", "recomendacion", "tallos_ventana", "ventas_usd_ventana",
     ]
@@ -720,7 +781,11 @@ def build_operational_sku_summary(df: pd.DataFrame, recent_weeks: int = 12) -> p
     return base[cols].sort_values(["cod_cliente", "tallos_promedio_semana_normal", "frecuencia_en_ventana"], ascending=[True, False, False]).reset_index(drop=True)
 
 
-def build_operational_sku_composition(df: pd.DataFrame, recent_weeks: int = 12) -> pd.DataFrame:
+def build_operational_sku_composition(
+    df: pd.DataFrame,
+    recent_weeks: int = 12,
+    structure_tables: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
     """Describe the internal composition of each operational SKU."""
     if df.empty:
         return pd.DataFrame()
@@ -760,16 +825,32 @@ def build_operational_sku_composition(df: pd.DataFrame, recent_weeks: int = 12) 
         default="VARIABLE",
     )
     out = out.rename(columns={"tallos_x_ramo": "tallos_por_ramo"})
+    if "tallos_por_ramo" in out.columns:
+        out["tallos_por_ramo"] = out["tallos_por_ramo"].map(_format_integerish_value)
+    reconstructed = _structure_sku_metadata(structure_tables)
+    if not reconstructed.empty:
+        join_keys = [col for col in CLIENT_KEYS + ["sku_operativo", "tipo_pedido_operativo"] if col in out.columns and col in reconstructed.columns]
+        keep_cols = join_keys + [
+            col for col in [
+                "productos_composicion", "colores_composicion", "variedades_composicion",
+                "lineas_componentes", "composicion_versiones", "composicion_firma_principal",
+                "tallos_por_ramo_reconstruido",
+            ] if col in reconstructed.columns
+        ]
+        out = out.merge(reconstructed[keep_cols].drop_duplicates(join_keys), on=join_keys, how="left")
+        out = _fill_blank_from_reconstructed(out, "tallos_por_ramo", "tallos_por_ramo_reconstruido")
     preferred = [
         "cod_cliente", "cliente", "sku_operativo", "tipo_pedido_operativo", "producto", "color", "variedad",
         "porcentaje_composicion", "tallos_promedio_semana_normal", "ramos_promedio_semana_normal",
         "tipo_caja", "tallos_por_ramo", "capuchon", "comida", "empaque", "semanas", "estabilidad_composicion", "std_share_color",
+        "productos_composicion", "colores_composicion", "variedades_composicion", "lineas_componentes", "composicion_versiones",
+        "composicion_firma_principal",
     ]
     cols = [col for col in preferred if col in out.columns]
     return out[cols].sort_values(["cod_cliente", "sku_operativo", "tallos_promedio_semana_normal"], ascending=[True, True, False]).reset_index(drop=True)
 
 
-MIXED_STRUCTURE_TYPES = ["SURTIDO", "SURTIDO_M", "RAINBOW", "BQT", "COMBO", "BOUQUET"]
+MIXED_STRUCTURE_TYPES = ["SURTIDO", "SURTIDO_M", "RAINBOW", "BQT", "COMBO", "BOUQUET", "BULK"]
 
 
 def _top_join(series: pd.Series, n: int = 8) -> str:
@@ -783,6 +864,67 @@ def _unique_join(series: pd.Series, n: int = 8) -> str:
     values = pd.Series(series).dropna().astype(str)
     values = values[~values.isin(["sin_info", "nan", "none", ""])]
     return ", ".join(values.drop_duplicates().head(n).tolist())
+
+
+def _is_blank_text_series(series: pd.Series) -> pd.Series:
+    text = series.fillna("").astype(str).str.strip().str.lower()
+    return text.isin(["", "nan", "none", "sin_info", "sin caja", "sin tallos", "sin_ramo", "sin_caja"])
+
+
+def _fill_blank_from_reconstructed(frame: pd.DataFrame, target: str, source: str) -> pd.DataFrame:
+    if target not in frame.columns or source not in frame.columns:
+        return frame
+    mask = _is_blank_text_series(frame[target]) & ~_is_blank_text_series(frame[source])
+    if mask.any():
+        frame[target] = frame[target].astype("object")
+        frame.loc[mask, target] = frame.loc[mask, source].astype(str)
+    return frame
+
+
+def _structure_sku_metadata(structure_tables: dict[str, pd.DataFrame] | None) -> pd.DataFrame:
+    if not structure_tables:
+        return pd.DataFrame()
+    boxes = structure_tables.get("estructura_caja", pd.DataFrame()).copy()
+    comps = structure_tables.get("estructura_componentes", pd.DataFrame()).copy()
+    frames: list[pd.DataFrame] = []
+
+    if not boxes.empty and {"cod_cliente", "sku_operativo"}.issubset(boxes.columns):
+        box_keys = [col for col in CLIENT_KEYS + ["sku_operativo", "tipo_pedido_operativo"] if col in boxes.columns]
+        box_meta = boxes.groupby(box_keys, dropna=False, as_index=False).agg(
+            productos_composicion=("productos", lambda s: _top_join(s, 6)) if "productos" in boxes.columns else ("sku_operativo", "size"),
+            colores_composicion=("colores", lambda s: _top_join(s, 10)) if "colores" in boxes.columns else ("sku_operativo", "size"),
+            variedades_composicion=("variedades", lambda s: _top_join(s, 10)) if "variedades" in boxes.columns else ("sku_operativo", "size"),
+            tipo_caja_reconstruida=("tipo_caja", lambda s: _top_join(s, 4)) if "tipo_caja" in boxes.columns else ("sku_operativo", "size"),
+            capuchon_reconstruido=("capuchon", lambda s: _top_join(s, 4)) if "capuchon" in boxes.columns else ("sku_operativo", "size"),
+            comida_reconstruida=("comida", lambda s: _top_join(s, 4)) if "comida" in boxes.columns else ("sku_operativo", "size"),
+            empaque_reconstruido=("empaque", lambda s: _top_join(s, 4)) if "empaque" in boxes.columns else ("sku_operativo", "size"),
+            receta_reconstruida=("receta", lambda s: _top_join(s, 4)) if "receta" in boxes.columns else ("sku_operativo", "size"),
+            caja_operativa_reconstruida=("caja_operativa", lambda s: _top_join(s, 6)) if "caja_operativa" in boxes.columns else ("sku_operativo", "size"),
+            composicion_firma_principal=("composicion_firma", lambda s: _top_join(s, 2)) if "composicion_firma" in boxes.columns else ("sku_operativo", "size"),
+            composicion_versiones=("composicion_version_id", "nunique") if "composicion_version_id" in boxes.columns else ("sku_operativo", "size"),
+            lineas_componentes=("lineas_componentes", "max") if "lineas_componentes" in boxes.columns else ("sku_operativo", "size"),
+            tallos_promedio_estructura=("tallos_estructura", "mean") if "tallos_estructura" in boxes.columns else ("sku_operativo", "size"),
+            ramos_estimados_comercial=("ramos_estimados", "mean") if "ramos_estimados" in boxes.columns else ("sku_operativo", "size"),
+        )
+        frames.append(box_meta)
+
+    if not comps.empty and {"cod_cliente", "sku_operativo"}.issubset(comps.columns):
+        comp_keys = [col for col in CLIENT_KEYS + ["sku_operativo", "tipo_pedido_operativo"] if col in comps.columns]
+        comp_meta = comps.groupby(comp_keys, dropna=False, as_index=False).agg(
+            producto_reconstruido=("producto", lambda s: _top_join(s, 6)) if "producto" in comps.columns else ("sku_operativo", "size"),
+            variedad_reconstruida=("variedad", lambda s: _top_join(s, 10)) if "variedad" in comps.columns else ("sku_operativo", "size"),
+            color_reconstruido=("color", lambda s: _top_join(s, 10)) if "color" in comps.columns else ("sku_operativo", "size"),
+            tallos_por_ramo_reconstruido=("tallos_x_ramo", lambda s: _top_join_integerish(s, 6)) if "tallos_x_ramo" in comps.columns else ("sku_operativo", "size"),
+        )
+        frames.append(comp_meta)
+
+    if not frames:
+        return pd.DataFrame()
+    meta = frames[0]
+    for extra in frames[1:]:
+        join_keys = [col for col in meta.columns if col in extra.columns and col in CLIENT_KEYS + ["sku_operativo", "tipo_pedido_operativo"]]
+        meta = meta.merge(extra, on=join_keys, how="outer")
+    return meta.reset_index(drop=True)
 
 
 def _grouped_unique_labels(frame: pd.DataFrame, keys: list[str], col: str, output_col: str, n: int) -> pd.DataFrame:
@@ -868,7 +1010,7 @@ def build_operational_structure_tables(df: pd.DataFrame) -> dict[str, pd.DataFra
     work = df.copy()
     work["sku_operativo"] = _analysis_key_series(work)
     work["tipo_pedido_operativo"] = work["tipo_pedido_operativo"].astype(str).str.upper()
-    work["es_estructura_mixta"] = work["tipo_pedido_operativo"].isin(MIXED_STRUCTURE_TYPES)
+    work["es_estructura_mixta"] = work["tipo_pedido_operativo"].ne("SOLIDO")
     for col in ["caja_operativa", "pedido", "sku_composicion", "sku_terminado", "producto_color"]:
         if col not in work.columns:
             work[col] = "sin_info"

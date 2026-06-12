@@ -45,7 +45,6 @@ La herramienta debe responder:
 - Qué clientes son buenos candidatos para compra terminada.
 - Qué clientes solo sirven para compra casi terminada o compra por color/base.
 - Qué clientes no deben usarse para compra anticipada porque son demasiado variables.
-- Qué clientes tienen patrones similares entre sí.
 - Qué clientes presentan bajo cumplimiento histórico o reciente.
 - Cómo cruzar demanda futura probable contra disponibilidad/inventario proyectado.
 - Cómo priorizar compras para reducir reproceso y mejorar cumplimiento.
@@ -1063,7 +1062,6 @@ Debe considerar:
 - Cumplimiento histórico y reciente.
 - Tipo de pedido dominante.
 - Complejidad operativa.
-- Similitud con clientes compatibles.
 - Score de actualidad del cliente.
 
 Componentes sugeridos:
@@ -1290,8 +1288,6 @@ mix_color.csv
 mix_tipo_pedido.csv
 mix_sku_terminado.csv
 mix_sku_flexible.csv
-clientes_similares.csv
-clusters_clientes.csv
 forecast_historico_confirmado.csv
 forecast_pendientes_reales.csv
 demanda_operativa_futura.csv
@@ -1424,15 +1420,6 @@ Mostrar:
 - Faltantes por tipo de pedido.
 - Faltantes recientes.
 
-### 18.9 Similares
-
-Mostrar:
-
-- Clientes parecidos.
-- Similitud por producto/color.
-- Similitud por tipo de pedido.
-- Similitud por empaque.
-- Similitud reciente.
 - Posibilidad de compartir compra anticipada.
 
 ---

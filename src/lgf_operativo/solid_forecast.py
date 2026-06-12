@@ -9,11 +9,49 @@ from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostin
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from .clustering import classify_market
 from .io_utils import write_outputs
 
 
 CLIENT_KEYS = ["cod_cliente", "cliente"]
+MARKET_US_CANADA = "01_ESTADOS_UNIDOS_CANADA"
+MARKET_NETHERLANDS = "02_THE_NETHERLANDS"
+MARKET_POLAND = "03_POLONIA"
+MARKET_ASIA = "04_ASIA"
+MARKET_OTHER = "05_OTROS"
+
+ASIA_COUNTRIES = {
+    "china",
+    "hong kong",
+    "japan",
+    "singapore",
+    "south korea",
+    "korea",
+    "taiwan",
+    "thailand",
+    "vietnam",
+    "malaysia",
+    "indonesia",
+    "philippines",
+    "india",
+    "united arab emirates",
+    "uae",
+    "qatar",
+    "saudi arabia",
+}
+
+
+def classify_market(pais: object) -> str:
+    """Asigna cada pais a uno de los mercados comerciales del forecast."""
+    text = str(pais or "").strip().lower()
+    if text in {"united states", "usa", "u.s.a.", "us", "canada"}:
+        return MARKET_US_CANADA
+    if text in {"the netherlands", "netherlands", "holland", "holanda"}:
+        return MARKET_NETHERLANDS
+    if text in {"poland", "polonia"}:
+        return MARKET_POLAND
+    if text in ASIA_COUNTRIES:
+        return MARKET_ASIA
+    return MARKET_OTHER
 
 KEY_COLS = [
     "cod_cliente",
