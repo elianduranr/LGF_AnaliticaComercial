@@ -14,6 +14,27 @@ SQL Server 192.168.1.22 / op_sales.fact_sales_line
 app_dash.py consume resultados/descriptivos, vistas `op_sales` y resultados/forecast_solidos.
 ```
 
+Para despliegue local con SQL Server no se suben los CSV historicos pesados a
+GitHub. La maquina de ejecucion debe tener acceso a `192.168.1.22`, base
+`gaitana`, schema `op_sales`, y el driver ODBC de SQL Server instalado.
+
+Si la maquina usa autenticacion integrada de Windows, no hace falta definir
+usuario ni clave. Si usa autenticacion SQL, definir variables de entorno fuera
+del repositorio:
+
+```powershell
+$env:OP_SALES_SQL_SERVER = "192.168.1.22"
+$env:OP_SALES_SQL_DATABASE = "gaitana"
+$env:OP_SALES_SQL_USER = "usuario_sql"
+$env:OP_SALES_SQL_PASSWORD = "clave_sql"
+```
+
+El dashboard debe abrirse en modo SQL:
+
+```powershell
+.\run_dash_sql.ps1
+```
+
 La carpeta local de respaldo/carga inicial es:
 
 ```text

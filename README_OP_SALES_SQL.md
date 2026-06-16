@@ -32,7 +32,7 @@ export OP_SALES_SQL_PASSWORD="TU_PASSWORD_REAL"
 Tambien puedes usar una sola variable:
 
 ```bash
-export OP_SALES_CONN_STR="DRIVER={ODBC Driver 18 for SQL Server};SERVER=192.168.1.22;DATABASE=gaitana;UID=sa;PWD=TU_PASSWORD_REAL;TrustServerCertificate=yes;"
+export OP_SALES_CONN_STR="DRIVER={ODBC Driver 18 for SQL Server};SERVER=192.168.1.22;DATABASE=gaitana;UID=usuario_sql;PWD=TU_PASSWORD_REAL;TrustServerCertificate=yes;"
 ```
 
 Si no defines usuario/clave, los scripts intentan autenticacion integrada de

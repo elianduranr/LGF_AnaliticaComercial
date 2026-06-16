@@ -206,13 +206,16 @@ LINE_KEY_COLUMNS = [
 
 def conexion_GF() -> str:
     """Conexion local al SQL Server operativo de Gaitana."""
+    driver = os.getenv("OP_SALES_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    server = os.getenv("OP_SALES_SQL_SERVER", "192.168.1.22")
+    database = os.getenv("OP_SALES_SQL_DATABASE", "gaitana")
     return (
-        r"DRIVER={ODBC Driver 17 for SQL Server};"
-        r"SERVER=192.168.1.22;"
-        r"DATABASE=gaitana;"
-        r"UID=sa;"
-        r"PWD=G41trn422*$;"
-        r"Encrypt=No;"
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        "Trusted_Connection=yes;"
+        "Encrypt=no;"
+        "TrustServerCertificate=yes;"
     )
 
 
@@ -259,9 +262,10 @@ def _print_summary(label: str, frame: pd.DataFrame, verbose: bool = True) -> Non
 def connection_string_from_env() -> str:
     explicit = os.getenv("OP_SALES_CONN_STR")
     if explicit:
-        explicit = explicit.replace("TrustServerCertificate=yes;", "").replace("TrustServerCertificate=Yes;", "")
         if "Encrypt=" not in explicit and "encrypt=" not in explicit:
-            explicit = explicit.rstrip(";") + ";Encrypt=No;"
+            explicit = explicit.rstrip(";") + ";Encrypt=no;"
+        if "TrustServerCertificate=" not in explicit and "trustservercertificate=" not in explicit:
+            explicit = explicit.rstrip(";") + ";TrustServerCertificate=yes;"
         return explicit
     if not any(os.getenv(name) for name in ["OP_SALES_SQL_SERVER", "OP_SALES_SQL_USER", "OP_SALES_SQL_PASSWORD"]):
         return conexion_GF()
@@ -281,7 +285,8 @@ def connection_string_from_env() -> str:
             f"SERVER={server};"
             f"DATABASE={database};"
             "Trusted_Connection=yes;"
-            "Encrypt=No;"
+            "Encrypt=no;"
+            "TrustServerCertificate=yes;"
         )
     return (
         f"DRIVER={{{driver}}};"
@@ -289,7 +294,8 @@ def connection_string_from_env() -> str:
         f"DATABASE={database};"
         f"UID={user};"
         f"PWD={password};"
-        "Encrypt=No;"
+        "Encrypt=no;"
+        "TrustServerCertificate=yes;"
     )
 
 
