@@ -15,6 +15,7 @@ while IFS= read -r line; do
 done < "configurar_credenciales.local.ps1"
 
 export OP_SALES_USE_SQL_SERVER=1
+export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
 
 ./carac_clients/Scripts/python.exe app_dash.py \
   --data-dir "resultados/descriptivos" \
