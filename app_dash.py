@@ -14,6 +14,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import zlib
 from pathlib import Path
 
@@ -599,6 +601,270 @@ def read_client_sku_week_from_sql(client_code: str | None) -> pd.DataFrame:
     return frame
 
 
+def read_client_sku_week_many_from_sql(client_codes: list[str]) -> pd.DataFrame:
+    codes = [str(code) for code in client_codes if str(code).strip()]
+    if not codes:
+        return pd.DataFrame()
+    placeholders = ", ".join("?" for _ in codes)
+    frame = read_op_sales_sql_table(
+        "op_sales.agg_client_sku_week",
+        params=codes,
+        where=f" WHERE cod_cliente IN ({placeholders})",
+    )
+    if frame.empty:
+        return frame
+    frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
+    if "fecha" in frame.columns:
+        frame["fecha"] = pd.to_datetime(frame["fecha"], errors="coerce")
+    for col in ["tallos_confirmados", "tallos_pedidos", "tallos_historicos", "ventas_usd", "valor_total_original"]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
+    return frame
+
+
+ADMIN_PASSWORD = "142806"
+
+
+def admin_sql_status() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Read operational SQL coverage and latest ETL batches for the admin tab."""
+    try:
+        from src.lgf_operativo.op_sales_sql import get_connection
+
+        with get_connection() as con:
+            coverage = pd.read_sql_query(
+                """
+                SELECT
+                    MIN(fecha) AS fecha_min,
+                    MAX(fecha) AS fecha_max,
+                    COUNT_BIG(*) AS filas,
+                    COUNT(DISTINCT CONVERT(date, fecha)) AS dias,
+                    COUNT(DISTINCT anio) AS anios
+                FROM op_sales.fact_sales_line
+                """,
+                con,
+            )
+            batches = pd.read_sql_query(
+                """
+                SELECT TOP 12
+                    load_id,
+                    source_name,
+                    period_start,
+                    period_end,
+                    status,
+                    rows_deleted,
+                    rows_inserted,
+                    started_at,
+                    finished_at
+                FROM op_sales.etl_load_batch
+                ORDER BY load_id DESC
+                """,
+                con,
+            )
+        if not coverage.empty:
+            raw_min = pd.to_datetime(coverage.loc[0, "fecha_min"], errors="coerce")
+            raw_max = pd.to_datetime(coverage.loc[0, "fecha_max"], errors="coerce")
+            coverage.attrs["fecha_min"] = raw_min.strftime("%Y-%m-%d") if pd.notna(raw_min) else ""
+            coverage.attrs["fecha_max"] = raw_max.strftime("%Y-%m-%d") if pd.notna(raw_max) else ""
+            coverage.attrs["next_start"] = (raw_max + pd.Timedelta(days=1)).strftime("%Y-%m-%d") if pd.notna(raw_max) else ""
+            raw_rows = pd.to_numeric(coverage.loc[0, "filas"], errors="coerce")
+            raw_days = pd.to_numeric(coverage.loc[0, "dias"], errors="coerce")
+            coverage.attrs["filas"] = int(raw_rows) if pd.notna(raw_rows) else 0
+            coverage.attrs["dias"] = int(raw_days) if pd.notna(raw_days) else 0
+            for col in ["fecha_min", "fecha_max"]:
+                coverage[col] = pd.to_datetime(coverage[col], errors="coerce").dt.strftime("%Y-%m-%d")
+            for col in ["filas", "dias", "anios"]:
+                coverage[col] = coverage[col].map(lambda value: moneyless_number(value, 0))
+            coverage = coverage.rename(
+                columns={
+                    "fecha_min": "Desde SQL",
+                    "fecha_max": "Hasta SQL",
+                    "filas": "Filas",
+                    "dias": "Dias cargados",
+                    "anios": "Anios",
+                }
+            )
+        if not batches.empty:
+            for col in ["period_start", "period_end", "started_at", "finished_at"]:
+                batches[col] = pd.to_datetime(batches[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+            batches = batches.rename(
+                columns={
+                    "load_id": "Load ID",
+                    "source_name": "Fuente",
+                    "period_start": "Desde",
+                    "period_end": "Hasta",
+                    "status": "Estado",
+                    "rows_deleted": "Filas eliminadas",
+                    "rows_inserted": "Filas insertadas",
+                    "started_at": "Inicio",
+                    "finished_at": "Fin",
+                    "error_message": "Error",
+                }
+            )
+        return coverage, batches, ""
+    except Exception as exc:
+        return pd.DataFrame(), pd.DataFrame(), f"No se pudo leer SQL Server: {exc}"
+
+
+def admin_run_command(command: list[str], timeout_seconds: int = 7200) -> tuple[int, str]:
+    env = os.environ.copy()
+    env["OP_SALES_USE_SQL_SERVER"] = "1"
+    completed = subprocess.run(
+        command,
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+    )
+    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+    return completed.returncode, output.strip()
+
+
+def render_admin_tab() -> html.Div:
+    coverage, batches, message = admin_sql_status()
+    today = pd.Timestamp.today().normalize()
+    next_start = coverage.attrs.get("next_start", "") if not coverage.empty else ""
+    loaded_from = coverage.attrs.get("fecha_min", "") if not coverage.empty else ""
+    loaded_to = coverage.attrs.get("fecha_max", "") if not coverage.empty else ""
+    loaded_rows = moneyless_number(coverage.attrs.get("filas", 0), 0) if not coverage.empty else "0"
+    loaded_days = moneyless_number(coverage.attrs.get("dias", 0), 0) if not coverage.empty else "0"
+    default_end = today.strftime("%Y-%m-%d")
+    default_start = next_start or (today - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    if pd.to_datetime(default_start, errors="coerce") > today:
+        default_start = default_end
+    coverage_cards = html.Div(
+        [
+            html.Div([html.Div("Desde SQL", className="admin-card-label"), html.Div(loaded_from or "Sin datos", className="admin-card-value")], className="admin-status-card"),
+            html.Div([html.Div("Hasta SQL", className="admin-card-label"), html.Div(loaded_to or "Sin datos", className="admin-card-value")], className="admin-status-card admin-status-card-accent"),
+            html.Div([html.Div("Siguiente sugerido", className="admin-card-label"), html.Div(default_start, className="admin-card-value")], className="admin-status-card"),
+            html.Div([html.Div("Filas / dias", className="admin-card-label"), html.Div(f"{loaded_rows} / {loaded_days}", className="admin-card-value")], className="admin-status-card"),
+        ],
+        className="admin-status-grid",
+    )
+    admin_guidance = html.Div(
+        [
+            html.Div("Como decidir la carga", className="panel-title"),
+            html.Div(
+                [
+                    html.Div("1. Si SQL llega hasta una fecha anterior, carga desde el dia siguiente hasta la fecha nueva.", className="admin-guidance-item"),
+                    html.Div("2. Usa Validar sin escribir antes de cargar si no estas seguro del rango.", className="admin-guidance-item"),
+                    html.Div("3. Reconstruir agregados SQL del Dash debe quedar marcado casi siempre: actualiza las vistas rapidas que lee Ventas generales.", className="admin-guidance-item"),
+                    html.Div("4. Descriptivos no siempre son obligatorios. Correlos cuando quieras actualizar perfiles, SKUs, estructuras, resumen de clientes o forecast con la historia nueva.", className="admin-guidance-item"),
+                ],
+                className="admin-guidance-list",
+            ),
+        ],
+        className="admin-guidance",
+    )
+    status_block = (
+        html.Div(message, className="panel-note")
+        if message
+        else html.Div(
+            [
+                html.Div("Cobertura actual en SQL", className="panel-title"),
+                make_table(coverage, 5),
+                html.Div("Ultimas cargas", className="panel-title section-gap"),
+                make_table(batches, 8),
+            ],
+            className="table-panel",
+        )
+    )
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Administrador", className="admin-hero-title"),
+                    html.Div("Carga controlada de ventas a SQL Server y preparacion de datos para el Dash.", className="admin-hero-subtitle"),
+                    coverage_cards,
+                ],
+                className="admin-hero",
+            ),
+            html.Div(
+                [
+                    html.Div("Nueva carga", className="panel-title"),
+                    panel_note("Clave visible temporal: 142806. El rango se inicializa con el siguiente dia sugerido segun SQL."),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Label("Contrasena"),
+                                    dcc.Input(id="admin-password", type="text", value="", placeholder="142806", className="admin-input"),
+                                ],
+                                className="demand-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Rango ETL"),
+                                    dcc.DatePickerRange(
+                                        id="admin-date-range",
+                                        start_date=default_start,
+                                        end_date=default_end,
+                                        display_format="YYYY-MM-DD",
+                                    ),
+                                ],
+                                className="demand-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Particionar carga"),
+                                    dcc.Dropdown(
+                                        id="admin-split-by",
+                                        options=[
+                                            {"label": "Sin partir", "value": "none"},
+                                            {"label": "Por mes", "value": "month"},
+                                            {"label": "Por ano", "value": "year"},
+                                        ],
+                                        value="none",
+                                        clearable=False,
+                                    ),
+                                ],
+                                className="demand-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Filas por lote"),
+                                    dcc.Input(id="admin-chunk-size", type="number", min=100, step=100, value=5000, className="admin-input"),
+                                ],
+                                className="demand-control",
+                            ),
+                        ],
+                        className="grid-2",
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Acciones adicionales"),
+                            dcc.Checklist(
+                                id="admin-extra-actions",
+                                options=[
+                                    {"label": "Reconstruir agregados SQL del Dash", "value": "materialize"},
+                                    {"label": "Regenerar descriptivos desde SQL", "value": "descriptivos"},
+                                    {"label": "Regenerar forecast solidos", "value": "forecast"},
+                                ],
+                                value=["materialize"],
+                                inputStyle={"marginRight": "8px"},
+                                labelStyle={"display": "block"},
+                            ),
+                        ],
+                        className="demand-control",
+                    ),
+                    html.Div(
+                        [
+                            html.Button("Validar sin escribir", id="admin-dry-run", n_clicks=0, type="button", className="executive-button secondary"),
+                            html.Button("Ejecutar ETL y cargar SQL", id="admin-run-etl", n_clicks=0, type="button", className="executive-button primary"),
+                        ],
+                        className="executive-button-group",
+                    ),
+                    html.Pre(id="admin-run-output", className="admin-output"),
+                ],
+                className="table-panel",
+            ),
+            admin_guidance,
+            status_block,
+        ],
+        className="section-gap",
+    )
+
+
 def load_data(
     data_dir: Path,
     forecast_dir: Path | None = None,
@@ -1041,7 +1307,7 @@ def make_table(
         sort_action="native",
         sort_by=sort_by or [],
         filter_action="native",
-        export_format="csv",
+        export_format="xlsx",
         style_table={"overflowX": "auto", "maxHeight": "430px", "overflowY": "auto"},
         style_cell={
             "fontFamily": "Arial, sans-serif",
@@ -1099,6 +1365,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     general_sales_company_options = []
     general_sales_product_options = []
     general_sales_country_options = []
+    general_sales_color_options = []
     forecast_year_options = []
     forecast_default_years = []
     forecast_market_options = []
@@ -1152,6 +1419,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             general_sales_product_options = [
                 {"label": product, "value": product}
                 for product in sorted(ventas_source["producto"].dropna().astype(str).unique())
+            ]
+        if "color" in ventas_source.columns:
+            general_sales_color_options = [
+                {"label": color, "value": color}
+                for color in sorted(ventas_source["color"].dropna().astype(str).unique())
+                if color.strip()
             ]
         if "pais" in ventas_source.columns:
             general_sales_country_options = [
@@ -1250,7 +1523,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         current_week = int(max_hist_date.isocalendar().week) if pd.notna(max_hist_date) else int(pd.Timestamp.today().isocalendar().week)
     else:
         current_week = int(pd.Timestamp.today().isocalendar().week)
-    app = Dash(__name__, title="LGF Analitica Comercial")
+    app = Dash(__name__, title="LGF Analitica Comercial", suppress_callback_exceptions=True)
 
     @app.callback(
         Output({"type": "managed-table", "index": MATCH}, "filter_query"),
@@ -1291,8 +1564,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                     html.Aside(
                         [
                             html.Label("Cliente"),
-                            dcc.Dropdown(id="client", options=client_options, value=None, clearable=True, placeholder="Todos los clientes"),
-                            html.Div("Primero selecciona un cliente. El 360 explica como viene pidiendo en semanas recientes y separa solidos, surtidos, recetas y bulk.", className="filter-help"),
+                            dcc.Dropdown(id="client", options=client_options, value=[], multi=True, clearable=True, placeholder="Todos los clientes"),
+                            html.Div("Selecciona uno o varios clientes. El visualizador detalla compras recientes y separa solidos, surtidos, recetas y bulk.", className="filter-help"),
                             html.Div(
                                 [
                                     html.Label("Producto cliente"),
@@ -1435,6 +1708,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     dcc.Tab(label="Comprador", value="comprador"),
                                     dcc.Tab(label="Demanda e inventario", value="demanda"),
                                     dcc.Tab(label="Forecast solidos historico", value="forecast_solidos"),
+                                    dcc.Tab(label="Administrador", value="administrador"),
                                 ],
                             ),
                             html.Div(
@@ -1672,6 +1946,20 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                         ],
                                         className="demand-control",
                                     ),
+                                    html.Div(
+                                        [
+                                            html.Label("Color"),
+                                            dcc.Dropdown(
+                                                id="general-sales-colors",
+                                                options=general_sales_color_options,
+                                                value=[],
+                                                multi=True,
+                                                clearable=True,
+                                                placeholder="Todos los colores",
+                                            ),
+                                        ],
+                                        className="demand-control",
+                                    ),
                                 ],
                                 id="general-sales-options",
                                 className="demand-options",
@@ -1899,6 +2187,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("general-sales-clients", "value"),
         Input("general-sales-countries", "value"),
         Input("general-sales-products", "value"),
+        Input("general-sales-colors", "value"),
         Input("compare-mode", "value"),
         Input("solid-product", "value"),
         Input("analysis-scope", "value"),
@@ -1925,7 +2214,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     )
     def render_tab(
         tab: str,
-        client: str,
+        client: list[str] | str | None,
         top_n: int,
         analysis_week: int,
         client_lookback_weeks: int,
@@ -1949,6 +2238,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         general_sales_clients: list[str] | None,
         general_sales_countries: list[str] | None,
         general_sales_products: list[str] | None,
+        general_sales_colors: list[str] | None,
         compare_mode: str | None,
         solid_product: str | None,
         analysis_scope: str | None,
@@ -1974,8 +2264,11 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         forecast_scenario_volume: int | None,
     ):
         filtered = data["perfil"]
-        selected = select_client(filtered, data["perfil"], client)
+        client_values = selected_values(client)
+        primary_client = client_values[0] if len(client_values) == 1 else None
+        selected = select_client(filtered, data["perfil"], primary_client)
         selected_code = None if selected is None else selected["cod_cliente"]
+        visual_selected_code = client_values if client_values else None
         week_offset = 0
         visible_weeks = 4
 
@@ -2003,7 +2296,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 data,
                 filtered,
                 selected,
-                selected_code,
+                visual_selected_code,
                 top_n,
                 client_lookback_weeks,
                 analysis_week,
@@ -2030,6 +2323,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 general_sales_clients,
                 general_sales_countries,
                 general_sales_products,
+                general_sales_colors,
             )
         if tab == "estructuras_componentes":
             return render_estructuras_componentes_tab(
@@ -2069,8 +2363,10 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 forecast_scenario_volume,
                 top_n,
             )
+        if tab == "administrador":
+            return render_admin_tab()
         return render_visualizador_clientes_general(
-            data, filtered, selected, selected_code, top_n, client_lookback_weeks,
+            data, filtered, selected, visual_selected_code, top_n, client_lookback_weeks,
             analysis_week, "last_year" in (client_compare_last_year or []),
             client_volume_metric, client_product_filter, client_color_filter,
             client_program_filter, visual_sales_years, visual_week_range,
@@ -2101,7 +2397,91 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             return hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, hidden, {"gridTemplateColumns": "1fr"}
         if tab == "forecast_solidos":
             return hidden, hidden, hidden, hidden, hidden, hidden, {"display": "block"}, {"display": "none"}, {"gridTemplateColumns": "1fr"}
+        if tab == "administrador":
+            return hidden, hidden, hidden, hidden, hidden, hidden, hidden, {"display": "none"}, {"gridTemplateColumns": "1fr"}
         return hidden, hidden, hidden, hidden, hidden, hidden, hidden, {"display": "none"}, {"gridTemplateColumns": "1fr"}
+
+    @app.callback(
+        Output("general-sales-companies", "options"),
+        Output("general-sales-companies", "value"),
+        Output("general-sales-clients", "options"),
+        Output("general-sales-clients", "value"),
+        Output("general-sales-countries", "options"),
+        Output("general-sales-countries", "value"),
+        Output("general-sales-products", "options"),
+        Output("general-sales-products", "value"),
+        Output("general-sales-colors", "options"),
+        Output("general-sales-colors", "value"),
+        Input("tabs", "value"),
+        Input("general-sales-years", "value"),
+        Input("general-sales-week-range", "value"),
+        Input("general-sales-companies", "value"),
+        Input("general-sales-clients", "value"),
+        Input("general-sales-countries", "value"),
+        Input("general-sales-products", "value"),
+        Input("general-sales-colors", "value"),
+    )
+    def cascade_general_sales_filters(tab, years, week_range, companies, clients, countries, products, colors):
+        sales = data.get("ventas_semana", pd.DataFrame())
+        if sales.empty:
+            return [], [], [], [], [], [], [], [], [], []
+        latest_year = latest_selected_year(years, sales)
+        scope = filter_general_sales_frame(
+            sales,
+            [latest_year] if latest_year is not None else years,
+            week_range,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        selected_companies = selected_values(companies)
+        selected_clients = selected_values(clients)
+        selected_countries = selected_values(countries)
+        selected_products = selected_values(products)
+        selected_colors = selected_values(colors)
+
+        company_options, company_values = tallos_options_from_frame(scope, "NomCompania")
+        selected_companies = [value for value in selected_companies if value in set(company_values)]
+        if selected_companies and "NomCompania" in scope.columns:
+            scope = scope[scope["NomCompania"].astype(str).isin(set(selected_companies))].copy()
+
+        client_scope = scope.copy()
+        if {"cod_cliente", "cliente"}.issubset(client_scope.columns):
+            client_scope["cliente_label"] = client_scope["cliente"].astype(str) + " | " + client_scope["cod_cliente"].astype(str)
+            client_options, client_values = tallos_options_from_frame(client_scope, "cod_cliente", "cliente_label")
+        else:
+            client_options, client_values = [], []
+        selected_clients = [value for value in selected_clients if value in set(client_values)]
+        if selected_clients and "cod_cliente" in scope.columns:
+            scope = scope[scope["cod_cliente"].astype(str).isin(set(selected_clients))].copy()
+
+        country_options, country_values = tallos_options_from_frame(scope, "pais")
+        selected_countries = [value for value in selected_countries if value in set(country_values)]
+        if selected_countries and "pais" in scope.columns:
+            scope = scope[scope["pais"].astype(str).isin(set(selected_countries))].copy()
+
+        product_options, product_values = tallos_options_from_frame(scope, "producto")
+        selected_products = [value for value in selected_products if value in set(product_values)]
+        if selected_products and "producto" in scope.columns:
+            scope = scope[scope["producto"].astype(str).isin(set(selected_products))].copy()
+
+        color_options, color_values = tallos_options_from_frame(scope, "color")
+        selected_colors = [value for value in selected_colors if value in set(color_values)]
+
+        return (
+            company_options,
+            selected_companies,
+            client_options,
+            selected_clients,
+            country_options,
+            selected_countries,
+            product_options,
+            selected_products,
+            color_options,
+            selected_colors,
+        )
 
     @app.callback(
         Output("forecast-markets", "options"),
@@ -2240,7 +2620,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     )
     def update_visual_sku_options(
         tab: str,
-        client: str | None,
+        client: list[str] | str | None,
         visual_sales_years: list[int] | None,
         visual_week_range: list[int] | None,
         visual_tipo_filter: list[str] | None,
@@ -2252,12 +2632,10 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     ):
         if tab != "visualizador_clientes_general":
             return [], []
-        selected = select_client(data["perfil"], data["perfil"], client)
-        selected_code = None if selected is None else selected["cod_cliente"]
         base = filter_visual_operational_base(
             data,
             data["perfil"],
-            selected_code,
+            selected_values(client) or None,
             visual_sales_years,
             visual_week_range,
             visual_tipo_filter,
@@ -2291,25 +2669,43 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Output("client-product-filter", "options"),
         Output("client-product-filter", "value"),
         Input("client", "value"),
+        Input("visual-sales-years", "value"),
+        Input("visual-week-range", "value"),
+        Input("visual-tipo-filter", "value"),
         Input("product-select-all", "n_clicks"),
         Input("product-clear", "n_clicks"),
         State("client-product-filter", "value"),
     )
-    def update_client_product_options(client: str | None, product_select_all_clicks: int | None, product_clear_clicks: int | None, current_value: list[str] | str | None):
-        hist = data.get("historico_confirmado", pd.DataFrame())
+    def update_client_product_options(
+        client: list[str] | str | None,
+        visual_sales_years: list[int] | None,
+        visual_week_range: list[int] | None,
+        visual_tipo_filter: list[str] | None,
+        product_select_all_clicks: int | None,
+        product_clear_clicks: int | None,
+        current_value: list[str] | str | None,
+    ):
         sales = data.get("ventas_semana", pd.DataFrame())
-        if not client and not sales.empty and "producto" in sales.columns:
-            ranked = sales.groupby("producto", dropna=False)["tallos_confirmados"].sum().sort_values(ascending=False)
-            products = [str(idx) for idx in ranked.index if str(idx) and str(idx) != "nan"]
-            options = [{"label": f"{product} | {moneyless_number(ranked.loc[product], 0)} tallos", "value": product} for product in products]
+        selected_clients = selected_values(client)
+        if not selected_clients and not sales.empty and "producto" in sales.columns:
+            work = filter_sales_visual(sales, None, [latest_selected_year(visual_sales_years, sales)] if latest_selected_year(visual_sales_years, sales) else None, visual_week_range, visual_tipo_filter, None, None)
+            options, products = tallos_options_from_frame(work, "producto")
             value = synced_multi_value(current_value, products, "product-select-all", "product-clear")
             return options, value
-        if not client or hist.empty or "producto" not in hist.columns:
+        work = filter_visual_operational_base(
+            data,
+            data["perfil"],
+            selected_clients,
+            [latest_selected_year(visual_sales_years, sales)] if latest_selected_year(visual_sales_years, sales) else visual_sales_years,
+            visual_week_range,
+            visual_tipo_filter,
+            None,
+            None,
+            None,
+        )
+        if work.empty or "producto" not in work.columns:
             return [], []
-        work = hist[hist["cod_cliente"] == str(client)].copy()
-        ranked = work.groupby("producto", dropna=False)["tallos_historicos"].sum().sort_values(ascending=False)
-        products = [str(idx) for idx in ranked.index if str(idx) and str(idx) != "nan"]
-        options = [{"label": f"{product} | {moneyless_number(ranked.loc[product], 0)} tallos", "value": product} for product in products]
+        options, products = tallos_options_from_frame(work, "producto")
         value = synced_multi_value(current_value, products, "product-select-all", "product-clear")
         return options, value
 
@@ -2318,32 +2714,44 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Output("client-color-filter", "value"),
         Input("client", "value"),
         Input("client-product-filter", "value"),
+        Input("visual-sales-years", "value"),
+        Input("visual-week-range", "value"),
+        Input("visual-tipo-filter", "value"),
         Input("color-select-all", "n_clicks"),
         Input("color-clear", "n_clicks"),
         State("client-color-filter", "value"),
     )
-    def update_client_color_options(client: str | None, product: list[str] | str | None, color_select_all_clicks: int | None, color_clear_clicks: int | None, current_value: list[str] | str | None):
-        hist = data.get("historico_confirmado", pd.DataFrame())
+    def update_client_color_options(
+        client: list[str] | str | None,
+        product: list[str] | str | None,
+        visual_sales_years: list[int] | None,
+        visual_week_range: list[int] | None,
+        visual_tipo_filter: list[str] | None,
+        color_select_all_clicks: int | None,
+        color_clear_clicks: int | None,
+        current_value: list[str] | str | None,
+    ):
         sales = data.get("ventas_semana", pd.DataFrame())
-        if not client and not sales.empty and "color" in sales.columns:
-            work = sales.copy()
-            products = selected_values(product)
-            if products and "producto" in work.columns:
-                work = work[work["producto"].astype(str).isin(set(products))].copy()
-            ranked = work.groupby("color", dropna=False)["tallos_confirmados"].sum().sort_values(ascending=False)
-            colors = [str(idx) for idx in ranked.index if str(idx) and str(idx) != "nan"]
-            options = [{"label": f"{color} | {moneyless_number(ranked.loc[color], 0)} tallos", "value": color} for color in colors]
+        selected_clients = selected_values(client)
+        if not selected_clients and not sales.empty and "color" in sales.columns:
+            work = filter_sales_visual(sales, None, [latest_selected_year(visual_sales_years, sales)] if latest_selected_year(visual_sales_years, sales) else None, visual_week_range, visual_tipo_filter, product, None)
+            options, colors = tallos_options_from_frame(work, "color")
             value = synced_multi_value(current_value, colors, "color-select-all", "color-clear")
             return options, value
-        if not client or hist.empty or "color" not in hist.columns:
+        work = filter_visual_operational_base(
+            data,
+            data["perfil"],
+            selected_clients or None,
+            [latest_selected_year(visual_sales_years, sales)] if latest_selected_year(visual_sales_years, sales) else visual_sales_years,
+            visual_week_range,
+            visual_tipo_filter,
+            product,
+            None,
+            None,
+        )
+        if work.empty or "color" not in work.columns:
             return [], []
-        work = hist[hist["cod_cliente"] == str(client)].copy()
-        products = selected_values(product)
-        if products and "producto" in work.columns:
-            work = work[work["producto"].astype(str).isin(set(products))].copy()
-        ranked = work.groupby("color", dropna=False)["tallos_historicos"].sum().sort_values(ascending=False)
-        colors = [str(idx) for idx in ranked.index if str(idx) and str(idx) != "nan"]
-        options = [{"label": f"{color} | {moneyless_number(ranked.loc[color], 0)} tallos", "value": color} for color in colors]
+        options, colors = tallos_options_from_frame(work, "color")
         value = synced_multi_value(current_value, colors, "color-select-all", "color-clear")
         return options, value
 
@@ -2355,11 +2763,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("client-color-filter", "value"),
         State("client-program-filter", "value"),
     )
-    def update_client_program_options(client: str | None, product: list[str] | str | None, color: list[str] | str | None, current_value: str | None):
+    def update_client_program_options(client: list[str] | str | None, product: list[str] | str | None, color: list[str] | str | None, current_value: str | None):
         summary = data.get("sku_resumen", pd.DataFrame())
         hist = data.get("historico_confirmado", pd.DataFrame())
-        if not summary.empty and "sku_operativo" in summary.columns and client:
-            work = summary[summary["cod_cliente"] == str(client)].copy()
+        selected_clients = selected_values(client)
+        if not summary.empty and "sku_operativo" in summary.columns and selected_clients:
+            work = summary[summary["cod_cliente"].astype(str).isin(set(selected_clients))].copy()
             products = selected_values(product)
             colors = selected_values(color)
             if products and "producto" in work.columns:
@@ -2368,7 +2777,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 comp = data.get("sku_composicion", pd.DataFrame())
                 if not comp.empty and "color" in comp.columns:
                     valid_skus = comp[
-                        (comp["cod_cliente"] == str(client))
+                        (comp["cod_cliente"].astype(str).isin(set(selected_clients)))
                         & (comp["color"].astype(str).isin(set(colors)))
                     ]["sku_operativo"].astype(str).unique()
                     work = work[work["sku_operativo"].astype(str).isin(set(valid_skus))].copy()
@@ -2389,8 +2798,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             return options, value
         if hist.empty or "sku_operativo" not in hist.columns:
             return [], None
-        work = hist[hist["cod_cliente"] == str(client)].copy()
-        if not client:
+        work = hist[hist["cod_cliente"].astype(str).isin(set(selected_clients))].copy() if selected_clients and "cod_cliente" in hist.columns else hist.copy()
+        if not selected_clients:
             work = hist.copy()
         products = selected_values(product)
         colors = selected_values(color)
@@ -2413,11 +2822,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("client-program-filter", "value"),
         State("selected-sku-operativo", "value"),
     )
-    def update_selected_sku_options(client: str | None, product: list[str] | str | None, color: list[str] | str | None, program: str | None, current_value: str | None):
+    def update_selected_sku_options(client: list[str] | str | None, product: list[str] | str | None, color: list[str] | str | None, program: str | None, current_value: str | None):
         summary = data.get("sku_resumen", pd.DataFrame())
         hist = data.get("historico_confirmado", pd.DataFrame())
-        if not summary.empty and "sku_operativo" in summary.columns and client:
-            work = summary[summary["cod_cliente"] == str(client)].copy()
+        selected_clients = selected_values(client)
+        if not summary.empty and "sku_operativo" in summary.columns and selected_clients:
+            work = summary[summary["cod_cliente"].astype(str).isin(set(selected_clients))].copy()
             products = selected_values(product)
             colors = selected_values(color)
             if products and "producto" in work.columns:
@@ -2426,7 +2836,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 comp = data.get("sku_composicion", pd.DataFrame())
                 if not comp.empty and "color" in comp.columns:
                     valid_skus = comp[
-                        (comp["cod_cliente"] == str(client))
+                        (comp["cod_cliente"].astype(str).isin(set(selected_clients)))
                         & (comp["color"].astype(str).isin(set(colors)))
                     ]["sku_operativo"].astype(str).unique()
                     work = work[work["sku_operativo"].astype(str).isin(set(valid_skus))].copy()
@@ -2448,7 +2858,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             return options, value
         if hist.empty or "sku_operativo" not in hist.columns:
             return [], None
-        work = hist[hist["cod_cliente"] == str(client)].copy() if client else hist.copy()
+        work = hist[hist["cod_cliente"].astype(str).isin(set(selected_clients))].copy() if selected_clients and "cod_cliente" in hist.columns else hist.copy()
         products = selected_values(product)
         colors = selected_values(color)
         if products and "producto" in work.columns:
@@ -2466,6 +2876,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Output("general-sales-report-download", "data"),
         Input("general-sales-export-summary", "n_clicks"),
         Input("general-sales-export-full", "n_clicks"),
+        Input("general-sales-export-raw", "n_clicks"),
         State("general-sales-base-year", "value"),
         State("general-sales-compare-year", "value"),
         State("general-sales-years", "value"),
@@ -2474,27 +2885,187 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         State("general-sales-clients", "value"),
         State("general-sales-countries", "value"),
         State("general-sales-products", "value"),
+        State("general-sales-colors", "value"),
         prevent_initial_call=True,
     )
-    def export_general_sales_report(summary_clicks, full_clicks, base_year, compare_year, years, week_range, companies, clients, countries, products):
-        if not summary_clicks and not full_clicks:
+    def export_general_sales_report(summary_clicks, full_clicks, raw_clicks, base_year, compare_year, years, week_range, companies, clients, countries, products, colors):
+        if not summary_clicks and not full_clicks and not raw_clicks:
             return dash.no_update
+        if ctx.triggered_id == "general-sales-export-raw":
+            raw = sales_raw_export_frame(data, years, week_range, companies, clients, countries, products, colors)
+            if raw.empty:
+                return dash.no_update
+            years_text = "_".join(map(str, selected_values(years))) if selected_values(years) else "todos"
+            weeks_text = f"sem_{int(week_range[0])}_{int(week_range[1])}" if week_range and len(week_range) == 2 else "semanas_todas"
+            return dcc.send_data_frame(
+                raw.to_csv,
+                f"ventas_base_cruda_{years_text}_{weeks_text}.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
         sales = data.get("ventas_semana", pd.DataFrame())
         if sales.empty:
             return dash.no_update
-        view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies)
+        view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors)
         if view.empty:
             return dash.no_update
         context = build_sales_executive_context_v2(view, base_year, compare_year)
         if not context.get("ok"):
             return dash.no_update
-        scope = sales_scope_summary(view, clients, products, countries, companies)
+        scope = sales_scope_summary(view, clients, products, countries, companies, colors)
         report_type = "full" if ctx.triggered_id == "general-sales-export-full" else "summary"
         weekly = summarize_sales_frame(view, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
         report_pdf = build_sales_report_pdf(context, scope, weekly=weekly, report_type=report_type, view=view)
         suffix = "completo" if report_type == "full" else "resumido_1_pagina"
         filename = f"informe_ventas_{suffix}_{context.get('base_year', 'base')}_vs_{context.get('compare_year', 'comp')}.pdf"
         return dcc.send_bytes(report_pdf, filename=filename)
+
+    @app.callback(
+        Output("admin-run-output", "children"),
+        Input("admin-dry-run", "n_clicks"),
+        Input("admin-run-etl", "n_clicks"),
+        State("admin-password", "value"),
+        State("admin-date-range", "start_date"),
+        State("admin-date-range", "end_date"),
+        State("admin-split-by", "value"),
+        State("admin-chunk-size", "value"),
+        State("admin-extra-actions", "value"),
+        prevent_initial_call=True,
+    )
+    def run_admin_etl(dry_clicks, run_clicks, password, start_date, end_date, split_by, chunk_size, extra_actions):
+        if not dry_clicks and not run_clicks:
+            return dash.no_update
+        if str(password or "").strip() != ADMIN_PASSWORD:
+            return "Contrasena incorrecta. Usa 142806."
+        if not start_date or not end_date:
+            return "Selecciona fecha inicial y fecha final."
+        start = pd.to_datetime(start_date, errors="coerce")
+        end = pd.to_datetime(end_date, errors="coerce")
+        if pd.isna(start) or pd.isna(end):
+            return "Rango de fechas invalido."
+        if start > end:
+            return "La fecha inicial no puede ser mayor que la fecha final."
+        try:
+            chunk = int(chunk_size or 5000)
+        except (TypeError, ValueError):
+            return "Filas por lote debe ser numerico."
+        if chunk <= 0:
+            return "Filas por lote debe ser mayor que cero."
+
+        start_text = start.strftime("%Y-%m-%d")
+        end_text = end.strftime("%Y-%m-%d")
+        split = split_by or "none"
+        triggered = ctx.triggered_id
+        is_dry_run = triggered == "admin-dry-run"
+        selected_actions = set(extra_actions or [])
+        commands: list[tuple[str, list[str]]] = []
+        load_command = [
+            sys.executable,
+            "cargar_op_sales_sql.py",
+            "--from-cuadernillo",
+            "--start-date",
+            start_text,
+            "--end-date",
+            end_text,
+            "--chunk-size",
+            str(chunk),
+            "--split-by",
+            split,
+        ]
+        if is_dry_run:
+            load_command.append("--dry-run")
+        commands.append(("Validacion ETL sin escritura" if is_dry_run else "Carga ETL a SQL", load_command))
+        if not is_dry_run:
+            if "descriptivos" in selected_actions:
+                commands.append(
+                    (
+                        "Regenerar descriptivos desde SQL",
+                        [
+                            sys.executable,
+                            "run_descriptivos.py",
+                            "--source",
+                            "sql",
+                            "--output",
+                            str(data_dir),
+                            "--no-cache",
+                        ],
+                    )
+                )
+            if "forecast" in selected_actions:
+                commands.append(
+                    (
+                        "Regenerar forecast solidos",
+                        [
+                            sys.executable,
+                            "run_forecast_solidos.py",
+                            "--source",
+                            "sql",
+                            "--output",
+                            str(forecast_dir or DEFAULT_FORECAST_DIR),
+                            "--no-cache",
+                        ],
+                    )
+                )
+            if "materialize" in selected_actions:
+                materialize_command = [
+                    sys.executable,
+                    "materializar_op_sales_resultados_sql.py",
+                    "--descriptivos-dir",
+                    str(data_dir),
+                    "--forecast-dir",
+                    str(forecast_dir or DEFAULT_FORECAST_DIR),
+                ]
+                if "descriptivos" not in selected_actions and "forecast" not in selected_actions:
+                    materialize_command.append("--skip-results")
+                commands.append(("Reconstruir agregados SQL del Dash", materialize_command))
+
+        logs = [
+            f"Administrador iniciado",
+            f"- rango: {start_text} a {end_text}",
+            f"- modo: {'validacion sin escritura' if is_dry_run else 'carga real'}",
+            f"- particion: {split}",
+            "",
+        ]
+        for title, command in commands:
+            logs.append(f"=== {title} ===")
+            logs.append(" ".join(command))
+            try:
+                code, output = admin_run_command(command)
+            except subprocess.TimeoutExpired as exc:
+                partial = "\n".join(part for part in [exc.stdout or "", exc.stderr or ""] if part)
+                logs.append(partial)
+                logs.append("ERROR: tiempo maximo agotado.")
+                return "\n".join(logs)
+            except Exception as exc:
+                logs.append(f"ERROR ejecutando comando: {exc}")
+                return "\n".join(logs)
+            if output:
+                logs.append(output)
+            logs.append(f"Codigo de salida: {code}")
+            logs.append("")
+            if code != 0:
+                logs.append("Proceso detenido por error. SQL no queda marcado como listo hasta corregir este punto.")
+                return "\n".join(logs)
+
+        if not is_dry_run:
+            try:
+                data.clear()
+                data.update(load_data(data_dir, forecast_dir))
+                logs.append("Datos del Dash recargados en memoria.")
+            except Exception as exc:
+                logs.append(f"La carga termino, pero no se pudo recargar el Dash en memoria: {exc}")
+                logs.append("Reinicia el Dash para ver todos los cambios.")
+        coverage, batches, status_error = admin_sql_status()
+        if status_error:
+            logs.append(status_error)
+        elif not coverage.empty:
+            logs.append("Estado SQL despues del proceso:")
+            logs.append(coverage.to_string(index=False))
+            if not batches.empty:
+                logs.append("Ultimas cargas:")
+                logs.append(batches.head(5).to_string(index=False))
+        logs.append("Listo para trabajar." if not is_dry_run else "Validacion terminada; no se escribio en SQL.")
+        return "\n".join(logs)
 
     app.index_string = """
     <!DOCTYPE html>
@@ -2560,6 +3131,19 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 .executive-button.primary { background: #800020; color: white; }
                 .executive-button.secondary { background: white; color: #800020; }
                 .executive-button:hover { box-shadow: 0 8px 18px rgba(128, 0, 32, 0.16); }
+                .admin-hero { background: linear-gradient(135deg, #ffffff 0%, #f8fafc 58%, #eef4fb 100%); border: 1px solid #dfe5ec; border-radius: 8px; padding: 18px; box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06); }
+                .admin-hero-title { color: #17202a; font-size: 26px; line-height: 32px; font-weight: 800; }
+                .admin-hero-subtitle { color: #667382; font-size: 13px; margin-top: 4px; }
+                .admin-status-grid { display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 12px; margin-top: 16px; }
+                .admin-status-card { background: white; border: 1px solid #dfe5ec; border-left: 4px solid #4E79A7; border-radius: 8px; padding: 13px 14px; min-height: 72px; }
+                .admin-status-card-accent { border-left-color: #800020; }
+                .admin-card-label { color: #667382; font-size: 11px; font-weight: 800; text-transform: uppercase; margin-bottom: 7px; }
+                .admin-card-value { color: #17202a; font-size: 20px; line-height: 26px; font-weight: 800; overflow-wrap: anywhere; }
+                .admin-guidance { background: #ffffff; border: 1px solid #dfe5ec; border-radius: 8px; padding: 16px; }
+                .admin-guidance-list { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 10px; margin-top: 10px; }
+                .admin-guidance-item { background: #f8fafc; border: 1px solid #e5ebf2; border-radius: 8px; padding: 11px 12px; color: #344252; font-size: 13px; line-height: 1.35; }
+                .admin-input { width: 100%; box-sizing: border-box; border: 1px solid #cfd8e3; border-radius: 6px; padding: 9px 10px; font-size: 13px; }
+                .admin-output { margin-top: 14px; min-height: 180px; max-height: 520px; overflow: auto; background: #17202a; color: #f8fafc; border-radius: 8px; padding: 14px; font-size: 12px; line-height: 1.45; white-space: pre-wrap; }
                 .scope-strip { display: grid; grid-template-columns: minmax(260px, 1.4fr) minmax(240px, 1.1fr) minmax(140px, 0.45fr) minmax(140px, 0.45fr); gap: 12px; margin-bottom: 14px; }
                 .scope-card { background: white; border: 1px solid #dfe5ec; border-radius: 8px; padding: 12px 14px; box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04); min-height: 58px; }
                 .scope-card-wide { border-left: 4px solid #4E79A7; }
@@ -3663,7 +4247,7 @@ def render_visualizador_clientes_general(
     data: dict[str, pd.DataFrame],
     filtered: pd.DataFrame,
     selected: pd.Series | None,
-    selected_code: str | None,
+    selected_code: str | list[str] | None,
     top_n: int,
     history_weeks: int,
     analysis_week: int,
@@ -4024,7 +4608,7 @@ def render_visualizador_clientes_overview_lite(data: dict[str, pd.DataFrame], fi
 
 def filter_sales_visual(
     sales: pd.DataFrame,
-    selected_code: str | None,
+    selected_code: str | list[str] | None,
     years: list[int] | None,
     week_range: list[int] | None,
     tipo_filter: list[str] | None,
@@ -4034,8 +4618,9 @@ def filter_sales_visual(
     if sales.empty:
         return sales
     out = sales.copy()
-    if selected_code and "cod_cliente" in out.columns:
-        out = out[out["cod_cliente"].astype(str).eq(str(selected_code))].copy()
+    selected_codes = selected_values(selected_code)
+    if selected_codes and "cod_cliente" in out.columns:
+        out = out[out["cod_cliente"].astype(str).isin(set(selected_codes))].copy()
     if years and "anio" in out.columns:
         year_set = {int(year) for year in years if pd.notna(year)}
         out = out[pd.to_numeric(out["anio"], errors="coerce").astype("Int64").isin(year_set)].copy()
@@ -4104,6 +4689,67 @@ def format_sales_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def sales_product_week_matrix_display(df: pd.DataFrame, selected_clients: list[str] | str | None) -> pd.DataFrame:
+    """Build a product-by-week stems matrix for the current sales filters."""
+    required = {"anio", "semana_iso", "producto", "tallos_confirmados"}
+    if df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["anio_num"] = pd.to_numeric(work["anio"], errors="coerce")
+    work["semana_num"] = pd.to_numeric(work["semana_iso"], errors="coerce")
+    work = work.dropna(subset=["anio_num", "semana_num"])
+    if work.empty:
+        return pd.DataFrame()
+
+    work["anio_num"] = work["anio_num"].astype(int)
+    work["semana_num"] = work["semana_num"].astype(int)
+    single_year = work["anio_num"].nunique() == 1
+    work["semana_col"] = np.where(
+        single_year,
+        "Semana " + work["semana_num"].astype(str).str.zfill(2),
+        work["anio_num"].astype(str) + "-S" + work["semana_num"].astype(str).str.zfill(2),
+    )
+    row_cols = ["producto"]
+    if len(selected_values(selected_clients)) != 1 and {"cod_cliente", "cliente"}.issubset(work.columns):
+        row_cols = ["cod_cliente", "cliente", "producto"]
+
+    grouped = (
+        work.groupby(row_cols + ["semana_col", "anio_num", "semana_num"], dropna=False, as_index=False)["tallos_confirmados"]
+        .sum()
+        .sort_values(["anio_num", "semana_num"])
+    )
+    week_cols = grouped[["semana_col", "anio_num", "semana_num"]].drop_duplicates().sort_values(["anio_num", "semana_num"])["semana_col"].tolist()
+    matrix = grouped.pivot_table(index=row_cols, columns="semana_col", values="tallos_confirmados", aggfunc="sum", fill_value=0).reset_index()
+    matrix = matrix[row_cols + week_cols]
+    matrix["Total"] = matrix[week_cols].sum(axis=1)
+    matrix = matrix.sort_values("Total", ascending=False).head(250)
+
+    rename = {"cod_cliente": "Cod cliente", "cliente": "Cliente", "producto": "Producto"}
+    matrix = matrix.rename(columns=rename)
+    for col in week_cols + ["Total"]:
+        matrix[col] = pd.to_numeric(matrix[col], errors="coerce").fillna(0).round(0).astype(int)
+    return matrix
+
+
+def sales_raw_export_frame(data: dict[str, pd.DataFrame], years, week_range, companies, clients, countries, products, colors) -> pd.DataFrame:
+    """Return the most detailed available sales frame filtered like Ventas generales."""
+    source = data.get("ventas_caja", pd.DataFrame())
+    if source.empty:
+        source = data.get("ventas_semana", pd.DataFrame())
+    if source.empty:
+        return pd.DataFrame()
+    out = filter_general_sales_frame(source, years, week_range, clients, products, countries, companies, colors)
+    if out.empty:
+        return out
+    helper_cols = [col for col in ["week_start", "mes_num"] if col in out.columns]
+    if helper_cols:
+        out = out.drop(columns=helper_cols)
+    preferred = [col for col in SALES_BOX_COLS if col in out.columns]
+    extra = [col for col in out.columns if col not in preferred]
+    return out[preferred + extra].copy()
+
+
 NON_SOLID_TYPES = {"SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT", "BULK", "MIX", "ASSORTED"}
 
 
@@ -4140,6 +4786,52 @@ def synced_multi_value(current_value, ordered_values: list[str], select_all_id: 
         return ordered_values
     valid = set(ordered_values)
     return [item for item in selected_values(current_value) if item in valid]
+
+
+def latest_selected_year(years: list[int] | None, frame: pd.DataFrame) -> int | None:
+    selected_years = [int(year) for year in selected_values(years) if str(year).strip().isdigit()]
+    if selected_years:
+        return max(selected_years)
+    if frame.empty or "anio" not in frame.columns:
+        return None
+    available = pd.to_numeric(frame["anio"], errors="coerce").dropna()
+    if available.empty:
+        return None
+    return int(available.max())
+
+
+def frame_for_option_tallos(frame: pd.DataFrame, years: list[int] | None) -> pd.DataFrame:
+    year = latest_selected_year(years, frame)
+    if year is None or frame.empty or "anio" not in frame.columns:
+        return frame.copy()
+    return frame[pd.to_numeric(frame["anio"], errors="coerce").eq(year)].copy()
+
+
+def tallos_options_from_frame(
+    frame: pd.DataFrame,
+    value_col: str,
+    label_col: str | None = None,
+    tallos_col: str = "tallos_confirmados",
+) -> tuple[list[dict[str, str]], list[str]]:
+    if frame.empty or value_col not in frame.columns or tallos_col not in frame.columns:
+        return [], []
+    label_col = label_col if label_col and label_col in frame.columns else value_col
+    work = frame.copy()
+    work["_option_value"] = work[value_col].astype(str)
+    work["_option_label"] = work[label_col].astype(str)
+    work = work[~work["_option_value"].str.strip().str.lower().isin({"", "nan", "none"})]
+    if work.empty:
+        return [], []
+    grouped = (
+        work.groupby("_option_value", as_index=False)
+        .agg(label=("_option_label", "first"), tallos=(tallos_col, "sum"))
+        .sort_values("tallos", ascending=False)
+    )
+    options = [
+        {"label": f"{row['label']} | {moneyless_number(row['tallos'], 0)} tallos", "value": row["_option_value"]}
+        for row in grouped.to_dict("records")
+    ]
+    return options, grouped["_option_value"].astype(str).tolist()
 
 
 def normalize_operational_type(series: pd.Series) -> pd.Series:
@@ -4207,7 +4899,7 @@ def enrich_visual_with_sku_summary(data: dict[str, pd.DataFrame], frame: pd.Data
 def filter_visual_operational_base(
     data: dict[str, pd.DataFrame],
     filtered: pd.DataFrame,
-    selected_code: str | None,
+    selected_code: str | list[str] | None,
     years: list[int] | None,
     week_range: list[int] | None,
     tipo_filter: list[str] | None,
@@ -4216,8 +4908,9 @@ def filter_visual_operational_base(
     sku_filter: str | list[str] | None,
 ) -> pd.DataFrame:
     hist = data.get("historico_visualizador_comercial", data.get("historico_confirmado", pd.DataFrame()))
-    if hist.empty and selected_code:
-        hist = read_client_sku_week_from_sql(selected_code)
+    selected_codes = selected_values(selected_code)
+    if hist.empty and selected_codes:
+        hist = read_client_sku_week_many_from_sql(selected_codes)
     if hist.empty:
         return pd.DataFrame()
     needed = [
@@ -4225,7 +4918,8 @@ def filter_visual_operational_base(
         "tipo_pedido_operativo", "producto", "familia_analisis_operativa", "variedad", "color",
         "tipo_caja", "tallos_x_ramo", "capuchon", "comida", "empaque", "caja_operativa",
         "subtipo_pedido_operativo", "tipo_orden_empaque", "tipo_empaque", "receta", "codempaque", "bulkbouquet",
-        "tallos_analisis", "tallos_confirmados", "ventas_usd", "valor_total_original",
+        "tallos_analisis", "tallos_pedidos", "tallos_historicos", "tallos_confirmados", "ventas_usd", "valor_total_original",
+        "pedidos", "cajas",
         "moneda_original", "sku_operativo", "sku_terminado", "sku_composicion", "receta_estructura_key",
         "receta_programa_key", "receta_programa_tamano_key", "producto_color",
     ]
@@ -4244,8 +4938,8 @@ def filter_visual_operational_base(
             out[col] = 0
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
     valid_codes = set(filtered["cod_cliente"].astype(str)) if not filtered.empty and "cod_cliente" in filtered.columns else set()
-    if selected_code and "cod_cliente" in out.columns:
-        out = out[out["cod_cliente"].astype(str).eq(str(selected_code))].copy()
+    if selected_codes and "cod_cliente" in out.columns:
+        out = out[out["cod_cliente"].astype(str).isin(set(selected_codes))].copy()
     elif valid_codes and "cod_cliente" in out.columns:
         out = out[out["cod_cliente"].astype(str).isin(valid_codes)].copy()
     if years and "anio" in out.columns:
@@ -4816,6 +5510,7 @@ def filter_general_sales_frame(
     products: list[str] | None,
     countries: list[str] | None = None,
     companies: list[str] | None = None,
+    colors: list[str] | None = None,
 ) -> pd.DataFrame:
     """Filter the pre-aggregated weekly sales source used by the fast view."""
     if frame.empty:
@@ -4837,6 +5532,9 @@ def filter_general_sales_frame(
     selected_products = selected_values(products)
     if selected_products and "producto" in out.columns:
         out = out[out["producto"].astype(str).isin(selected_products)].copy()
+    selected_colors = selected_values(colors)
+    if selected_colors and "color" in out.columns:
+        out = out[out["color"].astype(str).isin(selected_colors)].copy()
     if "anio_semana" in out.columns and "week_start" not in out.columns and "semana_iso" in out.columns:
         out["week_start"] = pd.to_datetime(
             out["anio"].astype(str) + "-W" + pd.to_numeric(out["semana_iso"], errors="coerce").fillna(1).astype(int).astype(str).str.zfill(2) + "-1",
@@ -5171,6 +5869,7 @@ def render_ventas_generales_tab(
     week_range: list[int] | None,
     clients: list[str] | None,
     products: list[str] | None,
+    colors: list[str] | None = None,
 ) -> html.Div:
     """Present sales totals from the weekly aggregate without recipe-level detail."""
     sales = data.get("ventas_semana", pd.DataFrame())
@@ -5179,7 +5878,7 @@ def render_ventas_generales_tab(
             "No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.",
             className="table-panel",
         )
-    view = filter_general_sales_frame(sales, years, week_range, clients, products)
+    view = filter_general_sales_frame(sales, years, week_range, clients, products, colors=colors)
     if view.empty:
         return html.Div("No hay ventas para los filtros seleccionados.", className="table-panel")
 
@@ -5250,6 +5949,7 @@ def render_ventas_generales_tab(
                             make_card("Semanas ISO", weeks_text, "filtro activo"),
                             make_card("Clientes", selected_label(clients, "Todos"), "filtro activo"),
                             make_card("Productos", selected_label(products, "Todos"), "filtro activo"),
+                            make_card("Colores", selected_label(colors, "Todos"), "filtro activo"),
                         ],
                         className="metrics-grid",
                     ),
@@ -5623,14 +6323,17 @@ def sales_scope_summary(
     products: list[str] | None,
     countries: list[str] | None = None,
     companies: list[str] | None = None,
+    colors: list[str] | None = None,
 ) -> dict[str, str]:
     client_count = view["cod_cliente"].nunique() if "cod_cliente" in view.columns else 0
     product_count = view["producto"].nunique() if "producto" in view.columns else 0
+    color_count = view["color"].nunique() if "color" in view.columns else 0
     company_count = view["NomCompania"].nunique() if "NomCompania" in view.columns else 0
     selected_clients = selected_values(clients)
     selected_products = selected_values(products)
     selected_countries = selected_values(countries)
     selected_companies = selected_values(companies)
+    selected_colors = selected_values(colors)
     if selected_clients and {"cod_cliente", "cliente"}.issubset(view.columns):
         names = (
             view[["cod_cliente", "cliente"]]
@@ -5646,6 +6349,7 @@ def sales_scope_summary(
     else:
         client_label = f"Todos los clientes visibles ({moneyless_number(client_count)})"
     product_label = selected_label(selected_products, f"Todos los productos visibles ({moneyless_number(product_count)})")
+    color_label = selected_label(selected_colors, f"Todos los colores visibles ({moneyless_number(color_count)})")
     country_count = view["pais"].nunique() if "pais" in view.columns else 0
     country_label = selected_label(selected_countries, f"Todos los paises visibles ({moneyless_number(country_count)})")
     company_label = selected_label(selected_companies, f"Todas las companias visibles ({moneyless_number(company_count)})")
@@ -5653,10 +6357,12 @@ def sales_scope_summary(
         "clientes": client_label,
         "companias": company_label,
         "productos": product_label,
+        "colores": color_label,
         "paises": country_label,
         "clientes_count": moneyless_number(client_count),
         "companias_count": moneyless_number(company_count),
         "productos_count": moneyless_number(product_count),
+        "colores_count": moneyless_number(color_count),
         "paises_count": moneyless_number(country_count),
     }
 
@@ -6284,13 +6990,14 @@ def render_ventas_generales_tab_v2(
     clients: list[str] | None,
     countries: list[str] | None,
     products: list[str] | None,
+    colors: list[str] | None,
 ) -> html.Div:
     """Executive sales tab with yearly comparison and weekly context."""
     sales = data.get("ventas_semana", pd.DataFrame())
     if sales.empty:
         return html.Div("No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.", className="table-panel")
 
-    view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies)
+    view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors)
     if view.empty:
         available_years = sorted(pd.to_numeric(sales["anio"], errors="coerce").dropna().astype(int).unique().tolist()) if "anio" in sales.columns else []
         years_text = ", ".join(map(str, available_years)) if available_years else "sin anos disponibles"
@@ -6299,7 +7006,7 @@ def render_ventas_generales_tab_v2(
                 html.Div("Ventas generales", className="panel-title"),
                 panel_note(
                     f"No hay ventas para los filtros seleccionados. AÃ±os disponibles en esta base: {years_text}. "
-                    "Revisa el rango de semanas, el cliente o el producto seleccionado."
+                    "Revisa el rango de semanas, cliente, producto o color seleccionado."
                 ),
             ],
             className="table-panel",
@@ -6343,6 +7050,13 @@ def render_ventas_generales_tab_v2(
                 type="button",
                 className="executive-button primary",
             ),
+            html.Button(
+                "Base cruda CSV",
+                id="general-sales-export-raw",
+                n_clicks=0,
+                type="button",
+                className="executive-button secondary",
+            ),
         ],
         className="executive-button-group",
     )
@@ -6361,7 +7075,7 @@ def render_ventas_generales_tab_v2(
         context.get("compare_year", compare_year or 0),
         rows=20,
     )
-    scope = sales_scope_summary(view, clients, products, countries, companies)
+    scope = sales_scope_summary(view, clients, products, countries, companies, colors)
     logo_uri = logo_data_uri()
     strategic_items = context["insights"] if context.get("ok") else ["No hay suficientes datos para construir la comparacion ejecutiva."]
     strategic_cards = [
@@ -6378,6 +7092,12 @@ def render_ventas_generales_tab_v2(
     client_table_title = "Companias de mayor a menor facturacion" if not selected_clients else "Companias seleccionadas"
     client_table_note = "Orden descendente por facturacion dentro del filtro actual. La tabla tambien permite ordenar manualmente." if not selected_clients else "Resumen de las companias seleccionadas dentro del filtro actual."
     client_table = client_sales_display(view, rows=30, ascending=False)
+    product_week_matrix = sales_product_week_matrix_display(view, selected_clients)
+    product_week_note = (
+        "Cliente seleccionado: productos en filas y semanas en columnas, con tallos confirmados."
+        if len(selected_clients) == 1
+        else "Sin un unico cliente seleccionado se separa por cliente y producto para evitar mezclar portafolios."
+    )
     country_growth_table = growth_by_dimension_display(
         view,
         context.get("base_year", base_year or 0),
@@ -6561,6 +7281,14 @@ def render_ventas_generales_tab_v2(
                 ],
                 className="table-panel section-gap",
             ),
+            html.Div(
+                [
+                    html.Div("Tallos confirmados por producto y semana", className="panel-title"),
+                    panel_note(product_week_note),
+                    make_table(product_week_matrix, 15, sort_by=[{"column_id": "Total", "direction": "desc"}], table_id="ventas-producto-semana-matriz"),
+                ],
+                className="table-panel section-gap",
+            ),
         ],
         className="sales-executive-panel",
     )
@@ -6603,9 +7331,10 @@ def render_visualizador_clientes_general(
     color_view: str = "period_total",
     internal_detail: str = "color",
 ):
-    if selected_code is None:
+    selected_codes = selected_values(selected_code)
+    if not selected_codes:
         return html.Div(
-            "Selecciona un cliente para cargar el visualizador detallado. La consulta se ejecuta solo por cliente para evitar traer todo el historico.",
+            "Selecciona uno o varios clientes para cargar el visualizador detallado.",
             className="table-panel",
         )
 

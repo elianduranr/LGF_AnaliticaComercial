@@ -136,6 +136,7 @@ def materialize_aggregates(conn) -> None:
             MAX(pais) AS pais,
             tipo_pedido_operativo,
             producto,
+            color,
             MAX(moneda_original) AS moneda_original,
             CAST(SUM(COALESCE(tallos_confirmados, 0)) AS DECIMAL(20,4)) AS tallos_confirmados,
             CAST(SUM(COALESCE(tallos_analisis, 0)) AS DECIMAL(20,4)) AS tallos_analisis,
@@ -147,7 +148,7 @@ def materialize_aggregates(conn) -> None:
             CAST(SUM(COALESCE(ventas_usd, 0)) / NULLIF(SUM(COALESCE(tallos_confirmados, 0)), 0) AS DECIMAL(18,6)) AS precio_usd_tallo
         INTO op_sales.agg_sales_week_client_product
         FROM op_sales.fact_sales_line
-        GROUP BY anio, semana_iso, anio_semana, cod_cliente, tipo_pedido_operativo, producto;
+        GROUP BY anio, semana_iso, anio_semana, cod_cliente, tipo_pedido_operativo, producto, color;
         """
     )
     print("Materializando op_sales.agg_client_sku_week", flush=True)
@@ -225,6 +226,7 @@ def materialize_aggregates(conn) -> None:
         "CREATE INDEX IX_agg_sales_week ON op_sales.agg_sales_week_client_product (anio, semana_iso);",
         "CREATE INDEX IX_agg_sales_client_week ON op_sales.agg_sales_week_client_product (cod_cliente, anio, semana_iso);",
         "CREATE INDEX IX_agg_sales_product_week ON op_sales.agg_sales_week_client_product (producto, anio, semana_iso);",
+        "CREATE INDEX IX_agg_sales_color_week ON op_sales.agg_sales_week_client_product (color, anio, semana_iso);",
         "CREATE INDEX IX_agg_client_sku_client_week ON op_sales.agg_client_sku_week (cod_cliente, anio, semana_iso);",
         "CREATE INDEX IX_agg_client_sku_client_sku ON op_sales.agg_client_sku_week (cod_cliente, sku_operativo);",
         "CREATE INDEX IX_agg_client_sku_product_color ON op_sales.agg_client_sku_week (producto, color, anio, semana_iso);",
