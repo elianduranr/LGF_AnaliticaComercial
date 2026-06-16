@@ -782,13 +782,13 @@ def render_admin_tab() -> html.Div:
             html.Div(
                 [
                     html.Div("Nueva carga", className="panel-title"),
-                    panel_note("Clave visible temporal: 142806. El rango se inicializa con el siguiente dia sugerido segun SQL."),
+                    panel_note("Ingresa la clave de administrador. El rango se inicializa con el siguiente dia sugerido segun SQL."),
                     html.Div(
                         [
                             html.Div(
                                 [
                                     html.Label("Contrasena"),
-                                    dcc.Input(id="admin-password", type="text", value="", placeholder="142806", className="admin-input"),
+                                    dcc.Input(id="admin-password", type="password", value="", placeholder="Clave de administrador", className="admin-input"),
                                 ],
                                 className="demand-control",
                             ),
@@ -2936,7 +2936,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if not dry_clicks and not run_clicks:
             return dash.no_update
         if str(password or "").strip() != ADMIN_PASSWORD:
-            return "Contrasena incorrecta. Usa 142806."
+            return "Contrasena incorrecta."
         if not start_date or not end_date:
             return "Selecciona fecha inicial y fecha final."
         start = pd.to_datetime(start_date, errors="coerce")
