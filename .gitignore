@@ -6,6 +6,7 @@
 # Configuración sensible
 # Datos y salidas
 # Entornos virtuales
+carac_clients/
 # Python
 **/_cache/
 *.bak
