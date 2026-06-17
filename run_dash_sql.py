@@ -9,13 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 os.environ["OP_SALES_USE_SQL_SERVER"] = "1"
+host = os.environ.get("LGF_DASH_HOST", "0.0.0.0")
+port = os.environ.get("LGF_DASH_PORT", "8085")
 warnings.filterwarnings(
     "ignore",
     message="pandas only supports SQLAlchemy connectable",
     category=UserWarning,
 )
-print("Cargando dashboard desde SQL Server. Puede tardar 1-2 minutos antes de abrir el puerto 8085.", flush=True)
-print("Cuando termine la carga, abre http://127.0.0.1:8085 o http://<IP_LAN>:8085", flush=True)
+print(f"Cargando dashboard desde SQL Server. Puede tardar 1-2 minutos antes de abrir el puerto {port}.", flush=True)
+print(f"Cuando termine la carga, abre http://127.0.0.1:{port} o http://<IP_LAN>:{port}", flush=True)
 sys.argv = [
     "app_dash.py",
     "--data-dir",
@@ -23,9 +25,9 @@ sys.argv = [
     "--forecast-dir",
     "resultados/forecast_solidos",
     "--host",
-    "0.0.0.0",
+    host,
     "--port",
-    "8085",
+    port,
 ]
 try:
     runpy.run_path(str(ROOT / "app_dash.py"), run_name="__main__")

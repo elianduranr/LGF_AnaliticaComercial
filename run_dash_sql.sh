@@ -17,10 +17,23 @@ done < "configurar_credenciales.local.ps1"
 export OP_SALES_USE_SQL_SERVER=1
 export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
 
-PYTHON_EXE="${PYTHON_EXE:-C:/Users/LGF/miniconda3/envs/SDG_env/python.exe}"
+if [[ -n "${LGF_PYTHON:-}" ]]; then
+  PYTHON_EXE="$LGF_PYTHON"
+elif [[ -x ".venv/Scripts/python.exe" ]]; then
+  PYTHON_EXE=".venv/Scripts/python.exe"
+elif [[ -x "carac_clients/Scripts/python.exe" ]]; then
+  PYTHON_EXE="carac_clients/Scripts/python.exe"
+elif [[ -x "$USERPROFILE/miniconda3/envs/SDG_env/python.exe" ]]; then
+  PYTHON_EXE="$USERPROFILE/miniconda3/envs/SDG_env/python.exe"
+else
+  PYTHON_EXE="python"
+fi
+
+DASH_HOST="${LGF_DASH_HOST:-0.0.0.0}"
+DASH_PORT="${LGF_DASH_PORT:-8085}"
 
 "$PYTHON_EXE" app_dash.py \
   --data-dir "resultados/descriptivos" \
   --forecast-dir "resultados/forecast_solidos" \
-  --host 0.0.0.0 \
-  --port 8085
+  --host "$DASH_HOST" \
+  --port "$DASH_PORT"
