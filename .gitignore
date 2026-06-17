@@ -2,6 +2,7 @@
 
 # Configuración sensible
 .env
+configurar_credenciales.local.ps1
 
 # Entornos virtuales
 .venv/
@@ -30,6 +31,8 @@ outputs_*/
 *.pkl
 *.sqlite
 *.xlsx
+!referencias/
+!referencias/Master_table_varieties.xlsx
 
 # Outputs específicos
 outputs_descriptivo/_cache/

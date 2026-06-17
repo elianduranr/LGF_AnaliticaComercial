@@ -17,8 +17,10 @@ done < "configurar_credenciales.local.ps1"
 export OP_SALES_USE_SQL_SERVER=1
 export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
 
-./carac_clients/Scripts/python.exe app_dash.py \
+PYTHON_EXE="${PYTHON_EXE:-C:/Users/LGF/miniconda3/envs/SDG_env/python.exe}"
+
+"$PYTHON_EXE" app_dash.py \
   --data-dir "resultados/descriptivos" \
   --forecast-dir "resultados/forecast_solidos" \
-  --host 127.0.0.1 \
-  --port 8050
+  --host 0.0.0.0 \
+  --port 8085

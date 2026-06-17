@@ -20,6 +20,10 @@ import pandas as pd
 
 from .cleaning import clean_historical_orders
 from .io_utils import read_table
+from .local_env import load_local_credentials
+
+
+load_local_credentials()
 
 
 SQL_TABLE = "op_sales.fact_sales_line"
@@ -260,6 +264,7 @@ def _print_summary(label: str, frame: pd.DataFrame, verbose: bool = True) -> Non
 
 
 def connection_string_from_env() -> str:
+    load_local_credentials()
     explicit = os.getenv("OP_SALES_CONN_STR")
     if explicit:
         if "Encrypt=" not in explicit and "encrypt=" not in explicit:
@@ -280,13 +285,9 @@ def connection_string_from_env() -> str:
             "El valor recomendado para este proyecto es OP_SALES_SQL_SERVER=192.168.1.22."
         )
     if not user or not password:
-        return (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            "Trusted_Connection=yes;"
-            "Encrypt=no;"
-            "TrustServerCertificate=yes;"
+        raise RuntimeError(
+            "Faltan OP_SALES_SQL_USER y OP_SALES_SQL_PASSWORD. "
+            "Revisa configurar_credenciales.local.ps1; no se intentara autenticacion Windows."
         )
     return (
         f"DRIVER={{{driver}}};"
@@ -300,6 +301,7 @@ def connection_string_from_env() -> str:
 
 
 def get_connection():
+    load_local_credentials()
     try:
         import pyodbc
     except ImportError as exc:

@@ -14,8 +14,8 @@ warnings.filterwarnings(
     message="pandas only supports SQLAlchemy connectable",
     category=UserWarning,
 )
-print("Cargando dashboard desde SQL Server. Puede tardar 1-2 minutos antes de abrir el puerto 8050.", flush=True)
-print("Cuando termine la carga, abre http://127.0.0.1:8050", flush=True)
+print("Cargando dashboard desde SQL Server. Puede tardar 1-2 minutos antes de abrir el puerto 8085.", flush=True)
+print("Cuando termine la carga, abre http://127.0.0.1:8085 o http://<IP_LAN>:8085", flush=True)
 sys.argv = [
     "app_dash.py",
     "--data-dir",
@@ -23,9 +23,9 @@ sys.argv = [
     "--forecast-dir",
     "resultados/forecast_solidos",
     "--host",
-    "127.0.0.1",
+    "0.0.0.0",
     "--port",
-    "8050",
+    "8085",
 ]
 try:
     runpy.run_path(str(ROOT / "app_dash.py"), run_name="__main__")

@@ -12,10 +12,13 @@ import base64
 import io
 import math
 import os
+import queue
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -34,6 +37,11 @@ from dash import ctx
 from dash import dash_table
 from dash import dcc
 from dash import html
+
+from src.lgf_operativo.local_env import load_local_credentials
+
+
+load_local_credentials()
 
 
 DEFAULT_DATA_DIR = Path("resultados") / "descriptivos"
@@ -625,6 +633,207 @@ def read_client_sku_week_many_from_sql(client_codes: list[str]) -> pd.DataFrame:
 ADMIN_PASSWORD = "142806"
 
 
+ADMIN_ETL_JOB_LOCK = threading.RLock()
+ADMIN_ETL_JOBS: dict[str, dict[str, object]] = {}
+ADMIN_ETL_MAX_LINES = 220
+
+
+def admin_job_timestamp() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def admin_format_duration(seconds: float | int | None) -> str:
+    total = max(0, int(seconds or 0))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def admin_parse_progress_fraction(line: str) -> float | None:
+    clean = str(line)
+    patterns = [
+        r"(?:lote|periodo|bloque)\s+([\d.,]+)\s*/\s*([\d.,]+)",
+        r"([\d.,]+)\s*/\s*([\d.,]+)\s+filas",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, clean, flags=re.IGNORECASE)
+        if not match:
+            continue
+        current = re.sub(r"\D", "", match.group(1))
+        total = re.sub(r"\D", "", match.group(2))
+        if not current or not total:
+            continue
+        total_value = int(total)
+        if total_value <= 0:
+            continue
+        return min(1.0, max(0.0, int(current) / total_value))
+    return None
+
+
+def admin_job_create(initial_lines: list[str], step_titles: list[str]) -> str:
+    job_id = f"admin-etl-{int(time.time() * 1000)}"
+    with ADMIN_ETL_JOB_LOCK:
+        ADMIN_ETL_JOBS[job_id] = {
+            "lines": list(initial_lines),
+            "steps": [
+                {
+                    "title": title,
+                    "status": "pending",
+                    "percent": 0.0,
+                    "started_at": None,
+                    "finished_at": None,
+                }
+                for title in step_titles
+            ],
+            "current_step": None,
+            "status": "running",
+            "started_at": time.time(),
+            "finished_at": None,
+        }
+    return job_id
+
+
+def admin_job_append(job_id: str, line: str = "") -> None:
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return
+        lines = job.setdefault("lines", [])
+        if isinstance(lines, list):
+            lines.append(f"[{admin_job_timestamp()}] {line}" if line else "")
+            if len(lines) > ADMIN_ETL_MAX_LINES:
+                del lines[: len(lines) - ADMIN_ETL_MAX_LINES]
+
+
+def admin_job_finish(job_id: str, status: str) -> None:
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = status
+        job["finished_at"] = time.time()
+
+
+def admin_job_start_step(job_id: str, step_index: int) -> None:
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return
+        steps = job.get("steps")
+        if not isinstance(steps, list) or not (0 <= step_index < len(steps)):
+            return
+        step = steps[step_index]
+        if not isinstance(step, dict):
+            return
+        step["status"] = "running"
+        step["percent"] = max(float(step.get("percent") or 0), 0.02)
+        step["started_at"] = time.time()
+        step["finished_at"] = None
+        job["current_step"] = step_index
+
+
+def admin_job_update_current_step_progress(job_id: str, fraction: float) -> None:
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return
+        step_index = job.get("current_step")
+        steps = job.get("steps")
+        if not isinstance(step_index, int) or not isinstance(steps, list) or not (0 <= step_index < len(steps)):
+            return
+        step = steps[step_index]
+        if not isinstance(step, dict) or step.get("status") != "running":
+            return
+        step["percent"] = min(0.98, max(float(step.get("percent") or 0), float(fraction)))
+
+
+def admin_job_finish_step(job_id: str, step_index: int, ok: bool) -> None:
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return
+        steps = job.get("steps")
+        if not isinstance(steps, list) or not (0 <= step_index < len(steps)):
+            return
+        step = steps[step_index]
+        if not isinstance(step, dict):
+            return
+        step["status"] = "done" if ok else "error"
+        step["percent"] = 1.0 if ok else max(float(step.get("percent") or 0), 0.0)
+        step["finished_at"] = time.time()
+        if job.get("current_step") == step_index:
+            job["current_step"] = None
+
+
+def admin_job_progress_lines(job: dict[str, object]) -> list[str]:
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return []
+    now = time.time()
+    percents = [float(step.get("percent") or 0) for step in steps if isinstance(step, dict)]
+    total_percent = sum(percents) / len(steps) * 100 if percents else 0
+    lines = [
+        f"Avance total: {total_percent:5.1f}% | Tiempo total: {admin_format_duration(now - float(job.get('started_at') or now))}",
+        "",
+    ]
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            continue
+        status = str(step.get("status") or "pending")
+        label = {"pending": "PENDIENTE", "running": "EN CURSO", "done": "OK", "error": "ERROR"}.get(status, status.upper())
+        started = step.get("started_at")
+        finished = step.get("finished_at")
+        elapsed = 0
+        if isinstance(started, (int, float)):
+            elapsed = (float(finished) if isinstance(finished, (int, float)) else now) - float(started)
+        percent = float(step.get("percent") or 0) * 100
+        lines.append(f"[{label:<9}] {percent:5.1f}% | {admin_format_duration(elapsed):>8} | Paso {index}/{len(steps)}: {step.get('title')}")
+    return lines
+
+
+def admin_job_snapshot(job_id: str | None) -> tuple[str, bool]:
+    if not job_id:
+        return "", True
+    with ADMIN_ETL_JOB_LOCK:
+        job = ADMIN_ETL_JOBS.get(job_id)
+        if not job:
+            return "No hay una ejecucion activa.", True
+        progress_lines = admin_job_progress_lines(job)
+        lines = list(job.get("lines") or [])
+        done = job.get("status") != "running"
+    output = [*progress_lines, "", "Detalle:", *[str(line) for line in lines]]
+    return "\n".join(output), bool(done)
+
+
+def admin_job_log_process_output(job_id: str, line: str, index: int) -> None:
+    clean = re.sub(r"\s+", " ", str(line)).strip()
+    if not clean:
+        return
+    lower = clean.lower()
+    important = any(
+        token in lower
+        for token in [
+            "error",
+            "exception",
+            "traceback",
+            "filas",
+            "rows",
+            "insert",
+            "delete",
+            "batch",
+            "lote",
+            "carga",
+            "termin",
+            "valid",
+        ]
+    )
+    if important or index <= 6 or index % 25 == 0:
+        admin_job_append(job_id, f"  {clean[:260]}")
+    fraction = admin_parse_progress_fraction(clean)
+    if fraction is not None:
+        admin_job_update_current_step_progress(job_id, fraction)
+
+
 def admin_sql_status() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """Read operational SQL coverage and latest ETL batches for the admin tab."""
     try:
@@ -705,19 +914,137 @@ def admin_sql_status() -> tuple[pd.DataFrame, pd.DataFrame, str]:
         return pd.DataFrame(), pd.DataFrame(), f"No se pudo leer SQL Server: {exc}"
 
 
-def admin_run_command(command: list[str], timeout_seconds: int = 7200) -> tuple[int, str]:
+def admin_run_command(command: list[str], job_id: str | None = None, timeout_seconds: int = 7200) -> tuple[int, str]:
+    load_local_credentials()
     env = os.environ.copy()
+    env.update(load_local_credentials())
     env["OP_SALES_USE_SQL_SERVER"] = "1"
-    completed = subprocess.run(
+    started = time.monotonic()
+    process = subprocess.Popen(
         command,
         cwd=Path.cwd(),
         env=env,
         text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
-    output = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
-    return completed.returncode, output.strip()
+    output_lines: list[str] = []
+    output_queue: queue.Queue[str] = queue.Queue()
+
+    def read_process_output() -> None:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            output_queue.put(line.rstrip())
+
+    reader = threading.Thread(target=read_process_output, daemon=True)
+    reader.start()
+    output_index = 0
+    try:
+        while True:
+            try:
+                clean_line = output_queue.get(timeout=0.2)
+                output_lines.append(clean_line)
+                output_index += 1
+                if job_id:
+                    admin_job_log_process_output(job_id, clean_line, output_index)
+            except queue.Empty:
+                pass
+            if process.poll() is not None:
+                break
+            if time.monotonic() - started > timeout_seconds:
+                process.kill()
+                raise subprocess.TimeoutExpired(command, timeout_seconds, output="\n".join(output_lines))
+            time.sleep(0.2)
+    finally:
+        reader.join(timeout=1)
+        while True:
+            try:
+                output_lines.append(output_queue.get_nowait())
+            except queue.Empty:
+                break
+        if process.stdout is not None:
+            process.stdout.close()
+    return int(process.returncode or 0), "\n".join(output_lines).strip()
+
+
+def run_admin_etl_job(
+    job_id: str,
+    commands: list[tuple[str, list[str]]],
+    is_dry_run: bool,
+    data: dict[str, pd.DataFrame],
+    data_dir: Path,
+    forecast_dir: Path | None,
+) -> None:
+    final_status = "done"
+    try:
+        for step_number, (title, command) in enumerate(commands, start=1):
+            step_index = step_number - 1
+            admin_job_start_step(job_id, step_index)
+            admin_job_append(job_id, "")
+            admin_job_append(job_id, f"Paso {step_number}/{len(commands)}: {title}")
+            admin_job_append(job_id, f"Comando: {' '.join(command)}")
+            try:
+                code, output = admin_run_command(command, job_id=job_id)
+            except subprocess.TimeoutExpired as exc:
+                partial = "\n".join(part for part in [getattr(exc, "stdout", "") or getattr(exc, "output", "") or "", exc.stderr or ""] if part)
+                if partial:
+                    admin_job_append(job_id, "Salida parcial antes del timeout:")
+                    for line in partial.splitlines()[-12:]:
+                        admin_job_append(job_id, f"  {line[:260]}")
+                admin_job_append(job_id, "ERROR: tiempo maximo agotado.")
+                admin_job_finish_step(job_id, step_index, False)
+                admin_job_finish(job_id, "error")
+                return
+            except Exception as exc:
+                admin_job_append(job_id, f"ERROR ejecutando comando: {exc}")
+                admin_job_finish_step(job_id, step_index, False)
+                admin_job_finish(job_id, "error")
+                return
+
+            admin_job_append(job_id, f"Codigo de salida: {code}")
+            if code != 0:
+                if output:
+                    admin_job_append(job_id, "Ultimas lineas del proceso:")
+                    for line in output.splitlines()[-12:]:
+                        admin_job_append(job_id, f"  {line[:260]}")
+                admin_job_append(job_id, "Proceso detenido por error. SQL no queda marcado como listo hasta corregir este punto.")
+                admin_job_finish_step(job_id, step_index, False)
+                admin_job_finish(job_id, "error")
+                return
+            admin_job_finish_step(job_id, step_index, True)
+
+        if not is_dry_run:
+            admin_job_append(job_id, "")
+            admin_job_append(job_id, "Recargando datos del Dash en memoria...")
+            try:
+                data.clear()
+                data.update(load_data(data_dir, forecast_dir))
+                admin_job_append(job_id, "Datos del Dash recargados en memoria.")
+            except Exception as exc:
+                admin_job_append(job_id, f"La carga termino, pero no se pudo recargar el Dash en memoria: {exc}")
+                admin_job_append(job_id, "Reinicia el Dash para ver todos los cambios.")
+                final_status = "warning"
+
+        admin_job_append(job_id, "")
+        admin_job_append(job_id, "Consultando estado SQL despues del proceso...")
+        coverage, batches, status_error = admin_sql_status()
+        if status_error:
+            admin_job_append(job_id, status_error)
+            final_status = "warning"
+        elif not coverage.empty:
+            rows = coverage.attrs.get("filas", 0)
+            loaded_to = coverage.attrs.get("fecha_max", "")
+            admin_job_append(job_id, f"SQL actualizado hasta: {loaded_to or 'Sin datos'} | filas: {moneyless_number(rows, 0)}")
+            if not batches.empty:
+                latest = batches.head(1).to_dict("records")[0]
+                admin_job_append(job_id, f"Ultima carga: {latest.get('Estado', '')} | insertadas: {latest.get('Filas insertadas', '')}")
+
+        admin_job_append(job_id, "Listo para trabajar." if not is_dry_run else "Validacion terminada; no se escribio en SQL.")
+        admin_job_finish(job_id, final_status)
+    except Exception as exc:
+        admin_job_append(job_id, f"ERROR inesperado en ejecucion Admin: {exc}")
+        admin_job_finish(job_id, "error")
 
 
 def render_admin_tab() -> html.Div:
@@ -781,6 +1108,8 @@ def render_admin_tab() -> html.Div:
             ),
             html.Div(
                 [
+                    dcc.Store(id="admin-run-job", data=None),
+                    dcc.Interval(id="admin-run-poll", interval=1000, n_intervals=0, disabled=True),
                     html.Div("Nueva carga", className="panel-title"),
                     panel_note("Ingresa la clave de administrador. El rango se inicializa con el siguiente dia sugerido segun SQL."),
                     html.Div(
@@ -2921,7 +3250,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         return dcc.send_bytes(report_pdf, filename=filename)
 
     @app.callback(
-        Output("admin-run-output", "children"),
+        Output("admin-run-job", "data"),
         Input("admin-dry-run", "n_clicks"),
         Input("admin-run-etl", "n_clicks"),
         State("admin-password", "value"),
@@ -2930,27 +3259,36 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         State("admin-split-by", "value"),
         State("admin-chunk-size", "value"),
         State("admin-extra-actions", "value"),
+        State("admin-run-job", "data"),
         prevent_initial_call=True,
     )
-    def run_admin_etl(dry_clicks, run_clicks, password, start_date, end_date, split_by, chunk_size, extra_actions):
+    def start_admin_etl(dry_clicks, run_clicks, password, start_date, end_date, split_by, chunk_size, extra_actions, current_job):
         if not dry_clicks and not run_clicks:
             return dash.no_update
         if str(password or "").strip() != ADMIN_PASSWORD:
-            return "Contrasena incorrecta."
+            return {"message": "Contrasena incorrecta."}
         if not start_date or not end_date:
-            return "Selecciona fecha inicial y fecha final."
+            return {"message": "Selecciona fecha inicial y fecha final."}
         start = pd.to_datetime(start_date, errors="coerce")
         end = pd.to_datetime(end_date, errors="coerce")
         if pd.isna(start) or pd.isna(end):
-            return "Rango de fechas invalido."
+            return {"message": "Rango de fechas invalido."}
         if start > end:
-            return "La fecha inicial no puede ser mayor que la fecha final."
+            return {"message": "La fecha inicial no puede ser mayor que la fecha final."}
         try:
             chunk = int(chunk_size or 5000)
         except (TypeError, ValueError):
-            return "Filas por lote debe ser numerico."
+            return {"message": "Filas por lote debe ser numerico."}
         if chunk <= 0:
-            return "Filas por lote debe ser mayor que cero."
+            return {"message": "Filas por lote debe ser mayor que cero."}
+
+        with ADMIN_ETL_JOB_LOCK:
+            running_ids = [job_id for job_id, job in ADMIN_ETL_JOBS.items() if job.get("status") == "running"]
+        if running_ids:
+            current_job_id = current_job.get("job_id") if isinstance(current_job, dict) else None
+            job_id = current_job_id if current_job_id in running_ids else running_ids[0]
+            admin_job_append(job_id, "Ya hay una ejecucion en curso; se ignoro el nuevo clic.")
+            return {"job_id": job_id}
 
         start_text = start.strftime("%Y-%m-%d")
         end_text = end.strftime("%Y-%m-%d")
@@ -2985,6 +3323,10 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             "run_descriptivos.py",
                             "--source",
                             "sql",
+                            "--start-date",
+                            start_text,
+                            "--end-date",
+                            end_text,
                             "--output",
                             str(data_dir),
                             "--no-cache",
@@ -3010,6 +3352,10 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 materialize_command = [
                     sys.executable,
                     "materializar_op_sales_resultados_sql.py",
+                    "--start-date",
+                    start_text,
+                    "--end-date",
+                    end_text,
                     "--descriptivos-dir",
                     str(data_dir),
                     "--forecast-dir",
@@ -3019,53 +3365,36 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                     materialize_command.append("--skip-results")
                 commands.append(("Reconstruir agregados SQL del Dash", materialize_command))
 
-        logs = [
-            f"Administrador iniciado",
-            f"- rango: {start_text} a {end_text}",
-            f"- modo: {'validacion sin escritura' if is_dry_run else 'carga real'}",
-            f"- particion: {split}",
+        initial_lines = [
+            f"[{admin_job_timestamp()}] Administrador iniciado",
+            f"[{admin_job_timestamp()}] Rango: {start_text} a {end_text}",
+            f"[{admin_job_timestamp()}] Modo: {'validacion sin escritura' if is_dry_run else 'carga real'}",
+            f"[{admin_job_timestamp()}] Particion: {split}",
+            f"[{admin_job_timestamp()}] Pasos programados: {len(commands)}",
             "",
         ]
-        for title, command in commands:
-            logs.append(f"=== {title} ===")
-            logs.append(" ".join(command))
-            try:
-                code, output = admin_run_command(command)
-            except subprocess.TimeoutExpired as exc:
-                partial = "\n".join(part for part in [exc.stdout or "", exc.stderr or ""] if part)
-                logs.append(partial)
-                logs.append("ERROR: tiempo maximo agotado.")
-                return "\n".join(logs)
-            except Exception as exc:
-                logs.append(f"ERROR ejecutando comando: {exc}")
-                return "\n".join(logs)
-            if output:
-                logs.append(output)
-            logs.append(f"Codigo de salida: {code}")
-            logs.append("")
-            if code != 0:
-                logs.append("Proceso detenido por error. SQL no queda marcado como listo hasta corregir este punto.")
-                return "\n".join(logs)
+        job_id = admin_job_create(initial_lines, [title for title, _command in commands])
+        worker = threading.Thread(
+            target=run_admin_etl_job,
+            args=(job_id, commands, is_dry_run, data, data_dir, forecast_dir),
+            daemon=True,
+        )
+        worker.start()
+        return {"job_id": job_id}
 
-        if not is_dry_run:
-            try:
-                data.clear()
-                data.update(load_data(data_dir, forecast_dir))
-                logs.append("Datos del Dash recargados en memoria.")
-            except Exception as exc:
-                logs.append(f"La carga termino, pero no se pudo recargar el Dash en memoria: {exc}")
-                logs.append("Reinicia el Dash para ver todos los cambios.")
-        coverage, batches, status_error = admin_sql_status()
-        if status_error:
-            logs.append(status_error)
-        elif not coverage.empty:
-            logs.append("Estado SQL despues del proceso:")
-            logs.append(coverage.to_string(index=False))
-            if not batches.empty:
-                logs.append("Ultimas cargas:")
-                logs.append(batches.head(5).to_string(index=False))
-        logs.append("Listo para trabajar." if not is_dry_run else "Validacion terminada; no se escribio en SQL.")
-        return "\n".join(logs)
+    @app.callback(
+        Output("admin-run-output", "children"),
+        Output("admin-run-poll", "disabled"),
+        Input("admin-run-job", "data"),
+        Input("admin-run-poll", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def refresh_admin_etl_console(job_data, _n_intervals):
+        if isinstance(job_data, dict) and job_data.get("message"):
+            return str(job_data["message"]), True
+        job_id = job_data.get("job_id") if isinstance(job_data, dict) else None
+        text, done = admin_job_snapshot(job_id)
+        return text, done
 
     app.index_string = """
     <!DOCTYPE html>

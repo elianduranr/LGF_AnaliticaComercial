@@ -5,6 +5,11 @@ import numpy as np
 import pandas as pd
 import pyodbc
 
+from src.lgf_operativo.local_env import load_local_credentials
+
+
+load_local_credentials()
+
 ANIOS = list(range(2025, date.today().year + 1))
 CARPETA_SALIDA = Path.cwd()
 SOBRESCRIBIR = True
@@ -27,6 +32,7 @@ def rango_anio_iso(anio):
 
 
 def _conn_str_from_env(prefix, default_database, default_server=None, allow_trusted=False):
+    load_local_credentials()
     explicit = os.getenv(f"{prefix}_CONN_STR")
     if explicit:
         return explicit
@@ -39,17 +45,10 @@ def _conn_str_from_env(prefix, default_database, default_server=None, allow_trus
         raise RuntimeError(
             f"Falta {prefix}_SQL_SERVER o {prefix}_CONN_STR."
         )
-    if allow_trusted and (not user or not password):
-        return (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            "Trusted_Connection=yes;"
-            "TrustServerCertificate=yes;"
-        )
     if not user or not password:
         raise RuntimeError(
-            f"Faltan variables {prefix}_SQL_USER y {prefix}_SQL_PASSWORD o {prefix}_CONN_STR."
+            f"Faltan variables {prefix}_SQL_USER y {prefix}_SQL_PASSWORD o {prefix}_CONN_STR. "
+            "No se intentara autenticacion Windows."
         )
     return (
         f"DRIVER={{{driver}}};"
@@ -74,10 +73,15 @@ def conn_str_gaitana():
 
 
 def cargar_master_variedades(path=None):
-    default_path = Path(r"C:\Users\elian\OneDrive - LA GAITANA FARMS SAS\Sincronizacion_PDA") / "Master_table_varieties.xlsx"
+    project_root = Path(__file__).resolve().parents[1]
+    default_path = project_root / "referencias" / "Master_table_varieties.xlsx"
     source = Path(path or os.getenv("ETL_MASTER_VARIETIES_PATH", str(default_path)))
     if not source.exists():
-        raise FileNotFoundError(f"Archivo de variedades no encontrado: {source}")
+        raise FileNotFoundError(
+            f"Archivo de variedades no encontrado: {source}. "
+            "Define ETL_MASTER_VARIETIES_PATH o copia el archivo a "
+            f"{default_path}."
+        )
     master = pd.read_excel(source)
     return master.drop_duplicates(subset="VARIEDAD")
 
