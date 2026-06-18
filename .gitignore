@@ -2,7 +2,7 @@
 
 # Configuración sensible
 .env
-#configurar_credenciales.local.ps1
+configurar_credenciales.local.ps1
 
 # Entornos virtuales
 .venv/
