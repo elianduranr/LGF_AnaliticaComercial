@@ -23,7 +23,7 @@ else
   PYTHON_EXE="python"
 fi
 
-export OP_SALES_USE_SQL_SERVER="${OP_SALES_USE_SQL_SERVER:-1}"
+export OP_SALES_USE_SQL_SERVER="1"
 export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
 
 DASH_HOST="${LGF_DASH_HOST:-127.0.0.1}"

@@ -23,10 +23,8 @@ else
   PYTHON_EXE="python"
 fi
 
-SOURCE="${LGF_DATA_SOURCE:-sql}"
-
 "$PYTHON_EXE" run_descriptivos.py \
-  --source "$SOURCE" \
+  --source "sql" \
   --output "resultados/descriptivos" \
   --no-cache
 
