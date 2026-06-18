@@ -23,4 +23,5 @@ else
   PYTHON_EXE="python"
 fi
 
-"$PYTHON_EXE" run_descriptivos.py --output "resultados/descriptivos"
+"$PYTHON_EXE" run_descriptivos.py --output "resultados/descriptivos" --no-cache
+"$PYTHON_EXE" materializar_op_sales_resultados_sql.py --descriptivos-dir "resultados/descriptivos" --forecast-dir "resultados/forecast_solidos"

@@ -23,5 +23,14 @@ else
   PYTHON_EXE="python"
 fi
 
-"$PYTHON_EXE" run_forecast_solidos.py --output "resultados/forecast_solidos" --no-cache
-"$PYTHON_EXE" materializar_op_sales_resultados_sql.py --descriptivos-dir "resultados/descriptivos" --forecast-dir "resultados/forecast_solidos"
+export OP_SALES_USE_SQL_SERVER="${OP_SALES_USE_SQL_SERVER:-1}"
+export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
+
+DASH_HOST="${LGF_DASH_HOST:-127.0.0.1}"
+DASH_PORT="${LGF_DASH_PORT:-8050}"
+
+"$PYTHON_EXE" app_dash.py \
+  --data-dir "resultados/descriptivos" \
+  --forecast-dir "resultados/forecast_solidos" \
+  --host "$DASH_HOST" \
+  --port "$DASH_PORT"

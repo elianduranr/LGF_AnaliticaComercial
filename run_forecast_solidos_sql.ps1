@@ -17,4 +17,5 @@ if (-not $python) {
     }
 }
 
-& $python run_forecast_solidos.py --output "resultados/forecast_solidos"
+& $python run_forecast_solidos.py --output "resultados/forecast_solidos" --no-cache
+& $python materializar_op_sales_resultados_sql.py --descriptivos-dir "resultados/descriptivos" --forecast-dir "resultados/forecast_solidos"

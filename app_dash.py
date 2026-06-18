@@ -1110,7 +1110,16 @@ def render_admin_tab() -> html.Div:
                 [
                     dcc.Store(id="admin-run-job", data=None),
                     dcc.Interval(id="admin-run-poll", interval=1000, n_intervals=0, disabled=True),
-                    html.Div("Nueva carga", className="panel-title"),
+                    html.Div("Datos en memoria", className="panel-title"),
+                    panel_note("Recarga las tablas que el Dash ya consulta desde SQL sin ejecutar ETL ni pedir clave."),
+                    html.Div(
+                        [
+                            html.Button("Recargar datos del Dash", id="admin-refresh-data", n_clicks=0, type="button", className="executive-button secondary"),
+                            html.Div(id="admin-refresh-status", className="panel-note"),
+                        ],
+                        className="executive-button-group",
+                    ),
+                    html.Div("Nueva carga", className="panel-title section-gap"),
                     panel_note("Ingresa la clave de administrador. El rango se inicializa con el siguiente dia sugerido segun SQL."),
                     html.Div(
                         [
@@ -1192,6 +1201,17 @@ def render_admin_tab() -> html.Div:
         ],
         className="section-gap",
     )
+
+
+def build_client_dropdown_options(perfil: pd.DataFrame) -> list[dict[str, str]]:
+    if perfil.empty or "cod_cliente" not in perfil.columns:
+        return []
+    cols = [col for col in ["cod_cliente", "cliente"] if col in perfil.columns]
+    rows = perfil[cols].drop_duplicates("cod_cliente").head(5000)
+    return [
+        {"label": f"{row.cod_cliente}", "value": str(row.cod_cliente)}
+        for row in rows.itertuples(index=False)
+    ]
 
 
 def load_data(
@@ -1324,8 +1344,20 @@ def load_data(
         inventario_color = add_week_columns(inventario_color, "fecha_forecast")
 
     dashboard_db = DEFAULT_DASHBOARD_DB
+    use_sql_server = os.getenv("OP_SALES_USE_SQL_SERVER", "0").strip().lower() in {"1", "true", "yes", "si"}
     historico_visualizador_comercial = pd.DataFrame()
     historico_confirmado = pd.DataFrame()
+    if not use_sql_server:
+        historico_visualizador_comercial = read_csv_if_exists(
+            data_dir / "historico_visualizador_comercial.csv",
+            DESCRIPTIVE_DASH_COLUMNS["historico_visualizador_comercial"],
+            ["fecha"],
+        )
+        historico_confirmado = read_csv_if_exists(
+            data_dir / "historico_confirmado.csv",
+            DESCRIPTIVE_DASH_COLUMNS["historico_confirmado"],
+            ["fecha"],
+        )
     for history_frame in [historico_confirmado, historico_visualizador_comercial]:
         if history_frame.empty:
             continue
@@ -1714,10 +1746,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     if not perfil.empty:
         recommendation_options = [{"label": rec, "value": rec} for rec in sorted(perfil["recomendacion_compra"].dropna().unique())]
         segment_options = [{"label": seg, "value": seg} for seg in sorted(perfil["segmento_cliente"].dropna().unique())]
-        client_options = [
-            {"label": f"{row.cod_cliente}", "value": row.cod_cliente}
-            for row in perfil[["cod_cliente", "cliente"]].head(5000).itertuples(index=False)
-        ]
+        client_options = build_client_dropdown_options(perfil)
     ventas_source = data.get("ventas_semana", pd.DataFrame())
     if ventas_source.empty:
         ventas_source = data.get("ventas_producto", pd.DataFrame())
@@ -3248,6 +3277,28 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         suffix = "completo" if report_type == "full" else "resumido_1_pagina"
         filename = f"informe_ventas_{suffix}_{context.get('base_year', 'base')}_vs_{context.get('compare_year', 'comp')}.pdf"
         return dcc.send_bytes(report_pdf, filename=filename)
+
+    @app.callback(
+        Output("admin-refresh-status", "children"),
+        Output("client", "options"),
+        Output("client", "value"),
+        Input("admin-refresh-data", "n_clicks"),
+        State("client", "value"),
+        prevent_initial_call=True,
+    )
+    def refresh_dashboard_data(refresh_clicks, current_clients):
+        if not refresh_clicks:
+            return dash.no_update, dash.no_update, dash.no_update
+        try:
+            data.clear()
+            data.update(load_data(data_dir, forecast_dir))
+            options = build_client_dropdown_options(data.get("perfil", pd.DataFrame()))
+            valid_values = {str(option["value"]) for option in options}
+            selected_clients = [value for value in selected_values(current_clients) if str(value) in valid_values]
+            stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            return f"Datos recargados desde SQL: {stamp}.", options, selected_clients
+        except Exception as exc:
+            return f"No se pudieron recargar los datos: {exc}", dash.no_update, dash.no_update
 
     @app.callback(
         Output("admin-run-job", "data"),

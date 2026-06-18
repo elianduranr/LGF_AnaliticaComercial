@@ -23,5 +23,13 @@ else
   PYTHON_EXE="python"
 fi
 
-"$PYTHON_EXE" run_forecast_solidos.py --output "resultados/forecast_solidos" --no-cache
-"$PYTHON_EXE" materializar_op_sales_resultados_sql.py --descriptivos-dir "resultados/descriptivos" --forecast-dir "resultados/forecast_solidos"
+SOURCE="${LGF_DATA_SOURCE:-sql}"
+
+"$PYTHON_EXE" run_forecast_solidos.py \
+  --source "$SOURCE" \
+  --output "resultados/forecast_solidos" \
+  --no-cache
+
+"$PYTHON_EXE" materializar_op_sales_resultados_sql.py \
+  --descriptivos-dir "resultados/descriptivos" \
+  --forecast-dir "resultados/forecast_solidos"
