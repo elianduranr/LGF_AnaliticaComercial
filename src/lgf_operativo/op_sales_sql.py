@@ -210,7 +210,7 @@ LINE_KEY_COLUMNS = [
 
 def conexion_GF() -> str:
     """Conexion local al SQL Server operativo de Gaitana."""
-    driver = os.getenv("OP_SALES_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    driver = os.getenv("OP_SALES_SQL_DRIVER", "ODBC Driver 18 for SQL Server")
     server = os.getenv("OP_SALES_SQL_SERVER", "192.168.1.22")
     database = os.getenv("OP_SALES_SQL_DATABASE", "gaitana")
     return (
@@ -274,7 +274,7 @@ def connection_string_from_env() -> str:
         return explicit
     if not any(os.getenv(name) for name in ["OP_SALES_SQL_SERVER", "OP_SALES_SQL_USER", "OP_SALES_SQL_PASSWORD"]):
         return conexion_GF()
-    driver = os.getenv("OP_SALES_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+    driver = os.getenv("OP_SALES_SQL_DRIVER", "ODBC Driver 18 for SQL Server")
     server = os.getenv("OP_SALES_SQL_SERVER", "192.168.1.22")
     database = os.getenv("OP_SALES_SQL_DATABASE", "gaitana")
     user = os.getenv("OP_SALES_SQL_USER")

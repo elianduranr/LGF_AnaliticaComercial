@@ -524,7 +524,8 @@ def read_dashboard_sql_view(db_path: Path, view_name: str) -> pd.DataFrame:
 
 
 def read_op_sales_sql_table(table_name: str, params: list | None = None, where: str = "") -> pd.DataFrame:
-    if os.getenv("OP_SALES_USE_SQL_SERVER", "0").strip().lower() not in {"1", "true", "yes", "si"}:
+    sql_enabled = os.getenv("OP_SALES_USE_SQL_SERVER", "0").strip().lower() in {"1", "true", "yes", "si"}
+    if not sql_enabled:
         return pd.DataFrame()
     allowed = {
         "op_sales.agg_sales_week_client_product",
@@ -568,7 +569,8 @@ def read_op_sales_sql_table(table_name: str, params: list | None = None, where: 
 
         with get_connection() as con:
             return pd.read_sql_query(f"SELECT * FROM {table_name}{where}", con, params=params or [])
-    except Exception:
+    except Exception as exc:
+        print(f"ERROR leyendo {table_name} desde SQL Server: {exc}", file=sys.stderr, flush=True)
         return pd.DataFrame()
 
 
