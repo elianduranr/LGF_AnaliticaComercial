@@ -262,7 +262,7 @@ Pestanas activas:
 
 - `Visualizador clientes general`: descriptivo principal.
 - `Ventas generales`: control rapido de tallos confirmados, ventas USD y precio promedio ponderado, filtrable por ano, semana, cliente y producto; consume `ventas_semana_cliente_producto.csv` y evita el detalle operativo pesado.
-- `Estructuras y componentes`: orden regular resumida del cliente seleccionado.
+- `Fletes`: control de flete CIF/DEL/total, flete por tallo y FOB estimado desde la tabla distribuida de fletes.
 - `Forecast solidos historico`: estacionalidad, validacion, explicabilidad y escenarios.
 
 En `Forecast solidos historico`, los controles se separan por efecto:
@@ -281,7 +281,7 @@ Pestanas reservadas:
 | Carpeta | Estado | Uso |
 |---|---|---|
 | `bases de datos historicas/` | Obligatoria | Archivos crudos; no editar mediante el Dash. |
-| `resultados/descriptivos/` | Generada activa | Visualizador y estructuras. |
+| `resultados/descriptivos/` | Generada activa | Visualizador y salidas descriptivas internas. |
 | `resultados/forecast_solidos/` | Generada activa | Pestaña Forecast. |
 | `notebooks/` | Documentacion analitica | Metodologias para estudio/revision. |
 | `pruebas antiguas/` | Archivo legado | Corridas anteriores o pruebas 2026; fuera del flujo oficial. |

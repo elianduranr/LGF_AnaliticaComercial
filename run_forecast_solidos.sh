@@ -23,6 +23,9 @@ else
   PYTHON_EXE="python"
 fi
 
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
+
 "$PYTHON_EXE" run_forecast_solidos.py \
   --source "sql" \
   --output "resultados/forecast_solidos" \

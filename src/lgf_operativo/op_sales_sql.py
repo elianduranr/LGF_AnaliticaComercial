@@ -218,7 +218,7 @@ def conexion_GF() -> str:
         f"SERVER={server};"
         f"DATABASE={database};"
         "Trusted_Connection=yes;"
-        "Encrypt=no;"
+        "Encrypt=Optional;"
         "TrustServerCertificate=yes;"
     )
 
@@ -264,11 +264,15 @@ def _print_summary(label: str, frame: pd.DataFrame, verbose: bool = True) -> Non
 
 
 def connection_string_from_env() -> str:
-    load_local_credentials()
-    explicit = os.getenv("OP_SALES_CONN_STR")
+    loaded = load_local_credentials(override=True)
+    has_component_credentials = any(
+        os.getenv(name)
+        for name in ["OP_SALES_SQL_SERVER", "OP_SALES_SQL_USER", "OP_SALES_SQL_PASSWORD"]
+    )
+    explicit = os.getenv("OP_SALES_CONN_STR") if ("OP_SALES_CONN_STR" in loaded or not has_component_credentials) else None
     if explicit:
         if "Encrypt=" not in explicit and "encrypt=" not in explicit:
-            explicit = explicit.rstrip(";") + ";Encrypt=no;"
+            explicit = explicit.rstrip(";") + ";Encrypt=Optional;"
         if "TrustServerCertificate=" not in explicit and "trustservercertificate=" not in explicit:
             explicit = explicit.rstrip(";") + ";TrustServerCertificate=yes;"
         return explicit
@@ -295,20 +299,21 @@ def connection_string_from_env() -> str:
         f"DATABASE={database};"
         f"UID={user};"
         f"PWD={password};"
-        "Encrypt=no;"
+        "Authentication=SqlPassword;"
+        "Encrypt=Optional;"
         "TrustServerCertificate=yes;"
     )
 
 
 def get_connection():
-    load_local_credentials()
+    load_local_credentials(override=True)
     try:
         import pyodbc
     except ImportError as exc:
         raise RuntimeError("Instala pyodbc para cargar a SQL Server: pip install pyodbc") from exc
     if not any(os.getenv(name) for name in ["OP_SALES_CONN_STR", "OP_SALES_SQL_SERVER", "OP_SALES_SQL_USER", "OP_SALES_SQL_PASSWORD"]):
         return pyodbc.connect(conexion_GF(), timeout=30, autocommit=False)
-    return pyodbc.connect(connection_string_from_env(), autocommit=False)
+    return pyodbc.connect(connection_string_from_env(), timeout=30, autocommit=False)
 
 
 def _split_sql_server_batches(sql_text: str) -> list[str]:

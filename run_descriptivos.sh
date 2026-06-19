@@ -23,6 +23,9 @@ else
   PYTHON_EXE="python"
 fi
 
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
+
 "$PYTHON_EXE" run_descriptivos.py \
   --source "sql" \
   --output "resultados/descriptivos" \

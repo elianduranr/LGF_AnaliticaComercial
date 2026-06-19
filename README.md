@@ -177,7 +177,7 @@ Pestañas principales del dashboard:
 
 - `Visualizador clientes general`: historico, ventas, SKUs y composicion operativa.
 - `Ventas generales`: tallos, ventas y precio promedio ponderado.
-- `Estructuras y componentes`: orden regular y componentes por cliente.
+- `Fletes`: flete CIF/DEL/total desde la tabla distribuida de fletes.
 - `Comprador`: lista accionable de qué comprar, por prioridad, fecha, cliente, producto, variedad, color, grado y caja.
 - `Forecast solidos historico`: lectura historica, validacion y escenarios para pedidos `SOLIDO`.
 

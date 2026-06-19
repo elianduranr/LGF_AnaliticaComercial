@@ -25,11 +25,11 @@ fi
 
 export OP_SALES_USE_SQL_SERVER="1"
 export PYTHONWARNINGS="ignore:pandas only supports SQLAlchemy connectable:UserWarning"
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL="*"
 
 DASH_HOST="${LGF_DASH_HOST:-127.0.0.1}"
 DASH_PORT="${LGF_DASH_PORT:-8050}"
-
-"$PYTHON_EXE" -c "from src.lgf_operativo.local_env import load_local_credentials; load_local_credentials(); from src.lgf_operativo.op_sales_sql import get_connection; con=get_connection(); cur=con.cursor(); cur.execute('select count(distinct cast(cod_cliente as varchar(50))) from op_sales.result_descriptivo_perfil_cliente'); count=cur.fetchone()[0]; con.close(); print(f'SQL OK: {count} clientes en perfil_cliente'); raise SystemExit(0 if int(count or 0) > 0 else 'SQL sin clientes en op_sales.result_descriptivo_perfil_cliente')"
 
 "$PYTHON_EXE" app_dash.py \
   --data-dir "resultados/descriptivos" \

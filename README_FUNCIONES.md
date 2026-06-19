@@ -22,9 +22,9 @@ Este documento identifica los componentes del flujo activo. Los archivos de inve
 
 | Funcion | Descripcion | Entradas | Salidas | Donde se usa |
 |---|---|---|---|---|
-| `run_descriptive_pipeline()` | Ejecuta limpieza, filtro temporal opcional, perfiles, mixes, SKUs y estructuras. | Ruta historica, `analysis_year` o `analysis_years`, carpeta de salida. | CSV/XLSX en `resultados/descriptivos/`. | Visualizador y estructuras. |
+| `run_descriptive_pipeline()` | Ejecuta limpieza, filtro temporal opcional, perfiles, mixes, SKUs y estructuras. | Ruta historica, `analysis_year` o `analysis_years`, carpeta de salida. | CSV/XLSX en `resultados/descriptivos/`. | Visualizador y salidas descriptivas internas. |
 | `_load_or_clean_historical()` | Reutiliza cache de limpieza para evitar reprocesar la base cruda. | DataFrame crudo/ruta/cache. | Ordenes limpias. | Interno del descriptivo. |
-| `build_operational_structure_tables()` | Resume la orden regular por cliente, semana y version de estructura; conserva repeticiones y composicion sin materializar cada linea historica repetida. | Historico confirmado limpio. | `estructura_caja.csv`, `estructura_componentes.csv`, `catalogo_estructura_version.csv`. | Pestana Estructuras y componentes. |
+| `build_operational_structure_tables()` | Resume la orden regular por cliente, semana y version de estructura; conserva repeticiones y composicion sin materializar cada linea historica repetida. | Historico confirmado limpio. | `estructura_caja.csv`, `estructura_componentes.csv`, `catalogo_estructura_version.csv`. | Salidas descriptivas internas. |
 
 **Outputs importantes:** `historico_confirmado.csv`, `historico_visualizador_comercial.csv`, `perfil_cliente.csv`, `ventas_semana_cliente_producto.csv`, `estructura_caja.csv`, `estructura_componentes.csv`.
 `historico_confirmado.csv` preserva `pais` para lectura comercial y forecast.
@@ -69,7 +69,7 @@ Esta pestana se usa para control general rapido. El precio se calcula como
 linea. Para analizar color, SKU o composicion se utiliza el visualizador
 detallado.
 
-## Estructuras Y Componentes
+## Estructuras Internas
 
 **Archivo:** `app_dash.py`
 

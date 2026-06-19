@@ -38,6 +38,7 @@ from dash import dash_table
 from dash import dcc
 from dash import html
 
+from fletes_dashboard import render_fletes_tab
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -871,6 +872,22 @@ def admin_sql_status() -> tuple[pd.DataFrame, pd.DataFrame, str]:
                 """,
                 con,
             )
+            result_counts = pd.read_sql_query(
+                """
+                SELECT 'Clientes perfil' AS metrica, COUNT(DISTINCT CAST(cod_cliente AS varchar(50))) AS valor
+                FROM op_sales.result_descriptivo_perfil_cliente
+                UNION ALL
+                SELECT 'Clientes ventas', COUNT(DISTINCT CAST(cod_cliente AS varchar(50)))
+                FROM op_sales.agg_sales_week_client_product
+                UNION ALL
+                SELECT 'Clientes SKU', COUNT(DISTINCT CAST(cod_cliente AS varchar(50)))
+                FROM op_sales.result_descriptivo_cliente_sku_operativo_resumen
+                UNION ALL
+                SELECT 'Forecast futuro', COUNT_BIG(*)
+                FROM op_sales.result_forecast_solid_forecast_future
+                """,
+                con,
+            )
         if not coverage.empty:
             raw_min = pd.to_datetime(coverage.loc[0, "fecha_min"], errors="coerce")
             raw_max = pd.to_datetime(coverage.loc[0, "fecha_max"], errors="coerce")
@@ -881,6 +898,15 @@ def admin_sql_status() -> tuple[pd.DataFrame, pd.DataFrame, str]:
             raw_days = pd.to_numeric(coverage.loc[0, "dias"], errors="coerce")
             coverage.attrs["filas"] = int(raw_rows) if pd.notna(raw_rows) else 0
             coverage.attrs["dias"] = int(raw_days) if pd.notna(raw_days) else 0
+            if not result_counts.empty:
+                counts = {
+                    str(row.metrica): int(pd.to_numeric(row.valor, errors="coerce") or 0)
+                    for row in result_counts.itertuples(index=False)
+                }
+                coverage.attrs["clientes_perfil"] = counts.get("Clientes perfil", 0)
+                coverage.attrs["clientes_ventas"] = counts.get("Clientes ventas", 0)
+                coverage.attrs["clientes_sku"] = counts.get("Clientes SKU", 0)
+                coverage.attrs["forecast_futuro"] = counts.get("Forecast futuro", 0)
             for col in ["fecha_min", "fecha_max"]:
                 coverage[col] = pd.to_datetime(coverage[col], errors="coerce").dt.strftime("%Y-%m-%d")
             for col in ["filas", "dias", "anios"]:
@@ -1057,6 +1083,10 @@ def render_admin_tab() -> html.Div:
     loaded_to = coverage.attrs.get("fecha_max", "") if not coverage.empty else ""
     loaded_rows = moneyless_number(coverage.attrs.get("filas", 0), 0) if not coverage.empty else "0"
     loaded_days = moneyless_number(coverage.attrs.get("dias", 0), 0) if not coverage.empty else "0"
+    clientes_perfil = moneyless_number(coverage.attrs.get("clientes_perfil", 0), 0) if not coverage.empty else "0"
+    clientes_ventas = moneyless_number(coverage.attrs.get("clientes_ventas", 0), 0) if not coverage.empty else "0"
+    clientes_sku = moneyless_number(coverage.attrs.get("clientes_sku", 0), 0) if not coverage.empty else "0"
+    forecast_futuro = moneyless_number(coverage.attrs.get("forecast_futuro", 0), 0) if not coverage.empty else "0"
     default_end = today.strftime("%Y-%m-%d")
     default_start = next_start or (today - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
     if pd.to_datetime(default_start, errors="coerce") > today:
@@ -1067,6 +1097,9 @@ def render_admin_tab() -> html.Div:
             html.Div([html.Div("Hasta SQL", className="admin-card-label"), html.Div(loaded_to or "Sin datos", className="admin-card-value")], className="admin-status-card admin-status-card-accent"),
             html.Div([html.Div("Siguiente sugerido", className="admin-card-label"), html.Div(default_start, className="admin-card-value")], className="admin-status-card"),
             html.Div([html.Div("Filas / dias", className="admin-card-label"), html.Div(f"{loaded_rows} / {loaded_days}", className="admin-card-value")], className="admin-status-card"),
+            html.Div([html.Div("Clientes perfil / ventas", className="admin-card-label"), html.Div(f"{clientes_perfil} / {clientes_ventas}", className="admin-card-value")], className="admin-status-card"),
+            html.Div([html.Div("Clientes SKU", className="admin-card-label"), html.Div(clientes_sku, className="admin-card-value")], className="admin-status-card"),
+            html.Div([html.Div("Forecast futuro", className="admin-card-label"), html.Div(forecast_futuro, className="admin-card-value")], className="admin-status-card"),
         ],
         className="admin-status-grid",
     )
@@ -1210,10 +1243,13 @@ def build_client_dropdown_options(perfil: pd.DataFrame) -> list[dict[str, str]]:
         return []
     cols = [col for col in ["cod_cliente", "cliente"] if col in perfil.columns]
     rows = perfil[cols].drop_duplicates("cod_cliente").head(5000)
-    return [
-        {"label": f"{row.cod_cliente}", "value": str(row.cod_cliente)}
-        for row in rows.itertuples(index=False)
-    ]
+    options = []
+    for row in rows.itertuples(index=False):
+        code = str(getattr(row, "cod_cliente"))
+        name = str(getattr(row, "cliente", "") or "").strip()
+        label = f"{code} | {name}" if name else code
+        options.append({"label": label, "value": code})
+    return options
 
 
 def load_data(
@@ -1346,20 +1382,8 @@ def load_data(
         inventario_color = add_week_columns(inventario_color, "fecha_forecast")
 
     dashboard_db = DEFAULT_DASHBOARD_DB
-    use_sql_server = os.getenv("OP_SALES_USE_SQL_SERVER", "0").strip().lower() in {"1", "true", "yes", "si"}
     historico_visualizador_comercial = pd.DataFrame()
     historico_confirmado = pd.DataFrame()
-    if not use_sql_server:
-        historico_visualizador_comercial = read_csv_if_exists(
-            data_dir / "historico_visualizador_comercial.csv",
-            DESCRIPTIVE_DASH_COLUMNS["historico_visualizador_comercial"],
-            ["fecha"],
-        )
-        historico_confirmado = read_csv_if_exists(
-            data_dir / "historico_confirmado.csv",
-            DESCRIPTIVE_DASH_COLUMNS["historico_confirmado"],
-            ["fecha"],
-        )
     for history_frame in [historico_confirmado, historico_visualizador_comercial]:
         if history_frame.empty:
             continue
@@ -2064,7 +2088,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                 children=[
                                     dcc.Tab(label="Visualizador clientes detallado", value="visualizador_clientes_general"),
                                     dcc.Tab(label="Ventas generales", value="ventas_generales"),
-                                    dcc.Tab(label="Estructuras y componentes", value="estructuras_componentes"),
+                                    dcc.Tab(label="Fletes", value="fletes"),
                                     dcc.Tab(label="Comprador", value="comprador"),
                                     dcc.Tab(label="Demanda e inventario", value="demanda"),
                                     dcc.Tab(label="Forecast solidos historico", value="forecast_solidos"),
@@ -2685,15 +2709,15 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 general_sales_products,
                 general_sales_colors,
             )
-        if tab == "estructuras_componentes":
-            return render_estructuras_componentes_tab(
-                data,
-                selected_code,
-                top_n,
-                client_product_filter,
-                client_color_filter,
-                visual_sales_years,
-                visual_week_range,
+        if tab == "fletes":
+            return render_fletes_tab(
+                general_sales_years,
+                general_sales_week_range,
+                general_sales_companies,
+                general_sales_clients,
+                general_sales_countries,
+                general_sales_products,
+                general_sales_colors,
             )
         if tab == "comprador":
             return render_reserved_module("Comprador", "Este modulo queda reservado para la fase de proyeccion y cruce con inventario.")
@@ -2749,11 +2773,11 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     def toggle_context_options(tab: str):
         visible = {"display": "block"}
         hidden = {"display": "none"}
-        if tab in ["visualizador_clientes_general", "estructuras_componentes"]:
-            if tab == "visualizador_clientes_general":
-                return {"display": "none"}, {"display": "grid"}, hidden, hidden, visible, hidden, hidden, {}, {}
-            return {"display": "none"}, {"display": "grid"}, hidden, hidden, hidden, hidden, hidden, {}, {}
+        if tab == "visualizador_clientes_general":
+            return {"display": "none"}, {"display": "grid"}, hidden, hidden, visible, hidden, hidden, {}, {}
         if tab == "ventas_generales":
+            return hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, hidden, {"gridTemplateColumns": "1fr"}
+        if tab == "fletes":
             return hidden, hidden, hidden, hidden, hidden, {"display": "grid"}, hidden, hidden, {"gridTemplateColumns": "1fr"}
         if tab == "forecast_solidos":
             return hidden, hidden, hidden, hidden, hidden, hidden, {"display": "block"}, {"display": "none"}, {"gridTemplateColumns": "1fr"}
@@ -6699,6 +6723,67 @@ def growth_by_dimension_display(
     return out
 
 
+def tallos_movers_display(
+    view: pd.DataFrame,
+    base_year: int,
+    compare_year: int,
+    group_cols: list[str],
+    label_cols: list[str],
+    rows: int = 10,
+    direction: str = "up",
+) -> pd.DataFrame:
+    if view.empty or not group_cols or any(col not in view.columns for col in group_cols):
+        return pd.DataFrame()
+    work = view[pd.to_numeric(view["anio"], errors="coerce").isin([int(base_year), int(compare_year)])].copy()
+    if work.empty:
+        return pd.DataFrame()
+    grouped = work.groupby(["anio"] + group_cols, dropna=False, as_index=False).agg(
+        tallos_confirmados=("tallos_confirmados", "sum"),
+        ventas_usd=("ventas_usd", "sum"),
+    )
+    base = grouped[pd.to_numeric(grouped["anio"], errors="coerce").eq(int(base_year))].drop(columns=["anio"])
+    comp = grouped[pd.to_numeric(grouped["anio"], errors="coerce").eq(int(compare_year))].drop(columns=["anio"])
+    merged = base.merge(comp, on=group_cols, how="outer", suffixes=("_base", "_compare")).fillna(0)
+    merged["delta_tallos"] = merged["tallos_confirmados_compare"] - merged["tallos_confirmados_base"]
+    merged["delta_tallos_pct"] = np.where(
+        merged["tallos_confirmados_base"] > 0,
+        merged["delta_tallos"] / merged["tallos_confirmados_base"],
+        np.nan,
+    )
+    merged["delta_ventas_usd"] = merged["ventas_usd_compare"] - merged["ventas_usd_base"]
+    ascending = str(direction).lower() == "down"
+    ranked = merged.sort_values(["delta_tallos", "tallos_confirmados_compare"], ascending=[ascending, False]).head(rows)
+    rename = {
+        "producto": "Producto",
+        "cod_cliente": "Cod. cliente",
+        "cliente": "Cliente",
+        "NomCompania": "Compania",
+        "pais": "Pais",
+        "tallos_confirmados_base": f"Tallos {base_year}",
+        "tallos_confirmados_compare": f"Tallos {compare_year}",
+        "delta_tallos": "Dif. tallos",
+        "delta_tallos_pct": "Var. tallos %",
+        "ventas_usd_compare": f"Ventas USD {compare_year}",
+        "delta_ventas_usd": "Dif. ventas USD",
+    }
+    out = ranked.rename(columns=rename)
+    cols = [rename.get(col, col) for col in label_cols] + [
+        f"Tallos {base_year}",
+        f"Tallos {compare_year}",
+        "Dif. tallos",
+        "Var. tallos %",
+        f"Ventas USD {compare_year}",
+        "Dif. ventas USD",
+    ]
+    out = out[[col for col in cols if col in out.columns]]
+    for col in [f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos", f"Ventas USD {compare_year}", "Dif. ventas USD"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    if "Var. tallos %" in out.columns:
+        out["Var. tallos %"] = pd.to_numeric(out["Var. tallos %"], errors="coerce").round(4)
+    return out
+
+
 def sales_scope_summary(
     view: pd.DataFrame,
     clients: list[str] | None,
@@ -7056,15 +7141,24 @@ def _pdf_pie_chart(content: list[str], x: int, y: int, w: int, h: int, mix: pd.D
     if frame.empty or "tallos_compare" not in frame.columns:
         _pdf_text(content, x + 20, y + h / 2, "Sin datos para la torta", 8, (0.38, 0.43, 0.49))
         return
-    frame = frame.sort_values("tallos_compare", ascending=False).head(8)
+    frame = frame.sort_values("tallos_compare", ascending=False).copy()
+    if len(frame) > 5:
+        top = frame.head(5).copy()
+        other = {
+            "producto": "Otros",
+            "tallos_compare": float(frame.iloc[5:]["tallos_compare"].sum()),
+        }
+        frame = pd.concat([top, pd.DataFrame([other])], ignore_index=True)
+    else:
+        frame = frame.head(5)
     total = float(frame["tallos_compare"].sum())
     if total <= 0:
         _pdf_text(content, x + 20, y + h / 2, "Sin tallos para la torta", 8, (0.38, 0.43, 0.49))
         return
     colors = [(0.50, 0.00, 0.13), (0.31, 0.47, 0.65), (0.35, 0.63, 0.31), (0.95, 0.56, 0.17), (0.69, 0.48, 0.63), (0.60, 0.64, 0.69), (0.88, 0.34, 0.35), (0.46, 0.72, 0.70)]
-    cx = x + 88
-    cy = y + 78
-    radius = min(54, h / 3)
+    cx = x + 70
+    cy = y + 76
+    radius = min(42, h / 3)
     start = -math.pi / 2
     for idx, row in enumerate(frame.itertuples(index=False)):
         value = float(getattr(row, "tallos_compare"))
@@ -7076,17 +7170,14 @@ def _pdf_pie_chart(content: list[str], x: int, y: int, w: int, h: int, mix: pd.D
             points.append((cx + math.cos(a) * radius, cy + math.sin(a) * radius))
         _pdf_polygon(content, points, colors[idx % len(colors)])
         start += angle
-    _pdf_rect(content, int(cx - 24), int(cy - 24), 48, 48, (1, 1, 1))
-    _pdf_text(content, int(cx - 17), int(cy + 3), "Mix", 9, (0.09, 0.13, 0.18), "F2")
-    _pdf_text(content, int(cx - 22), int(cy - 11), "tallos", 7, (0.38, 0.43, 0.49))
-    legend_x = x + 168
-    legend_y = y + h - 48
+    legend_x = x + 126
+    legend_y = y + h - 46
     for idx, row in enumerate(frame.itertuples(index=False)):
-        product = str(getattr(row, "producto"))[:18]
+        product = str(getattr(row, "producto"))[:13]
         share = float(getattr(row, "tallos_compare")) / total
-        yy = legend_y - idx * 14
-        _pdf_rect(content, legend_x, yy, 8, 8, colors[idx % len(colors)])
-        _pdf_text(content, legend_x + 12, yy, f"{product} {percent(share)}", 7, (0.18, 0.22, 0.28))
+        yy = legend_y - idx * 11
+        _pdf_rect(content, legend_x, yy, 7, 7, colors[idx % len(colors)])
+        _pdf_text(content, legend_x + 10, yy, f"{product} {percent(share)}", 6, (0.18, 0.22, 0.28))
 
 
 def build_sales_report_pdf(
@@ -7505,6 +7596,25 @@ def render_ventas_generales_tab_v2(
         ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
         rows=30,
     )
+    mover_group_cols = ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"]
+    tallos_growth_up = tallos_movers_display(
+        view,
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        mover_group_cols,
+        mover_group_cols,
+        rows=10,
+        direction="up",
+    )
+    tallos_growth_down = tallos_movers_display(
+        view,
+        context.get("base_year", base_year or 0),
+        context.get("compare_year", compare_year or 0),
+        mover_group_cols,
+        mover_group_cols,
+        rows=10,
+        direction="down",
+    )
 
     report_panel = html.Div(
         [
@@ -7584,6 +7694,37 @@ def render_ventas_generales_tab_v2(
                     ),
                 ],
                 className="grid-2 section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Top 10 aumento de tallos", className="panel-title"),
+                            panel_note("Ordenado solo por diferencia de tallos; ventas USD se muestran como contexto."),
+                            make_table(
+                                tallos_growth_up,
+                                10,
+                                sort_by=[{"column_id": "Dif. tallos", "direction": "desc"}],
+                                table_id="ventas-top-tallos-crecimiento",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Top 10 caida de tallos", className="panel-title"),
+                            panel_note("Ordenado solo por diferencia de tallos; ventas USD se muestran como contexto."),
+                            make_table(
+                                tallos_growth_down,
+                                10,
+                                sort_by=[{"column_id": "Dif. tallos", "direction": "asc"}],
+                                table_id="ventas-top-tallos-caida",
+                            ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                ],
+                className="executive-table-grid section-gap",
             ),
             html.Div(
                 [
