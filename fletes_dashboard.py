@@ -214,12 +214,12 @@ def _read_freight_scope(
                 COALESCE(
                     SUM(COALESCE(CAST(Rate_cif AS float), 0) * COALESCE(CAST(Total_Factura_cif AS float), 0))
                     / NULLIF(SUM(COALESCE(CAST(Total_Factura_cif AS float), 0)), 0),
-                    AVG(CAST(Rate_cif AS float))
+                    0
                 ) AS rate_cif,
                 COALESCE(
                     SUM(COALESCE(CAST(Rate_del AS float), 0) * COALESCE(CAST(Total_Factura_del AS float), 0))
                     / NULLIF(SUM(COALESCE(CAST(Total_Factura_del AS float), 0)), 0),
-                    AVG(CAST(Rate_del AS float))
+                    0
                 ) AS rate_del,
                 MAX(CAST(Num_Factura_cif AS varchar(120))) AS num_factura_cif,
                 MAX(CAST(Num_Factura_del AS varchar(120))) AS num_factura_del,
@@ -370,8 +370,8 @@ def _display(
         "precio_fob": "Precio FOB estimado",
         "precio_fob_x_tallo": "FOB x tallo",
         "precio_venta_x_tallo": "Venta x tallo",
-        "rate_cif_prom": "Rate CIF prom.",
-        "rate_del_prom": "Rate DEL prom.",
+        "rate_cif_prom": "Rate CIF pond.",
+        "rate_del_prom": "Rate DEL pond.",
         "facturas": "Facturas",
         "lineas": "Lineas",
     }
@@ -400,8 +400,8 @@ def _display(
         "% flete/venta",
         "Precio FOB estimado",
         "FOB x tallo",
-        "Rate CIF prom.",
-        "Rate DEL prom.",
+        "Rate CIF pond.",
+        "Rate DEL pond.",
     ]
     out = out[[col for col in ordered if col in out.columns]].copy()
     for col in out.columns:

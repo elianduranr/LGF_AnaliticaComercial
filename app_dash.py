@@ -477,8 +477,8 @@ def moneyless_number(value: float | int | None, decimals: int = 0) -> str:
 def percent(value: float | int | None) -> str:
     value = pd.to_numeric(value, errors="coerce")
     if pd.isna(value):
-        return "0.0%"
-    return f"{value * 100:,.1f}%"
+        return "0.00%"
+    return f"{value * 100:,.2f}%"
 
 
 def panel_note(text: str) -> html.Div:
@@ -1615,11 +1615,11 @@ def make_year_comparison_card(
             delta = "base"
             delta_class = "year-delta neutral"
         elif previous_value == 0:
-            delta = "nuevo" if value else "0.0%"
+            delta = "nuevo" if value else "0.00%"
             delta_class = "year-delta positive" if value else "year-delta neutral"
         else:
             change = (value - previous_value) / previous_value
-            delta = f"{change:+.1%} vs {previous_year}"
+            delta = f"{change:+.2%} vs {previous_year}"
             delta_class = "year-delta positive" if change >= 0 else "year-delta negative"
         rows.append(
             html.Div(
@@ -1645,7 +1645,7 @@ def make_delta_card(title: str, value: str, delta_value: float | None, detail: s
         delta_text = "sin base"
         delta_class = "delta-badge neutral"
     else:
-        delta_text = f"{delta_value:+.1%}"
+        delta_text = f"{delta_value:+.2%}"
         delta_class = "delta-badge positive" if delta_value >= 0 else "delta-badge negative"
     return html.Div(
         [
@@ -5134,7 +5134,7 @@ def sales_product_week_matrix_display(df: pd.DataFrame, selected_clients: list[s
     rename = {"cod_cliente": "Cod cliente", "cliente": "Cliente", "producto": "Producto"}
     matrix = matrix.rename(columns=rename)
     for col in week_cols + ["Total"]:
-        matrix[col] = pd.to_numeric(matrix[col], errors="coerce").fillna(0).round(0).astype(int)
+        matrix[col] = pd.to_numeric(matrix[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
     return matrix
 
 
@@ -6396,18 +6396,18 @@ def build_sales_executive_context_v2(
     if not years_available:
         context["message"] = "No se encontraron anos validos en el alcance seleccionado."
         return context
-    if base_year is None:
-        base_year = years_available[-2] if len(years_available) >= 2 else years_available[-1]
-    if compare_year is None:
-        compare_year = years_available[-1]
-    if int(base_year) == int(compare_year):
-        context["message"] = "Selecciona dos anos diferentes para construir la comparacion ejecutiva."
-        return context
+    selected_compare = int(compare_year) if compare_year is not None and int(compare_year) in years_available else years_available[-1]
+    selected_base = int(base_year) if base_year is not None and int(base_year) in years_available and int(base_year) != selected_compare else None
+    if selected_base is None and len(years_available) >= 2:
+        previous_years = [year for year in years_available if year != selected_compare]
+        selected_base = previous_years[-1] if previous_years else None
+    comparison_mode = selected_base is not None and selected_base != selected_compare
 
-    base_frame = view[pd.to_numeric(view["anio"], errors="coerce").eq(int(base_year))].copy()
-    compare_frame = view[pd.to_numeric(view["anio"], errors="coerce").eq(int(compare_year))].copy()
-    if base_frame.empty or compare_frame.empty:
-        context["message"] = "No hay datos suficientes para uno de los anos seleccionados."
+    year_series = pd.to_numeric(view["anio"], errors="coerce")
+    base_frame = view[year_series.eq(int(selected_base))].copy() if comparison_mode else view.iloc[0:0].copy()
+    compare_frame = view[year_series.eq(int(selected_compare))].copy()
+    if compare_frame.empty:
+        context["message"] = "No hay datos suficientes para el ano seleccionado."
         return context
 
     def aggregate(frame: pd.DataFrame) -> dict[str, float]:
@@ -6422,16 +6422,13 @@ def build_sales_executive_context_v2(
 
     base_metrics = aggregate(base_frame)
     compare_metrics = aggregate(compare_frame)
-    base_weeks = max(int(base_frame["semana_iso"].nunique()), 1) if "semana_iso" in base_frame.columns else 1
+    base_weeks = int(base_frame["semana_iso"].nunique()) if comparison_mode and "semana_iso" in base_frame.columns else 0
     compare_weeks = max(int(compare_frame["semana_iso"].nunique()), 1) if "semana_iso" in compare_frame.columns else 1
 
-    monthly = pd.concat(
-        [
-            base_frame.assign(ano_label=f"Ano base {int(base_year)}"),
-            compare_frame.assign(ano_label=f"Ano comparativo {int(compare_year)}"),
-        ],
-        ignore_index=True,
-    )
+    monthly_parts = [compare_frame.assign(ano_label=f"Ano seleccionado {int(selected_compare)}")]
+    if comparison_mode:
+        monthly_parts.insert(0, base_frame.assign(ano_label=f"Ano base {int(selected_base)}"))
+    monthly = pd.concat(monthly_parts, ignore_index=True)
     if "mes_num" in monthly.columns:
         month_source = monthly["mes_num"]
     elif "week_start" in monthly.columns:
@@ -6463,46 +6460,52 @@ def build_sales_executive_context_v2(
     mix_donut["share"] = np.where(compare_metrics["tallos_confirmados"] > 0, mix_donut["tallos_compare"] / compare_metrics["tallos_confirmados"], 0)
 
     monthly_fig = go.Figure()
-    for year_label in [f"Ano base {int(base_year)}", f"Ano comparativo {int(compare_year)}"]:
+    month_labels = ([f"Ano base {int(selected_base)}"] if comparison_mode else []) + [f"Ano seleccionado {int(selected_compare)}"]
+    for year_label in month_labels:
         subset = monthly[monthly["ano_label"].eq(year_label)]
         monthly_fig.add_trace(go.Bar(x=subset["Mes"], y=subset["ventas_usd"], name=year_label))
     monthly_fig.update_layout(barmode="group", title="Facturacion USD por mes")
     monthly_fig.update_yaxes(title="Ventas USD")
     monthly_fig.update_xaxes(title="Mes")
     apply_common_layout(monthly_fig, 360)
+    monthly_fig.update_yaxes(tickformat=",.2f")
 
-    mix_fig = px.pie(mix_donut, names="producto", values="tallos_compare", hole=0.42, title=f"Mix de tallos del ano comparativo {compare_year}")
+    mix_fig = px.pie(mix_donut, names="producto", values="tallos_compare", hole=0.42, title=f"Mix de tallos del ano seleccionado {selected_compare}")
     apply_pie_label_style(mix_fig)
     apply_common_layout(mix_fig, 360)
 
     compare_top = product_compare.head(10).copy()
     product_bar_fig = go.Figure()
-    product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_base"], name=f"Ano base {base_year}"))
-    product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_compare"], name=f"Ano comparativo {compare_year}"))
-    product_bar_fig.update_layout(barmode="group", title="Tallos por producto: base vs comparativo")
+    if comparison_mode:
+        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_base"], name=f"Ano base {selected_base}"))
+    product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_compare"], name=f"Ano seleccionado {selected_compare}"))
+    product_bar_fig.update_layout(barmode="group", title="Tallos por producto" + (": base vs comparativo" if comparison_mode else ""))
     product_bar_fig.update_yaxes(title="Tallos confirmados")
     product_bar_fig.update_xaxes(title="Producto")
     apply_common_layout(product_bar_fig, 370)
+    product_bar_fig.update_yaxes(tickformat=",d")
 
     product_sales_bar_fig = go.Figure()
-    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_base"], name=f"Ano base {base_year}"))
-    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_compare"], name=f"Ano comparativo {compare_year}"))
-    product_sales_bar_fig.update_layout(barmode="group", title="Facturacion por producto: base vs comparativo")
+    if comparison_mode:
+        product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_base"], name=f"Ano base {selected_base}"))
+    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_compare"], name=f"Ano seleccionado {selected_compare}"))
+    product_sales_bar_fig.update_layout(barmode="group", title="Facturacion por producto" + (": base vs comparativo" if comparison_mode else ""))
     product_sales_bar_fig.update_yaxes(title="Ventas USD")
     product_sales_bar_fig.update_xaxes(title="Producto")
     apply_common_layout(product_sales_bar_fig, 370)
+    product_sales_bar_fig.update_yaxes(tickformat=",.2f")
 
-    consolidated_table = pd.DataFrame(
-        [
-            {"Ano": f"Ano base {base_year}", "Tipo de dato": "Real", "Total USD": base_metrics["ventas_usd"]},
-            {"Ano": f"Ano comparativo {compare_year}", "Tipo de dato": "Real", "Total USD": compare_metrics["ventas_usd"]},
-        ]
-    )
+    consolidated_rows = []
+    if comparison_mode:
+        consolidated_rows.append({"Ano": f"Ano base {selected_base}", "Tipo de dato": "Real", "Total USD": base_metrics["ventas_usd"]})
+    consolidated_rows.append({"Ano": f"Ano seleccionado {selected_compare}", "Tipo de dato": "Real", "Total USD": compare_metrics["ventas_usd"]})
+    consolidated_table = pd.DataFrame(consolidated_rows)
     consolidated_fig = go.Figure()
-    consolidated_fig.add_trace(go.Bar(x=consolidated_table["Ano"], y=consolidated_table["Total USD"], marker_color=["#800020", "#4E79A7"]))
+    consolidated_fig.add_trace(go.Bar(x=consolidated_table["Ano"], y=consolidated_table["Total USD"], marker_color=["#800020", "#4E79A7"][: len(consolidated_table)]))
     consolidated_fig.update_layout(title="Consolidado real USD", showlegend=False)
     consolidated_fig.update_yaxes(title="USD")
     apply_common_layout(consolidated_fig, 330)
+    consolidated_fig.update_yaxes(tickformat=",.2f")
 
     consolidated_delta = compare_metrics["ventas_usd"] - base_metrics["ventas_usd"]
     consolidated_delta_pct = consolidated_delta / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
@@ -6511,15 +6514,19 @@ def build_sales_executive_context_v2(
     compare_real_mult = compare_metrics["ventas_usd"] / base_metrics["ventas_usd"] if base_metrics["ventas_usd"] > 0 else np.nan
     annual_cards = pd.DataFrame(
         [
-            {"anio": int(base_year), **base_metrics},
-            {"anio": int(compare_year), **compare_metrics},
+            *([{"anio": int(selected_base), **base_metrics}] if comparison_mode else []),
+            {"anio": int(selected_compare), **compare_metrics},
         ]
     )
 
     product_leader = mix_donut.sort_values("share", ascending=False).iloc[0] if not mix_donut.empty else None
     product_grower = product_compare.sort_values("delta_usd_pct", ascending=False).iloc[0] if not product_compare.empty else None
     product_decliner = product_compare.sort_values("delta_usd_pct", ascending=True).iloc[0] if not product_compare.empty else None
-    insights = [f"La comparacion usa {base_weeks} semanas del ano base y {compare_weeks} semanas del ano comparativo dentro del alcance filtrado."]
+    insights = [
+        f"La comparacion usa {base_weeks} semanas del ano base y {compare_weeks} semanas del ano comparativo dentro del alcance filtrado."
+        if comparison_mode
+        else f"Solo hay un ano visible en el filtro: {selected_compare}. Las graficas muestran la tendencia real de ese ano."
+    ]
     if pd.notna(consolidated_delta_pct):
         insights.append(f"La facturacion total cambia {percent(consolidated_delta_pct)} frente al ano base.")
     insights.append(f"Los tallos totales pasan de {moneyless_number(base_metrics['tallos_confirmados'])} a {moneyless_number(compare_metrics['tallos_confirmados'])} en el alcance filtrado.")
@@ -6553,8 +6560,9 @@ def build_sales_executive_context_v2(
             "compare_real_pct": compare_real_pct,
             "compare_real_mult": compare_real_mult,
             "insights": insights,
-            "base_year": int(base_year),
-            "compare_year": int(compare_year),
+            "base_year": int(selected_base) if comparison_mode else None,
+            "compare_year": int(selected_compare),
+            "comparison_mode": comparison_mode,
             "week_text": f"{int(view['semana_iso'].min())}-{int(view['semana_iso'].max())}" if "semana_iso" in view.columns else "todas",
         }
     )
@@ -6573,6 +6581,16 @@ def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
         ("Precio USD/tallo", "precio_usd_tallo", lambda value: moneyless_number(value, 4), lambda value: moneyless_number(value, 4)),
         ("Pedidos", "pedidos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
     ]
+    if not context.get("comparison_mode", True):
+        return pd.DataFrame(
+            [
+                {
+                    "Metrica": label,
+                    f"Ano seleccionado {context['compare_year']}": formatter(float(compare.get(key, 0) or 0)),
+                }
+                for label, key, formatter, _ in specs
+            ]
+        )
     for label, key, formatter, delta_formatter in specs:
         base_value = float(base.get(key, 0) or 0)
         compare_value = float(compare.get(key, 0) or 0)
@@ -6593,6 +6611,25 @@ def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
 def product_comparison_display(product_compare: pd.DataFrame, base_year: int, compare_year: int, rows: int = 18) -> pd.DataFrame:
     if product_compare.empty:
         return pd.DataFrame()
+    if int(base_year) == int(compare_year):
+        out = product_compare.head(rows).copy()
+        out = out.rename(
+            columns={
+                "producto": "Producto",
+                "ventas_compare": f"USD {compare_year}",
+                "tallos_compare": f"Tallos {compare_year}",
+                "share_compare": f"Share tallos {compare_year}",
+            }
+        )
+        cols = ["Producto", f"USD {compare_year}", f"Tallos {compare_year}", f"Share tallos {compare_year}"]
+        out = out[[col for col in cols if col in out.columns]]
+        if f"USD {compare_year}" in out.columns:
+            out[f"USD {compare_year}"] = pd.to_numeric(out[f"USD {compare_year}"], errors="coerce").map(lambda value: moneyless_number(value, 2))
+        if f"Tallos {compare_year}" in out.columns:
+            out[f"Tallos {compare_year}"] = pd.to_numeric(out[f"Tallos {compare_year}"], errors="coerce").map(lambda value: moneyless_number(value, 0))
+        if f"Share tallos {compare_year}" in out.columns:
+            out[f"Share tallos {compare_year}"] = pd.to_numeric(out[f"Share tallos {compare_year}"], errors="coerce").map(percent)
+        return out
     out = product_compare.head(rows).copy()
     out = out.rename(
         columns={
@@ -6621,10 +6658,15 @@ def product_comparison_display(product_compare: pd.DataFrame, base_year: int, co
         f"Share tallos {compare_year}",
     ]
     out = out[[col for col in cols if col in out.columns]]
-    for col in [f"USD {base_year}", f"USD {compare_year}", "Dif. USD", f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos", "Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"]:
+    for col in [f"USD {base_year}", f"USD {compare_year}", "Dif. USD"]:
         if col in out.columns:
-            digits = 4 if col in {"Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"} else 2
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(digits)
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 2))
+    for col in [f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
+    for col in ["Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(percent)
     return out
 
 
@@ -6655,9 +6697,14 @@ def client_sales_display(view: pd.DataFrame, rows: int = 30, ascending: bool = T
             "pedidos": "Pedidos",
         }
     )
-    for col in ["Facturacion USD", "Tallos", "Precio USD/tallo", "Pedidos"]:
+    for col in ["Facturacion USD"]:
         if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(4 if col == "Precio USD/tallo" else 2)
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 2))
+    for col in ["Tallos", "Pedidos"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
+    if "Precio USD/tallo" in out.columns:
+        out["Precio USD/tallo"] = pd.to_numeric(out["Precio USD/tallo"], errors="coerce").map(lambda value: moneyless_number(value, 4))
     cols = ["Cod. cliente", "Compania", "Cliente", "Facturacion USD", "Tallos", "Precio USD/tallo", "Pedidos"]
     return out[[col for col in cols if col in out.columns]]
 
@@ -6716,10 +6763,17 @@ def growth_by_dimension_display(
         f"Precio {compare_year}",
     ]
     out = out[[col for col in cols if col in out.columns]]
-    for col in [f"USD {base_year}", f"USD {compare_year}", "Crecimiento USD", f"Tallos {base_year}", f"Tallos {compare_year}", "Crecimiento tallos", "Crecimiento %", "Crec. tallos %", f"Precio {compare_year}"]:
+    for col in [f"USD {base_year}", f"USD {compare_year}", "Crecimiento USD"]:
         if col in out.columns:
-            digits = 4 if col == f"Precio {compare_year}" else 4 if col in {"Crecimiento %", "Crec. tallos %"} else 2
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(digits)
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 2))
+    for col in [f"Tallos {base_year}", f"Tallos {compare_year}", "Crecimiento tallos"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
+    for col in ["Crecimiento %", "Crec. tallos %"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(percent)
+    if f"Precio {compare_year}" in out.columns:
+        out[f"Precio {compare_year}"] = pd.to_numeric(out[f"Precio {compare_year}"], errors="coerce").map(lambda value: moneyless_number(value, 4))
     return out
 
 
@@ -6776,11 +6830,14 @@ def tallos_movers_display(
         "Dif. ventas USD",
     ]
     out = out[[col for col in cols if col in out.columns]]
-    for col in [f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos", f"Ventas USD {compare_year}", "Dif. ventas USD"]:
+    for col in [f"Tallos {base_year}", f"Tallos {compare_year}", "Dif. tallos"]:
         if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
+    for col in [f"Ventas USD {compare_year}", "Dif. ventas USD"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 2))
     if "Var. tallos %" in out.columns:
-        out["Var. tallos %"] = pd.to_numeric(out["Var. tallos %"], errors="coerce").round(4)
+        out["Var. tallos %"] = pd.to_numeric(out["Var. tallos %"], errors="coerce").map(percent)
     return out
 
 
@@ -7496,10 +7553,12 @@ def render_ventas_generales_tab_v2(
     tallos_fig = px.line(weekly, x="semana_iso", y="tallos_confirmados", color="anio", markers=True, title="Tallos confirmados por semana")
     tallos_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Tallos confirmados")
     apply_common_layout(tallos_fig, 370)
+    tallos_fig.update_yaxes(tickformat=",d")
 
     precio_fig = px.line(weekly, x="semana_iso", y="precio_usd_tallo", color="anio", markers=True, title="Precio promedio USD/tallo por semana")
     precio_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="USD/tallo")
     apply_common_layout(precio_fig, 345)
+    precio_fig.update_yaxes(tickformat=",.4f")
 
     annual_display = annual.rename(columns={"anio": "Ano", "tallos_confirmados": "Tallos confirmados", "ventas_usd": "Ventas USD", "precio_usd_tallo": "USD/tallo"})[["Ano", "Tallos confirmados", "Ventas USD", "USD/tallo"]].copy()
     annual_display["Tallos confirmados"] = annual_display["Tallos confirmados"].map(moneyless_number)
@@ -7542,12 +7601,15 @@ def render_ventas_generales_tab_v2(
         make_year_comparison_card("Pedidos", annual_cards, "pedidos", lambda value: moneyless_number(value), "ordenes agregadas"),
     ]
     metric_compare_table = sales_metric_comparison_display(context)
+    active_compare_year = context.get("compare_year") or compare_year or (int(annual["anio"].max()) if not annual.empty else 0)
+    active_base_year = context.get("base_year") or base_year or active_compare_year
     product_compare_table = product_comparison_display(
         context["product_compare"] if context.get("ok") else pd.DataFrame(),
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
+        active_base_year,
+        active_compare_year,
         rows=20,
     )
+    comparison_mode = bool(context.get("comparison_mode"))
     scope = sales_scope_summary(view, clients, products, countries, companies, colors)
     logo_uri = logo_data_uri()
     strategic_items = context["insights"] if context.get("ok") else ["No hay suficientes datos para construir la comparacion ejecutiva."]
@@ -7571,49 +7633,39 @@ def render_ventas_generales_tab_v2(
         if len(selected_clients) == 1
         else "Sin un unico cliente seleccionado se separa por cliente y producto para evitar mezclar portafolios."
     )
-    country_growth_table = growth_by_dimension_display(
-        view,
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
-        ["pais"],
-        ["pais"],
-        rows=25,
+    country_growth_table = (
+        growth_by_dimension_display(view, active_base_year, active_compare_year, ["pais"], ["pais"], rows=25)
+        if comparison_mode
+        else pd.DataFrame()
     )
     company_group_cols = ["NomCompania"] if "NomCompania" in view.columns else ["cod_cliente", "cliente"]
-    company_growth_table = growth_by_dimension_display(
-        view,
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
-        company_group_cols,
-        company_group_cols,
-        rows=30,
+    company_growth_table = (
+        growth_by_dimension_display(view, active_base_year, active_compare_year, company_group_cols, company_group_cols, rows=30)
+        if comparison_mode
+        else pd.DataFrame()
     )
-    client_growth_table = growth_by_dimension_display(
-        view,
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
-        ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
-        ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
-        rows=30,
+    client_growth_table = (
+        growth_by_dimension_display(
+            view,
+            active_base_year,
+            active_compare_year,
+            ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
+            ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"],
+            rows=30,
+        )
+        if comparison_mode
+        else pd.DataFrame()
     )
     mover_group_cols = ["cod_cliente", "cliente"] if {"cod_cliente", "cliente"}.issubset(view.columns) else ["cod_cliente"]
-    tallos_growth_up = tallos_movers_display(
-        view,
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
-        mover_group_cols,
-        mover_group_cols,
-        rows=10,
-        direction="up",
+    tallos_growth_up = (
+        tallos_movers_display(view, active_base_year, active_compare_year, mover_group_cols, mover_group_cols, rows=10, direction="up")
+        if comparison_mode
+        else pd.DataFrame()
     )
-    tallos_growth_down = tallos_movers_display(
-        view,
-        context.get("base_year", base_year or 0),
-        context.get("compare_year", compare_year or 0),
-        mover_group_cols,
-        mover_group_cols,
-        rows=10,
-        direction="down",
+    tallos_growth_down = (
+        tallos_movers_display(view, active_base_year, active_compare_year, mover_group_cols, mover_group_cols, rows=10, direction="down")
+        if comparison_mode
+        else pd.DataFrame()
     )
 
     report_panel = html.Div(
@@ -7626,7 +7678,11 @@ def render_ventas_generales_tab_v2(
                             html.Div("Ventas generales", className="executive-kicker"),
                             html.Div("Informe ejecutivo comercial", className="executive-title"),
                             html.Div(
-                                f"Ano base {context.get('base_year', base_year)} vs ano comparativo {context.get('compare_year', compare_year)} | semanas {weeks_text}",
+                                (
+                                    f"Ano base {active_base_year} vs ano comparativo {active_compare_year} | semanas {weeks_text}"
+                                    if context.get("comparison_mode")
+                                    else f"Ano seleccionado {active_compare_year} | semanas {weeks_text}"
+                                ),
                                 className="executive-subtitle",
                             ),
                         ]
@@ -7651,7 +7707,7 @@ def render_ventas_generales_tab_v2(
                     html.Div(
                         [
                             html.Div("Ventas generales USD", className="panel-title"),
-                            panel_note("Comparacion directa de facturacion real entre ano base y ano comparativo."),
+                            panel_note("Comparacion directa de facturacion real entre anos; si solo hay un ano visible, muestra su total real."),
                             dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Ventas generales USD")),
                         ],
                         className="panel panel-feature",
@@ -7659,7 +7715,7 @@ def render_ventas_generales_tab_v2(
                     html.Div(
                         [
                             html.Div("Facturacion por producto", className="panel-title"),
-                            panel_note("Barras por producto ordenadas por facturacion del ano comparativo."),
+                            panel_note("Barras por producto ordenadas por facturacion del ano seleccionado."),
                             dcc.Graph(figure=context["product_sales_bar_fig"] if context.get("ok") else empty_figure("Facturacion por producto")),
                         ],
                         className="panel panel-feature",
@@ -7669,7 +7725,7 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Tallos por producto", className="panel-title"), panel_note("Base vs comparativo por producto para leer cambios de portafolio en volumen."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
+                    html.Div([html.Div("Tallos por producto", className="panel-title"), panel_note("Volumen por producto; compara anos cuando existe base visible."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
                     html.Div([html.Div("Tallos confirmados por semana", className="panel-title"), panel_note("Evolucion semanal de tallos reales para comparar nivel y estacionalidad entre anos."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
                 ],
                 className="grid-2 section-gap",
@@ -7677,13 +7733,13 @@ def render_ventas_generales_tab_v2(
             html.Div(
                 [
                     html.Div([html.Div("Evolucion del precio", className="panel-title"), panel_note("Precio promedio ponderado semanal: ventas USD divididas por tallos confirmados."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
-                    html.Div([html.Div("Resumen mensual USD", className="panel-title"), panel_note("Comparacion mensual del ano base frente al comparativo."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturacion USD por mes"))], className="panel"),
+                    html.Div([html.Div("Resumen mensual USD", className="panel-title"), panel_note("Tendencia mensual del ano seleccionado y comparacion cuando existe base visible."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturacion USD por mes"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Mix por producto", className="panel-title"), panel_note("Producto dominante del ano comparativo y su participacion en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix por producto"))], className="panel"),
+                    html.Div([html.Div("Mix por producto", className="panel-title"), panel_note("Producto dominante del ano seleccionado y su participacion en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix por producto"))], className="panel"),
                     html.Div(
                         [
                             html.Div("Lectura estratÃ©gica", className="panel-title"),
@@ -7735,7 +7791,7 @@ def render_ventas_generales_tab_v2(
                             make_table(
                                 country_growth_table,
                                 12,
-                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                sort_by=[{"column_id": f"USD {active_compare_year}", "direction": "desc"}],
                                 table_id="ventas-crecimiento-pais",
                             ),
                         ],
@@ -7748,7 +7804,7 @@ def render_ventas_generales_tab_v2(
                             make_table(
                                 company_growth_table,
                                 12,
-                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                sort_by=[{"column_id": f"USD {active_compare_year}", "direction": "desc"}],
                                 table_id="ventas-crecimiento-compania",
                             ),
                         ],
@@ -7766,7 +7822,7 @@ def render_ventas_generales_tab_v2(
                             make_table(
                                 client_growth_table,
                                 12,
-                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                sort_by=[{"column_id": f"USD {active_compare_year}", "direction": "desc"}],
                                 table_id="ventas-crecimiento-cliente",
                             ),
                         ],
@@ -7787,7 +7843,7 @@ def render_ventas_generales_tab_v2(
                             make_table(
                                 product_compare_table,
                                 12,
-                                sort_by=[{"column_id": f"USD {context.get('compare_year', compare_year or 0)}", "direction": "desc"}],
+                                sort_by=[{"column_id": f"USD {active_compare_year}", "direction": "desc"}],
                                 table_id="ventas-comparativo-producto",
                             ),
                         ],
@@ -7823,7 +7879,7 @@ def render_ventas_generales_tab_v2(
             html.Div(
                 [
                     html.Div([html.Div("Resumen por ano", className="panel-title"), make_table(annual_display, 8)], className="table-panel no-top-margin"),
-                    html.Div([html.Div("Consolidado real", className="panel-title"), panel_note("Real del ano base frente al real del ano comparativo. No incluye proyecciones anualizadas."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Consolidado real USD"))], className="panel"),
+                    html.Div([html.Div("Consolidado real", className="panel-title"), panel_note("Real del ano seleccionado y comparacion cuando existe base visible. No incluye proyecciones anualizadas."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Consolidado real USD"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
