@@ -38,7 +38,7 @@ from dash import dash_table
 from dash import dcc
 from dash import html
 
-from fletes_dashboard import render_fletes_tab
+from fletes_dashboard import get_fletes_type_options, render_fletes_tab
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -1753,6 +1753,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     general_sales_product_options = []
     general_sales_country_options = []
     general_sales_color_options = []
+    general_sales_type_options = []
     forecast_year_options = []
     forecast_default_years = []
     forecast_market_options = []
@@ -1814,6 +1815,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             general_sales_country_options = [
                 {"label": country, "value": country}
                 for country in sorted(ventas_source["pais"].dropna().astype(str).unique())
+            ]
+        if "tipo_pedido_operativo" in ventas_source.columns:
+            general_sales_type_options = [
+                {"label": tipo, "value": tipo}
+                for tipo in sorted(ventas_source["tipo_pedido_operativo"].dropna().astype(str).unique())
+                if tipo.strip()
             ]
     product_sources = [
         frame
@@ -2344,6 +2351,20 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                         ],
                                         className="demand-control",
                                     ),
+                                    html.Div(
+                                        [
+                                            html.Label("Tipo operativo"),
+                                            dcc.Dropdown(
+                                                id="general-sales-types",
+                                                options=general_sales_type_options,
+                                                value=[],
+                                                multi=True,
+                                                clearable=True,
+                                                placeholder="Todos los tipos",
+                                            ),
+                                        ],
+                                        className="demand-control",
+                                    ),
                                 ],
                                 id="general-sales-options",
                                 className="demand-options",
@@ -2572,6 +2593,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("general-sales-countries", "value"),
         Input("general-sales-products", "value"),
         Input("general-sales-colors", "value"),
+        Input("general-sales-types", "value"),
         Input("compare-mode", "value"),
         Input("solid-product", "value"),
         Input("analysis-scope", "value"),
@@ -2623,6 +2645,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         general_sales_countries: list[str] | None,
         general_sales_products: list[str] | None,
         general_sales_colors: list[str] | None,
+        general_sales_types: list[str] | None,
         compare_mode: str | None,
         solid_product: str | None,
         analysis_scope: str | None,
@@ -2718,6 +2741,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 general_sales_countries,
                 general_sales_products,
                 general_sales_colors,
+                general_sales_types,
             )
         if tab == "comprador":
             return render_reserved_module("Comprador", "Este modulo queda reservado para la fase de proyeccion y cruce con inventario.")
@@ -2796,6 +2820,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Output("general-sales-products", "value"),
         Output("general-sales-colors", "options"),
         Output("general-sales-colors", "value"),
+        Output("general-sales-types", "options"),
+        Output("general-sales-types", "value"),
         Input("tabs", "value"),
         Input("general-sales-years", "value"),
         Input("general-sales-week-range", "value"),
@@ -2804,11 +2830,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("general-sales-countries", "value"),
         Input("general-sales-products", "value"),
         Input("general-sales-colors", "value"),
+        Input("general-sales-types", "value"),
     )
-    def cascade_general_sales_filters(tab, years, week_range, companies, clients, countries, products, colors):
+    def cascade_general_sales_filters(tab, years, week_range, companies, clients, countries, products, colors, order_types):
         sales = data.get("ventas_semana", pd.DataFrame())
         if sales.empty:
-            return [], [], [], [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], [], [], [], [], []
         latest_year = latest_selected_year(years, sales)
         scope = filter_general_sales_frame(
             sales,
@@ -2825,6 +2852,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         selected_countries = selected_values(countries)
         selected_products = selected_values(products)
         selected_colors = selected_values(colors)
+        selected_types = selected_values(order_types)
 
         company_options, company_values = tallos_options_from_frame(scope, "NomCompania")
         selected_companies = [value for value in selected_companies if value in set(company_values)]
@@ -2853,6 +2881,23 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
 
         color_options, color_values = tallos_options_from_frame(scope, "color")
         selected_colors = [value for value in selected_colors if value in set(color_values)]
+        if selected_colors and "color" in scope.columns:
+            scope = scope[scope["color"].astype(str).isin(set(selected_colors))].copy()
+
+        if tab == "fletes":
+            type_options = get_fletes_type_options(
+                years,
+                week_range,
+                selected_companies,
+                selected_clients,
+                selected_countries,
+                selected_products,
+                selected_colors,
+            )
+            type_values = [str(option["value"]) for option in type_options]
+        else:
+            type_options, type_values = tallos_options_from_frame(scope, "tipo_pedido_operativo")
+        selected_types = [value for value in selected_types if value in set(type_values)]
 
         return (
             company_options,
@@ -2865,6 +2910,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             selected_products,
             color_options,
             selected_colors,
+            type_options,
+            selected_types,
         )
 
     @app.callback(
