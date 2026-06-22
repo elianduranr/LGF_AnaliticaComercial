@@ -561,7 +561,8 @@ def _freight_applicable(frame: pd.DataFrame) -> pd.DataFrame:
         return frame.copy()
     tipo = frame["tipo_flete"].fillna("Sin dato").astype(str).str.strip().str.upper()
     excluded = {"", "FOB", "NAL", "NAN", "NONE", "SIN DATO", "SIN_DATO"}
-    return frame[~tipo.isin(excluded)].copy()
+    flete = pd.to_numeric(frame.get("flete_total_distribuido", pd.Series(0, index=frame.index)), errors="coerce").fillna(0)
+    return frame[~tipo.isin(excluded) & flete.gt(0)].copy()
 
 
 def _min_volume(frame: pd.DataFrame) -> float:
@@ -967,7 +968,7 @@ def _generate_fletes_insights(frame: pd.DataFrame, weekly: pd.DataFrame, clients
         return [_small_insight("Sin datos para generar lectura rapida.", "warn")]
     status, _, _ = _risk_status(kpis["pct_flete_venta"])
     insights = [
-        _small_insight(f"El flete representa {_pct(kpis['pct_flete_venta'])} de la venta filtrada; clasificacion: {status.lower()}.", "bad" if status == "Critico" else ("warn" if status == "Atencion" else "good")),
+        _small_insight(f"El flete representa {_pct(kpis['pct_flete_venta'])} de la venta con flete CIF/DEL; clasificacion: {status.lower()}.", "bad" if status == "Critico" else ("warn" if status == "Atencion" else "good")),
         _small_insight(f"CIF explica {_pct(kpis['total_cif'] / kpis['total_flete'] if kpis['total_flete'] else 0)} del flete y DEL {_pct(kpis['total_del'] / kpis['total_flete'] if kpis['total_flete'] else 0)}.", "neutral"),
     ]
     product = _top_metric(frame, ["producto"], "flete_x_tallo", ascending=False)
@@ -1050,12 +1051,12 @@ def _render_fletes_dashboard(
     alert = q and q["tipo_sin_dato"] > 0
 
     kpi_cards = [
-        _fletes_kpi_card("Venta filtrada USD", _usd(kpis["total_ventas"]), "Valor factura USD", "Venta", "#2563EB", "#DBEAFE"),
+        _fletes_kpi_card("Venta con flete USD", _usd(kpis["total_ventas"]), "Solo registros CIF/DEL con flete > 0", "Venta", "#2563EB", "#DBEAFE"),
         _fletes_kpi_card("Total flete", _usd(kpis["total_flete"]), f"CIF {_usd(kpis['total_cif'])} / DEL {_usd(kpis['total_del'])}", "Logistica", "#4F46E5", "#EEF2FF"),
         _fletes_kpi_card("Flete por tallo", _usd_unit(kpis["flete_x_tallo"]), f"CIF {_usd_unit(kpis['cif_x_tallo'])} / DEL {_usd_unit(kpis['del_x_tallo'])}", "USD/tallo", "#7C3AED", "#F3E8FF"),
         _fletes_kpi_card("% flete / venta", _pct(kpis["pct_flete_venta"]), "<=18% saludable | 18%-23% atencion | >23% critico", status, status_color, status_bg),
         _fletes_kpi_card("FOB estimado", _usd(kpis["precio_fob"]), f"{_usd_unit(kpis['fob_x_tallo'])} USD/tallo", "Margen", "#059669", "#D1FAE5"),
-        _fletes_kpi_card("Volumen logistico", _stems(kpis["total_tallos"]), f"{_stems(kpis['facturas'])} facturas | {_stems(kpis['lineas'])} lineas", "Tallos CIF/DEL", "#0F766E", "#CCFBF1"),
+        _fletes_kpi_card("Volumen logistico", _stems(kpis["total_tallos"]), f"{_stems(kpis['facturas'])} facturas | {_stems(kpis['lineas'])} lineas", "Tallos con flete", "#0F766E", "#CCFBF1"),
     ]
 
     client_rank = _aggregate(applicable, ["cod_cliente", "cliente"])
