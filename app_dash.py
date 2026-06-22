@@ -38,7 +38,7 @@ from dash import dash_table
 from dash import dcc
 from dash import html
 
-from fletes_dashboard import get_fletes_type_options, render_fletes_tab
+from fletes_dashboard import get_fletes_filter_options, render_fletes_tab
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -2731,6 +2731,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 general_sales_countries,
                 general_sales_products,
                 general_sales_colors,
+                general_sales_types,
             )
         if tab == "fletes":
             return render_fletes_tab(
@@ -2834,6 +2835,36 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     )
     def cascade_general_sales_filters(tab, years, week_range, companies, clients, countries, products, colors, order_types):
         sales = data.get("ventas_semana", pd.DataFrame())
+        selected_companies = selected_values(companies)
+        selected_clients = selected_values(clients)
+        selected_countries = selected_values(countries)
+        selected_products = selected_values(products)
+        selected_colors = selected_values(colors)
+        selected_types = selected_values(order_types)
+
+        if tab == "fletes":
+            fletes_options = get_fletes_filter_options(years, week_range)
+            company_options, company_values = fletes_options.get("companies", ([], []))
+            client_options, client_values = fletes_options.get("clients", ([], []))
+            country_options, country_values = fletes_options.get("countries", ([], []))
+            product_options, product_values = fletes_options.get("products", ([], []))
+            color_options, color_values = fletes_options.get("colors", ([], []))
+            type_options, type_values = fletes_options.get("types", ([], []))
+            return (
+                company_options,
+                [value for value in selected_companies if value in set(company_values)],
+                client_options,
+                [value for value in selected_clients if value in set(client_values)],
+                country_options,
+                [value for value in selected_countries if value in set(country_values)],
+                product_options,
+                [value for value in selected_products if value in set(product_values)],
+                color_options,
+                [value for value in selected_colors if value in set(color_values)],
+                type_options,
+                [value for value in selected_types if value in set(type_values)],
+            )
+
         if sales.empty:
             return [], [], [], [], [], [], [], [], [], [], [], []
         latest_year = latest_selected_year(years, sales)
@@ -2847,12 +2878,6 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
             None,
             None,
         )
-        selected_companies = selected_values(companies)
-        selected_clients = selected_values(clients)
-        selected_countries = selected_values(countries)
-        selected_products = selected_values(products)
-        selected_colors = selected_values(colors)
-        selected_types = selected_values(order_types)
 
         company_options, company_values = tallos_options_from_frame(scope, "NomCompania")
         selected_companies = [value for value in selected_companies if value in set(company_values)]
@@ -2884,19 +2909,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if selected_colors and "color" in scope.columns:
             scope = scope[scope["color"].astype(str).isin(set(selected_colors))].copy()
 
-        if tab == "fletes":
-            type_options = get_fletes_type_options(
-                years,
-                week_range,
-                selected_companies,
-                selected_clients,
-                selected_countries,
-                selected_products,
-                selected_colors,
-            )
-            type_values = [str(option["value"]) for option in type_options]
-        else:
-            type_options, type_values = tallos_options_from_frame(scope, "tipo_pedido_operativo")
+        type_options, type_values = tallos_options_from_frame(scope, "tipo_pedido_operativo")
         selected_types = [value for value in selected_types if value in set(type_values)]
 
         return (
@@ -3317,13 +3330,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         State("general-sales-countries", "value"),
         State("general-sales-products", "value"),
         State("general-sales-colors", "value"),
+        State("general-sales-types", "value"),
         prevent_initial_call=True,
     )
-    def export_general_sales_report(summary_clicks, full_clicks, raw_clicks, base_year, compare_year, years, week_range, companies, clients, countries, products, colors):
+    def export_general_sales_report(summary_clicks, full_clicks, raw_clicks, base_year, compare_year, years, week_range, companies, clients, countries, products, colors, order_types):
         if not summary_clicks and not full_clicks and not raw_clicks:
             return dash.no_update
         if ctx.triggered_id == "general-sales-export-raw":
-            raw = sales_raw_export_frame(data, years, week_range, companies, clients, countries, products, colors)
+            raw = sales_raw_export_frame(data, years, week_range, companies, clients, countries, products, colors, order_types)
             if raw.empty:
                 return dash.no_update
             years_text = "_".join(map(str, selected_values(years))) if selected_values(years) else "todos"
@@ -3337,7 +3351,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         sales = data.get("ventas_semana", pd.DataFrame())
         if sales.empty:
             return dash.no_update
-        view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors)
+        view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors, order_types)
         if view.empty:
             return dash.no_update
         context = build_sales_executive_context_v2(view, base_year, compare_year)
@@ -5185,14 +5199,14 @@ def sales_product_week_matrix_display(df: pd.DataFrame, selected_clients: list[s
     return matrix
 
 
-def sales_raw_export_frame(data: dict[str, pd.DataFrame], years, week_range, companies, clients, countries, products, colors) -> pd.DataFrame:
+def sales_raw_export_frame(data: dict[str, pd.DataFrame], years, week_range, companies, clients, countries, products, colors, order_types=None) -> pd.DataFrame:
     """Return the most detailed available sales frame filtered like Ventas generales."""
     source = data.get("ventas_caja", pd.DataFrame())
     if source.empty:
         source = data.get("ventas_semana", pd.DataFrame())
     if source.empty:
         return pd.DataFrame()
-    out = filter_general_sales_frame(source, years, week_range, clients, products, countries, companies, colors)
+    out = filter_general_sales_frame(source, years, week_range, clients, products, countries, companies, colors, order_types)
     if out.empty:
         return out
     helper_cols = [col for col in ["week_start", "mes_num"] if col in out.columns]
@@ -5964,6 +5978,7 @@ def filter_general_sales_frame(
     countries: list[str] | None = None,
     companies: list[str] | None = None,
     colors: list[str] | None = None,
+    order_types: list[str] | None = None,
 ) -> pd.DataFrame:
     """Filter the pre-aggregated weekly sales source used by the fast view."""
     if frame.empty:
@@ -5988,6 +6003,9 @@ def filter_general_sales_frame(
     selected_colors = selected_values(colors)
     if selected_colors and "color" in out.columns:
         out = out[out["color"].astype(str).isin(selected_colors)].copy()
+    selected_types = selected_values(order_types)
+    if selected_types and "tipo_pedido_operativo" in out.columns:
+        out = out[out["tipo_pedido_operativo"].astype(str).isin(selected_types)].copy()
     if "anio_semana" in out.columns and "week_start" not in out.columns and "semana_iso" in out.columns:
         out["week_start"] = pd.to_datetime(
             out["anio"].astype(str) + "-W" + pd.to_numeric(out["semana_iso"], errors="coerce").fillna(1).astype(int).astype(str).str.zfill(2) + "-1",
@@ -6011,6 +6029,80 @@ def _month_label(month_num: int) -> str:
         7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
     }
     return labels.get(int(month_num), str(month_num))
+
+
+def _commercial_month_from_iso_week(year: pd.Series, week: pd.Series) -> pd.Series:
+    """Mes comercial aproximado para agregados semanales sin fecha diaria.
+
+    Usar el lunes ISO (`%G-W%V-%u`) puede poner la semana 1 en diciembre del
+    calendario anterior. Para Ventas generales necesitamos que las semanas del
+    año seleccionado se queden dentro de ese mismo año comercial.
+    """
+    year_num = pd.to_numeric(year, errors="coerce").fillna(0).astype(int)
+    week_num = pd.to_numeric(week, errors="coerce").fillna(1).clip(1, 53).astype(int)
+    dates = pd.to_datetime(
+        year_num.astype(str) + "-01-01",
+        errors="coerce",
+    ) + pd.to_timedelta((week_num - 1) * 7, unit="D")
+    return dates.dt.month
+
+
+LOW_USD_BASE_THRESHOLD = 1_000.0
+LOW_STEMS_BASE_THRESHOLD = 5_000.0
+
+
+def sales_variation_label(base: float, current: float, *, low_threshold: float = 0.0) -> str:
+    base = float(base or 0)
+    current = float(current or 0)
+    if base == 0 and current > 0:
+        return "Nuevo"
+    if base > 0 and current == 0:
+        return "Perdido"
+    if base == 0 and current == 0:
+        return "Sin movimiento"
+    if low_threshold and abs(base) < low_threshold:
+        return "Base baja"
+    return percent((current - base) / base)
+
+
+def sales_delta_pct(base: float, current: float, *, low_threshold: float = 0.0) -> float:
+    base = float(base or 0)
+    current = float(current or 0)
+    if base <= 0 or (low_threshold and abs(base) < low_threshold):
+        return np.nan
+    return (current - base) / base
+
+
+def sales_badge_class(delta_pct: float | None) -> str:
+    if delta_pct is None or pd.isna(delta_pct):
+        return "neutral"
+    if delta_pct > 0.02:
+        return "positive"
+    if delta_pct < -0.02:
+        return "negative"
+    return "neutral"
+
+
+def short_usd(value: float) -> str:
+    value = float(value or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value >= 1_000_000:
+        return f"{sign}${value / 1_000_000:,.1f}M"
+    if value >= 1_000:
+        return f"{sign}${value / 1_000:,.0f}K"
+    return f"{sign}${value:,.0f}"
+
+
+def short_stems(value: float) -> str:
+    value = float(value or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value >= 1_000_000:
+        return f"{sign}{value / 1_000_000:,.1f}M"
+    if value >= 1_000:
+        return f"{sign}{value / 1_000:,.0f}K"
+    return f"{sign}{value:,.0f}"
 
 
 def build_sales_executive_context(
@@ -6177,8 +6269,18 @@ def build_sales_executive_context(
     consolidated_delta_pct = consolidated_delta / consolidated_card_base if consolidated_card_base > 0 else np.nan
 
     product_leader = mix_donut.iloc[0] if not mix_donut.empty else None
-    product_grower = product_compare.sort_values("delta_usd_pct", ascending=False).iloc[0] if not product_compare.empty else None
-    product_decliner = product_compare.sort_values("delta_usd_pct", ascending=True).iloc[0] if not product_compare.empty else None
+    product_grower = product_compare.sort_values("delta_usd", ascending=False).iloc[0] if not product_compare.empty else None
+    product_decliner = product_compare.sort_values("delta_usd", ascending=True).iloc[0] if not product_compare.empty else None
+    country_grower = None
+    if comparison_mode and "pais" in view.columns:
+        country_raw = view[pd.to_numeric(view["anio"], errors="coerce").isin([int(selected_base), int(selected_compare)])].copy()
+        country_group = country_raw.groupby(["anio", "pais"], dropna=False, as_index=False)["ventas_usd"].sum()
+        country_base = country_group[country_group["anio"].eq(int(selected_base))].drop(columns=["anio"]).rename(columns={"ventas_usd": "ventas_base"})
+        country_comp = country_group[country_group["anio"].eq(int(selected_compare))].drop(columns=["anio"]).rename(columns={"ventas_usd": "ventas_compare"})
+        country_cmp = country_base.merge(country_comp, on="pais", how="outer").fillna(0)
+        country_cmp["delta_usd"] = country_cmp["ventas_compare"] - country_cmp["ventas_base"]
+        if not country_cmp.empty:
+            country_grower = country_cmp.sort_values("delta_usd", ascending=False).iloc[0]
     compare_growth_pct = (compare_projected_usd - consolidated_card_base) / consolidated_card_base if consolidated_card_base > 0 else np.nan
     compare_growth_mult = compare_projected_usd / consolidated_card_base if consolidated_card_base > 0 else np.nan
 
@@ -6460,11 +6562,16 @@ def build_sales_executive_context_v2(
     def aggregate(frame: pd.DataFrame) -> dict[str, float]:
         stems = float(frame["tallos_confirmados"].sum())
         usd = float(frame["ventas_usd"].sum())
+        pedidos = float(frame["pedidos"].sum()) if "pedidos" in frame.columns else float(len(frame))
         return {
             "ventas_usd": usd,
             "tallos_confirmados": stems,
             "precio_usd_tallo": usd / stems if stems > 0 else 0.0,
-            "pedidos": float(frame["pedidos"].sum()) if "pedidos" in frame.columns else float(len(frame)),
+            "pedidos": pedidos,
+            "clientes_activos": float(frame["cod_cliente"].nunique()) if "cod_cliente" in frame.columns else 0.0,
+            "productos_activos": float(frame["producto"].nunique()) if "producto" in frame.columns else 0.0,
+            "venta_promedio_pedido": usd / pedidos if pedidos > 0 else 0.0,
+            "tallos_promedio_pedido": stems / pedidos if pedidos > 0 else 0.0,
         }
 
     base_metrics = aggregate(base_frame)
@@ -6476,10 +6583,10 @@ def build_sales_executive_context_v2(
     if comparison_mode:
         monthly_parts.insert(0, base_frame.assign(ano_label=f"Ano base {int(selected_base)}"))
     monthly = pd.concat(monthly_parts, ignore_index=True)
-    if "mes_num" in monthly.columns:
+    if {"anio", "semana_iso"}.issubset(monthly.columns):
+        month_source = _commercial_month_from_iso_week(monthly["anio"], monthly["semana_iso"])
+    elif "mes_num" in monthly.columns:
         month_source = monthly["mes_num"]
-    elif "week_start" in monthly.columns:
-        month_source = pd.to_datetime(monthly["week_start"], errors="coerce").dt.month
     else:
         month_source = pd.Series([0] * len(monthly), index=monthly.index)
     monthly["mes_num"] = pd.to_numeric(month_source, errors="coerce").fillna(0).astype(int)
@@ -6490,20 +6597,41 @@ def build_sales_executive_context_v2(
     prod_compare = compare_frame.groupby("producto", as_index=False).agg(tallos_compare=("tallos_confirmados", "sum"), ventas_compare=("ventas_usd", "sum"))
     product_compare = prod_base.merge(prod_compare, on="producto", how="outer").fillna(0)
     product_compare["delta_tallos"] = product_compare["tallos_compare"] - product_compare["tallos_base"]
-    product_compare["delta_tallos_pct"] = np.where(product_compare["tallos_base"] > 0, product_compare["delta_tallos"] / product_compare["tallos_base"], np.nan)
+    product_compare["delta_tallos_pct"] = product_compare.apply(
+        lambda row: sales_delta_pct(row["tallos_base"], row["tallos_compare"], low_threshold=LOW_STEMS_BASE_THRESHOLD),
+        axis=1,
+    )
     product_compare["delta_usd"] = product_compare["ventas_compare"] - product_compare["ventas_base"]
-    product_compare["delta_usd_pct"] = np.where(product_compare["ventas_base"] > 0, product_compare["delta_usd"] / product_compare["ventas_base"], np.nan)
+    product_compare["delta_usd_pct"] = product_compare.apply(
+        lambda row: sales_delta_pct(row["ventas_base"], row["ventas_compare"], low_threshold=LOW_USD_BASE_THRESHOLD),
+        axis=1,
+    )
+    product_compare["estado_usd"] = product_compare.apply(
+        lambda row: sales_variation_label(row["ventas_base"], row["ventas_compare"], low_threshold=LOW_USD_BASE_THRESHOLD),
+        axis=1,
+    )
+    product_compare["estado_tallos"] = product_compare.apply(
+        lambda row: sales_variation_label(row["tallos_base"], row["tallos_compare"], low_threshold=LOW_STEMS_BASE_THRESHOLD),
+        axis=1,
+    )
+    product_compare["precio_base"] = (product_compare["ventas_base"] / product_compare["tallos_base"].replace(0, np.nan)).fillna(0)
+    product_compare["precio_compare"] = (product_compare["ventas_compare"] / product_compare["tallos_compare"].replace(0, np.nan)).fillna(0)
+    product_compare["delta_precio"] = product_compare["precio_compare"] - product_compare["precio_base"]
     product_compare["share_compare"] = np.where(compare_metrics["tallos_confirmados"] > 0, product_compare["tallos_compare"] / compare_metrics["tallos_confirmados"], np.nan)
     product_compare = product_compare.sort_values(["ventas_compare", "delta_usd"], ascending=[False, False]).reset_index(drop=True)
 
     mix_source = product_compare.sort_values("tallos_compare", ascending=False).copy()
     if len(mix_source) > 7:
-        others = pd.DataFrame(
+        top_mix = mix_source.head(7)[["producto", "tallos_compare", "ventas_compare"]].copy()
+        other_total = pd.DataFrame(
             [{"producto": "Otros", "tallos_compare": float(mix_source.iloc[7:]["tallos_compare"].sum()), "ventas_compare": float(mix_source.iloc[7:]["ventas_compare"].sum())}]
         )
-        mix_donut = pd.concat([mix_source.head(7)[["producto", "tallos_compare", "ventas_compare"]], others], ignore_index=True)
+        mix_donut = pd.concat([top_mix, other_total], ignore_index=True)
     else:
         mix_donut = mix_source[["producto", "tallos_compare", "ventas_compare"]].copy()
+    mix_donut["producto"] = mix_donut["producto"].fillna("Sin producto").astype(str)
+    mix_donut["producto"] = np.where(mix_donut["producto"].str.strip().str.lower().eq("otros"), "Otros", mix_donut["producto"])
+    mix_donut = mix_donut.groupby("producto", as_index=False)[["tallos_compare", "ventas_compare"]].sum()
     mix_donut["share"] = np.where(compare_metrics["tallos_confirmados"] > 0, mix_donut["tallos_compare"] / compare_metrics["tallos_confirmados"], 0)
 
     monthly_fig = go.Figure()
@@ -6524,21 +6652,21 @@ def build_sales_executive_context_v2(
     compare_top = product_compare.head(10).copy()
     product_bar_fig = go.Figure()
     if comparison_mode:
-        product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_base"], name=f"Ano base {selected_base}"))
-    product_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["tallos_compare"], name=f"Ano seleccionado {selected_compare}"))
-    product_bar_fig.update_layout(barmode="group", title="Tallos por producto" + (": base vs comparativo" if comparison_mode else ""))
-    product_bar_fig.update_yaxes(title="Tallos confirmados")
-    product_bar_fig.update_xaxes(title="Producto")
+        product_bar_fig.add_trace(go.Bar(y=compare_top["producto"], x=compare_top["tallos_base"], name=f"Año base {selected_base}", orientation="h"))
+    product_bar_fig.add_trace(go.Bar(y=compare_top["producto"], x=compare_top["tallos_compare"], name=f"Año seleccionado {selected_compare}", orientation="h"))
+    product_bar_fig.update_layout(barmode="group", title="¿Qué productos explican el volumen?", yaxis={"categoryorder": "total ascending"})
+    product_bar_fig.update_xaxes(title="Tallos confirmados")
+    product_bar_fig.update_yaxes(title="")
     apply_common_layout(product_bar_fig, 370)
     product_bar_fig.update_yaxes(tickformat=",d")
 
     product_sales_bar_fig = go.Figure()
     if comparison_mode:
-        product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_base"], name=f"Ano base {selected_base}"))
-    product_sales_bar_fig.add_trace(go.Bar(x=compare_top["producto"], y=compare_top["ventas_compare"], name=f"Ano seleccionado {selected_compare}"))
-    product_sales_bar_fig.update_layout(barmode="group", title="Facturacion por producto" + (": base vs comparativo" if comparison_mode else ""))
-    product_sales_bar_fig.update_yaxes(title="Ventas USD")
-    product_sales_bar_fig.update_xaxes(title="Producto")
+        product_sales_bar_fig.add_trace(go.Bar(y=compare_top["producto"], x=compare_top["ventas_base"], name=f"Año base {selected_base}", orientation="h"))
+    product_sales_bar_fig.add_trace(go.Bar(y=compare_top["producto"], x=compare_top["ventas_compare"], name=f"Año seleccionado {selected_compare}", orientation="h"))
+    product_sales_bar_fig.update_layout(barmode="group", title="¿Qué productos explican la facturación?", yaxis={"categoryorder": "total ascending"})
+    product_sales_bar_fig.update_xaxes(title="Ventas USD")
+    product_sales_bar_fig.update_yaxes(title="")
     apply_common_layout(product_sales_bar_fig, 370)
     product_sales_bar_fig.update_yaxes(tickformat=",.2f")
 
@@ -6567,22 +6695,48 @@ def build_sales_executive_context_v2(
     )
 
     product_leader = mix_donut.sort_values("share", ascending=False).iloc[0] if not mix_donut.empty else None
-    product_grower = product_compare.sort_values("delta_usd_pct", ascending=False).iloc[0] if not product_compare.empty else None
-    product_decliner = product_compare.sort_values("delta_usd_pct", ascending=True).iloc[0] if not product_compare.empty else None
+    product_grower = product_compare.sort_values("delta_usd", ascending=False).iloc[0] if not product_compare.empty else None
+    product_decliner = product_compare.sort_values("delta_usd", ascending=True).iloc[0] if not product_compare.empty else None
+    country_grower = None
+    if comparison_mode and "pais" in view.columns:
+        country_raw = view[pd.to_numeric(view["anio"], errors="coerce").isin([int(selected_base), int(selected_compare)])].copy()
+        country_group = country_raw.groupby(["anio", "pais"], dropna=False, as_index=False)["ventas_usd"].sum()
+        country_base = country_group[country_group["anio"].eq(int(selected_base))].drop(columns=["anio"]).rename(columns={"ventas_usd": "ventas_base"})
+        country_comp = country_group[country_group["anio"].eq(int(selected_compare))].drop(columns=["anio"]).rename(columns={"ventas_usd": "ventas_compare"})
+        country_cmp = country_base.merge(country_comp, on="pais", how="outer").fillna(0)
+        country_cmp["delta_usd"] = country_cmp["ventas_compare"] - country_cmp["ventas_base"]
+        if not country_cmp.empty:
+            country_grower = country_cmp.sort_values("delta_usd", ascending=False).iloc[0]
     insights = [
         f"La comparacion usa {base_weeks} semanas del ano base y {compare_weeks} semanas del ano comparativo dentro del alcance filtrado."
         if comparison_mode
         else f"Solo hay un ano visible en el filtro: {selected_compare}. Las graficas muestran la tendencia real de ese ano."
     ]
     if pd.notna(consolidated_delta_pct):
-        insights.append(f"La facturacion total cambia {percent(consolidated_delta_pct)} frente al ano base.")
-    insights.append(f"Los tallos totales pasan de {moneyless_number(base_metrics['tallos_confirmados'])} a {moneyless_number(compare_metrics['tallos_confirmados'])} en el alcance filtrado.")
+        insights.append(
+            f"Las ventas cambian {percent(consolidated_delta_pct)} frente al año base, pasando de {moneyless_number(base_metrics['ventas_usd'], 2)} a {moneyless_number(compare_metrics['ventas_usd'], 2)} USD."
+        )
+    volume_pct = sales_delta_pct(base_metrics["tallos_confirmados"], compare_metrics["tallos_confirmados"], low_threshold=LOW_STEMS_BASE_THRESHOLD)
+    price_pct = sales_delta_pct(base_metrics["precio_usd_tallo"], compare_metrics["precio_usd_tallo"])
+    if pd.notna(volume_pct) and pd.notna(price_pct):
+        if abs(volume_pct) > abs(price_pct) * 1.25:
+            driver = "principalmente por volumen"
+        elif abs(price_pct) > abs(volume_pct) * 1.25:
+            driver = "principalmente por precio"
+        else:
+            driver = "por combinacion de volumen y precio"
+        insights.append(f"El cambio se explica {driver}: tallos {percent(volume_pct)} y precio promedio {percent(price_pct)}.")
+    else:
+        insights.append(f"Los tallos totales pasan de {moneyless_number(base_metrics['tallos_confirmados'])} a {moneyless_number(compare_metrics['tallos_confirmados'])}.")
     if product_leader is not None:
         insights.append(f"El producto lider del mix en el ano comparativo es {product_leader['producto']} con {percent(product_leader['share'])} del total.")
     if product_grower is not None:
-        insights.append(f"El producto con mayor crecimiento en USD es {product_grower['producto']} ({percent(product_grower['delta_usd_pct'])}).")
+        status_text = product_grower.get("estado_usd", "")
+        insights.append(f"El producto que mas aporta al crecimiento en USD es {product_grower['producto']} ({moneyless_number(product_grower['delta_usd'], 2)} USD, {status_text}).")
     if product_decliner is not None:
-        insights.append(f"El producto con mayor caida relevante es {product_decliner['producto']} ({percent(product_decliner['delta_usd_pct'])}).")
+        insights.append(f"El producto con mayor caida en USD es {product_decliner['producto']} ({moneyless_number(product_decliner['delta_usd'], 2)} USD).")
+    if country_grower is not None:
+        insights.append(f"El mayor crecimiento por pais se concentra en {country_grower['pais']} ({moneyless_number(country_grower['delta_usd'], 2)} USD).")
     insights = insights[:6]
 
     context.update(
@@ -6627,6 +6781,10 @@ def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
         ("Tallos confirmados", "tallos_confirmados", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
         ("Precio USD/tallo", "precio_usd_tallo", lambda value: moneyless_number(value, 4), lambda value: moneyless_number(value, 4)),
         ("Pedidos", "pedidos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+        ("Clientes activos", "clientes_activos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+        ("Productos activos", "productos_activos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+        ("Venta prom. pedido", "venta_promedio_pedido", lambda value: moneyless_number(value, 2), lambda value: moneyless_number(value, 2)),
+        ("Tallos prom. pedido", "tallos_promedio_pedido", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
     ]
     if not context.get("comparison_mode", True):
         return pd.DataFrame(
@@ -6642,14 +6800,14 @@ def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
         base_value = float(base.get(key, 0) or 0)
         compare_value = float(compare.get(key, 0) or 0)
         delta = compare_value - base_value
-        delta_pct = delta / base_value if base_value > 0 else np.nan
+        delta_pct = sales_delta_pct(base_value, compare_value)
         rows.append(
             {
                 "Metrica": label,
                 f"Ano base {context['base_year']}": formatter(base_value),
                 f"Ano comparativo {context['compare_year']}": formatter(compare_value),
                 "Diferencia": delta_formatter(delta),
-                "Variacion %": percent(delta_pct),
+                "Variacion %": sales_variation_label(base_value, compare_value),
             }
         )
     return pd.DataFrame(rows)
@@ -6685,10 +6843,12 @@ def product_comparison_display(product_compare: pd.DataFrame, base_year: int, co
             "ventas_compare": f"USD {compare_year}",
             "delta_usd": "Dif. USD",
             "delta_usd_pct": "Var. USD %",
+            "estado_usd": "Estado USD",
             "tallos_base": f"Tallos {base_year}",
             "tallos_compare": f"Tallos {compare_year}",
             "delta_tallos": "Dif. tallos",
             "delta_tallos_pct": "Var. tallos %",
+            "estado_tallos": "Estado tallos",
             "share_compare": f"Share tallos {compare_year}",
         }
     )
@@ -6698,10 +6858,12 @@ def product_comparison_display(product_compare: pd.DataFrame, base_year: int, co
         f"USD {compare_year}",
         "Dif. USD",
         "Var. USD %",
+        "Estado USD",
         f"Tallos {base_year}",
         f"Tallos {compare_year}",
         "Dif. tallos",
         "Var. tallos %",
+        "Estado tallos",
         f"Share tallos {compare_year}",
     ]
     out = out[[col for col in cols if col in out.columns]]
@@ -6714,6 +6876,11 @@ def product_comparison_display(product_compare: pd.DataFrame, base_year: int, co
     for col in ["Var. USD %", "Var. tallos %", f"Share tallos {compare_year}"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").map(percent)
+    if "Estado USD" in out.columns and "Var. USD %" in out.columns:
+        out["Var. USD %"] = np.where(out["Estado USD"].isin(["Nuevo", "Perdido", "Base baja", "Sin movimiento"]), out["Estado USD"], out["Var. USD %"])
+    if "Estado tallos" in out.columns and "Var. tallos %" in out.columns:
+        out["Var. tallos %"] = np.where(out["Estado tallos"].isin(["Nuevo", "Perdido", "Base baja", "Sin movimiento"]), out["Estado tallos"], out["Var. tallos %"])
+    out = out.drop(columns=[col for col in ["Estado USD", "Estado tallos"] if col in out.columns])
     return out
 
 
@@ -6777,9 +6944,23 @@ def growth_by_dimension_display(
     comp = grouped[pd.to_numeric(grouped["anio"], errors="coerce").eq(int(compare_year))].drop(columns=["anio"])
     merged = base.merge(comp, on=group_cols, how="outer", suffixes=("_base", "_compare")).fillna(0)
     merged["delta_usd"] = merged["ventas_usd_compare"] - merged["ventas_usd_base"]
-    merged["delta_usd_pct"] = np.where(merged["ventas_usd_base"] > 0, merged["delta_usd"] / merged["ventas_usd_base"], np.nan)
+    merged["delta_usd_pct"] = merged.apply(
+        lambda row: sales_delta_pct(row["ventas_usd_base"], row["ventas_usd_compare"], low_threshold=LOW_USD_BASE_THRESHOLD),
+        axis=1,
+    )
+    merged["estado_usd"] = merged.apply(
+        lambda row: sales_variation_label(row["ventas_usd_base"], row["ventas_usd_compare"], low_threshold=LOW_USD_BASE_THRESHOLD),
+        axis=1,
+    )
     merged["delta_tallos"] = merged["tallos_confirmados_compare"] - merged["tallos_confirmados_base"]
-    merged["delta_tallos_pct"] = np.where(merged["tallos_confirmados_base"] > 0, merged["delta_tallos"] / merged["tallos_confirmados_base"], np.nan)
+    merged["delta_tallos_pct"] = merged.apply(
+        lambda row: sales_delta_pct(row["tallos_confirmados_base"], row["tallos_confirmados_compare"], low_threshold=LOW_STEMS_BASE_THRESHOLD),
+        axis=1,
+    )
+    merged["estado_tallos"] = merged.apply(
+        lambda row: sales_variation_label(row["tallos_confirmados_base"], row["tallos_confirmados_compare"], low_threshold=LOW_STEMS_BASE_THRESHOLD),
+        axis=1,
+    )
     merged["precio_compare"] = (merged["ventas_usd_compare"] / merged["tallos_confirmados_compare"].replace(0, np.nan)).fillna(0)
     merged = merged.sort_values(["ventas_usd_compare", "delta_usd"], ascending=[False, False]).head(rows)
     rename = {
@@ -6791,10 +6972,12 @@ def growth_by_dimension_display(
         "ventas_usd_compare": f"USD {compare_year}",
         "delta_usd": "Crecimiento USD",
         "delta_usd_pct": "Crecimiento %",
+        "estado_usd": "Estado USD",
         "tallos_confirmados_base": f"Tallos {base_year}",
         "tallos_confirmados_compare": f"Tallos {compare_year}",
         "delta_tallos": "Crecimiento tallos",
         "delta_tallos_pct": "Crec. tallos %",
+        "estado_tallos": "Estado tallos",
         "precio_compare": f"Precio {compare_year}",
     }
     out = merged.rename(columns=rename)
@@ -6803,10 +6986,12 @@ def growth_by_dimension_display(
         f"USD {compare_year}",
         "Crecimiento USD",
         "Crecimiento %",
+        "Estado USD",
         f"Tallos {base_year}",
         f"Tallos {compare_year}",
         "Crecimiento tallos",
         "Crec. tallos %",
+        "Estado tallos",
         f"Precio {compare_year}",
     ]
     out = out[[col for col in cols if col in out.columns]]
@@ -6819,6 +7004,11 @@ def growth_by_dimension_display(
     for col in ["Crecimiento %", "Crec. tallos %"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").map(percent)
+    if "Estado USD" in out.columns and "Crecimiento %" in out.columns:
+        out["Crecimiento %"] = np.where(out["Estado USD"].isin(["Nuevo", "Perdido", "Base baja", "Sin movimiento"]), out["Estado USD"], out["Crecimiento %"])
+    if "Estado tallos" in out.columns and "Crec. tallos %" in out.columns:
+        out["Crec. tallos %"] = np.where(out["Estado tallos"].isin(["Nuevo", "Perdido", "Base baja", "Sin movimiento"]), out["Estado tallos"], out["Crec. tallos %"])
+    out = out.drop(columns=[col for col in ["Estado USD", "Estado tallos"] if col in out.columns])
     if f"Precio {compare_year}" in out.columns:
         out[f"Precio {compare_year}"] = pd.to_numeric(out[f"Precio {compare_year}"], errors="coerce").map(lambda value: moneyless_number(value, 4))
     return out
@@ -6936,6 +7126,151 @@ def sales_scope_summary(
         "colores_count": moneyless_number(color_count),
         "paises_count": moneyless_number(country_count),
     }
+
+
+def sales_concentration_cards(view: pd.DataFrame, compare_year: int) -> list:
+    current = view[pd.to_numeric(view["anio"], errors="coerce").eq(int(compare_year))].copy()
+    if current.empty:
+        return []
+    total = float(current["ventas_usd"].sum())
+    specs = [
+        ("Top 10 clientes", "cod_cliente"),
+        ("Top 10 productos", "producto"),
+        ("Pais lider", "pais"),
+        ("Compania lider", "NomCompania"),
+    ]
+    cards = []
+    for title, col in specs:
+        if col not in current.columns or total <= 0:
+            continue
+        grouped = current.groupby(col, dropna=False)["ventas_usd"].sum().sort_values(ascending=False)
+        n = 10 if "Top 10" in title else 1
+        share = float(grouped.head(n).sum() / total)
+        leader = str(grouped.index[0]) if len(grouped) else "Sin dato"
+        cards.append(
+            html.Div(
+                [
+                    html.Div(title, className="scope-label"),
+                    html.Div(percent(share), className="scope-number"),
+                    html.Div(leader[:80], className="metric-detail"),
+                ],
+                className="scope-card",
+            )
+        )
+    return cards
+
+
+def sales_data_quality_summary(view: pd.DataFrame, week_range: list[int] | None) -> html.Div:
+    rows = max(len(view), 1)
+    checks = []
+    for label, col in [
+        ("sin cliente", "cod_cliente"),
+        ("sin pais", "pais"),
+        ("sin producto", "producto"),
+        ("sin compania", "NomCompania"),
+    ]:
+        if col in view.columns:
+            missing = view[col].fillna("").astype(str).str.strip().isin(["", "nan", "None", "SIN_DATO", "sin_info"]).sum()
+            checks.append((label, int(missing)))
+    tallos = pd.to_numeric(view.get("tallos_confirmados", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    ventas = pd.to_numeric(view.get("ventas_usd", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    checks.append(("ventas con tallos cero", int((ventas.gt(0) & tallos.le(0)).sum())))
+    price = ventas / tallos.replace(0, np.nan)
+    if price.notna().any():
+        lo, hi = price.quantile([0.01, 0.99])
+        checks.append(("precio atipico", int((price.lt(lo) | price.gt(hi)).fillna(False).sum())))
+    if week_range and len(week_range) == 2 and "semana_iso" in view.columns:
+        weeks = pd.to_numeric(view["semana_iso"], errors="coerce")
+        checks.append(("semanas fuera de rango", int((~weeks.between(int(week_range[0]), int(week_range[1]))).sum())))
+    issues = sum(count for _, count in checks)
+    completeness = 1 - min(issues / max(rows * max(len(checks), 1), 1), 1)
+    return html.Div(
+        [
+            html.Div("Calidad de datos", className="panel-title"),
+            html.Div(f"{percent(completeness)} completa", className="metric-value"),
+            html.Div([html.Div(f"{count:,} registros {label}", className="metric-detail") for label, count in checks if count > 0] or [html.Div("Sin alertas relevantes en el alcance filtrado.", className="metric-detail")]),
+        ],
+        className="strategy-card",
+    )
+
+
+def new_lost_clients_display(view: pd.DataFrame, base_year: int, compare_year: int, mode: str = "new", rows: int = 10) -> pd.DataFrame:
+    if view.empty or "cod_cliente" not in view.columns:
+        return pd.DataFrame()
+    group_cols = [col for col in ["cod_cliente", "cliente", "pais", "NomCompania"] if col in view.columns]
+    work = view[pd.to_numeric(view["anio"], errors="coerce").isin([int(base_year), int(compare_year)])].copy()
+    grouped = work.groupby(["anio"] + group_cols, dropna=False, as_index=False).agg(
+        ventas_usd=("ventas_usd", "sum"),
+        tallos_confirmados=("tallos_confirmados", "sum"),
+    )
+    base = grouped[grouped["anio"].eq(int(base_year))].drop(columns=["anio"]).rename(columns={"ventas_usd": "usd_base", "tallos_confirmados": "tallos_base"})
+    comp = grouped[grouped["anio"].eq(int(compare_year))].drop(columns=["anio"]).rename(columns={"ventas_usd": "usd_compare", "tallos_confirmados": "tallos_compare"})
+    merged = base.merge(comp, on=group_cols, how="outer").fillna(0)
+    if mode == "lost":
+        merged = merged[merged["usd_base"].gt(0) & merged["usd_compare"].le(0)].sort_values("usd_base", ascending=False)
+    else:
+        merged = merged[merged["usd_base"].le(0) & merged["usd_compare"].gt(0)].sort_values("usd_compare", ascending=False)
+    out = merged.head(rows).rename(columns={
+        "cod_cliente": "Cod. cliente",
+        "cliente": "Cliente",
+        "pais": "Pais",
+        "NomCompania": "Compania",
+        "usd_base": f"USD {base_year}",
+        "usd_compare": f"USD {compare_year}",
+        "tallos_base": f"Tallos {base_year}",
+        "tallos_compare": f"Tallos {compare_year}",
+    })
+    for col in [f"USD {base_year}", f"USD {compare_year}"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 2))
+    for col in [f"Tallos {base_year}", f"Tallos {compare_year}"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda value: moneyless_number(value, 0))
+    cols = ["Cod. cliente", "Cliente", "Pais", "Compania", f"USD {base_year}", f"USD {compare_year}", f"Tallos {base_year}", f"Tallos {compare_year}"]
+    return out[[col for col in cols if col in out.columns]]
+
+
+def sales_price_product_figure(product_compare: pd.DataFrame, base_year: int, compare_year: int) -> go.Figure:
+    if product_compare.empty:
+        return empty_figure("Precio promedio por producto")
+    top = product_compare.sort_values("ventas_compare", ascending=False).head(10).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=top["producto"], x=top["precio_base"], name=f"Precio {base_year}", orientation="h"))
+    fig.add_trace(go.Bar(y=top["producto"], x=top["precio_compare"], name=f"Precio {compare_year}", orientation="h"))
+    fig.update_layout(barmode="group", title="¿El precio por producto mejoró?", yaxis={"categoryorder": "total ascending"})
+    fig.update_xaxes(title="USD/tallo", tickformat=",.4f")
+    fig.update_yaxes(title="")
+    return apply_common_layout(fig, 370)
+
+
+def sales_opportunity_matrix_figure(product_compare: pd.DataFrame) -> go.Figure:
+    if product_compare.empty:
+        return empty_figure("Matriz de oportunidad")
+    plot = product_compare[
+        product_compare["ventas_compare"].gt(0)
+        & product_compare["delta_tallos_pct"].notna()
+        & product_compare["precio_base"].gt(0)
+    ].copy()
+    if len(plot) < 3:
+        return empty_figure("Matriz de oportunidad")
+    plot["precio_pct"] = np.where(plot["precio_base"].gt(0), plot["delta_precio"] / plot["precio_base"], np.nan)
+    plot = plot.dropna(subset=["delta_tallos_pct", "precio_pct"]).head(40)
+    if len(plot) < 3:
+        return empty_figure("Matriz de oportunidad")
+    fig = px.scatter(
+        plot,
+        x="delta_tallos_pct",
+        y="precio_pct",
+        size="ventas_compare",
+        color="producto",
+        hover_data=["ventas_compare", "tallos_compare", "precio_compare"],
+        title="¿Crecemos por volumen o por precio?",
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#9CA3AF")
+    fig.add_vline(x=0, line_dash="dash", line_color="#9CA3AF")
+    fig.update_xaxes(title="Crecimiento tallos", tickformat=".0%")
+    fig.update_yaxes(title="Crecimiento precio", tickformat=".0%")
+    return apply_common_layout(fig, 390)
 
 
 def _pdf_escape(text: object) -> str:
@@ -7058,9 +7393,9 @@ def _pdf_table(
 
 
 def _pdf_comparison_cards(content: list[str], x: int, y: int, cards: list[dict[str, object]], base_year: int, compare_year: int) -> None:
-    card_w = 124
-    card_h = 78
-    gap = 8
+    card_w = 82 if len(cards) > 4 else 124
+    card_h = 72 if len(cards) > 4 else 78
+    gap = 6 if len(cards) > 4 else 8
     for idx, card in enumerate(cards):
         cx = x + idx * (card_w + gap)
         delta = card.get("delta_pct")
@@ -7073,11 +7408,11 @@ def _pdf_comparison_cards(content: list[str], x: int, y: int, cards: list[dict[s
             delta_text = f"{float(delta):+.1%}"
         _pdf_stroked_rect(content, cx, y - card_h, card_w, card_h, (0.97, 0.98, 0.99), (0.86, 0.89, 0.93), 0.8)
         _pdf_rect(content, cx, y - 5, card_w, 5, (0.50, 0.00, 0.13))
-        _pdf_text(content, cx + 10, y - 20, str(card["title"]), 8, (0.38, 0.43, 0.49), "F2")
-        _pdf_text(content, cx + 10, y - 36, f"{base_year}: {card['base']}", 8, (0.18, 0.22, 0.28))
-        _pdf_text(content, cx + 10, y - 51, f"{compare_year}: {card['compare']}", 8, (0.09, 0.13, 0.18), "F2")
-        _pdf_rect(content, cx + 10, y - 70, 46, 13, accent)
-        _pdf_text(content, cx + 15, y - 67, delta_text, 7, (1, 1, 1), "F2")
+        _pdf_text(content, cx + 7, y - 18, str(card["title"])[:16], 7, (0.38, 0.43, 0.49), "F2")
+        _pdf_text(content, cx + 7, y - 33, f"{base_year}: {card['base']}", 7, (0.18, 0.22, 0.28))
+        _pdf_text(content, cx + 7, y - 47, f"{compare_year}: {card['compare']}", 7, (0.09, 0.13, 0.18), "F2")
+        _pdf_rect(content, cx + 7, y - 65, 42, 12, accent)
+        _pdf_text(content, cx + 11, y - 62, delta_text, 6, (1, 1, 1), "F2")
 
 
 def _pdf_bar_chart(
@@ -7208,8 +7543,16 @@ def _pdf_monthly_bar_chart(
     if frame.empty or "ventas_usd" not in frame.columns:
         _pdf_text(content, x + 20, y + h / 2, "Sin datos para la grafica", 8, (0.38, 0.43, 0.49))
         return
-    base_label = f"Ano base {base_year}"
-    compare_label = f"Ano comparativo {compare_year}"
+    label_series = frame.get("ano_label", pd.Series(dtype=object)).fillna("").astype(str)
+    base_label = next((label for label in label_series.unique() if str(base_year) in label and "base" in label.lower()), f"Ano base {base_year}")
+    compare_label = next(
+        (
+            label
+            for label in label_series.unique()
+            if str(compare_year) in label and ("comparativo" in label.lower() or "seleccionado" in label.lower())
+        ),
+        f"Ano seleccionado {compare_year}",
+    )
     months = frame[["mes_num", "Mes"]].drop_duplicates().sort_values("mes_num").head(12)
     max_value = max(float(frame["ventas_usd"].max()), 1.0) * 1.12
     for tick_idx in range(5):
@@ -7360,6 +7703,8 @@ def build_sales_report_pdf(
         ("Tallos confirmados", "tallos_confirmados", lambda value: moneyless_number(value)),
         ("Precio promedio", "precio_usd_tallo", lambda value: moneyless_number(value, 4)),
         ("Pedidos", "pedidos", lambda value: moneyless_number(value)),
+        ("Clientes activos", "clientes_activos", lambda value: moneyless_number(value)),
+        ("Productos activos", "productos_activos", lambda value: moneyless_number(value)),
     ]
     comparison_cards = []
     for title, metric, formatter in card_specs:
@@ -7568,13 +7913,14 @@ def render_ventas_generales_tab_v2(
     countries: list[str] | None,
     products: list[str] | None,
     colors: list[str] | None,
+    order_types: list[str] | None = None,
 ) -> html.Div:
     """Executive sales tab with yearly comparison and weekly context."""
     sales = data.get("ventas_semana", pd.DataFrame())
     if sales.empty:
         return html.Div("No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.", className="table-panel")
 
-    view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors)
+    view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors, order_types)
     if view.empty:
         available_years = sorted(pd.to_numeric(sales["anio"], errors="coerce").dropna().astype(int).unique().tolist()) if "anio" in sales.columns else []
         years_text = ", ".join(map(str, available_years)) if available_years else "sin anos disponibles"
@@ -7582,7 +7928,7 @@ def render_ventas_generales_tab_v2(
             [
                 html.Div("Ventas generales", className="panel-title"),
                 panel_note(
-                    f"No hay ventas para los filtros seleccionados. AÃ±os disponibles en esta base: {years_text}. "
+                    f"No hay ventas para los filtros seleccionados. Años disponibles en esta base: {years_text}. "
                     "Revisa el rango de semanas, cliente, producto o color seleccionado."
                 ),
             ],
@@ -7606,6 +7952,12 @@ def render_ventas_generales_tab_v2(
     precio_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="USD/tallo")
     apply_common_layout(precio_fig, 345)
     precio_fig.update_yaxes(tickformat=",.4f")
+    price_values = pd.to_numeric(weekly.get("precio_usd_tallo", pd.Series(dtype=float)), errors="coerce").dropna()
+    if not price_values.empty:
+        p_min = float(price_values.min())
+        p_max = float(price_values.max())
+        pad = max((p_max - p_min) * 0.15, 0.005)
+        precio_fig.update_yaxes(range=[max(0, p_min - pad), p_max + pad])
 
     annual_display = annual.rename(columns={"anio": "Ano", "tallos_confirmados": "Tallos confirmados", "ventas_usd": "Ventas USD", "precio_usd_tallo": "USD/tallo"})[["Ano", "Tallos confirmados", "Ventas USD", "USD/tallo"]].copy()
     annual_display["Tallos confirmados"] = annual_display["Tallos confirmados"].map(moneyless_number)
@@ -7646,18 +7998,27 @@ def render_ventas_generales_tab_v2(
         make_year_comparison_card("Tallos confirmados", annual_cards, "tallos_confirmados", lambda value: moneyless_number(value), "misma ventana"),
         make_year_comparison_card("Precio promedio", annual_cards, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/tallo"),
         make_year_comparison_card("Pedidos", annual_cards, "pedidos", lambda value: moneyless_number(value), "ordenes agregadas"),
+        make_year_comparison_card("Clientes activos", annual_cards, "clientes_activos", lambda value: moneyless_number(value), "con venta"),
+        make_year_comparison_card("Productos activos", annual_cards, "productos_activos", lambda value: moneyless_number(value), "con venta"),
+        make_year_comparison_card("Venta prom. pedido", annual_cards, "venta_promedio_pedido", lambda value: moneyless_number(value, 2), "USD/pedido"),
+        make_year_comparison_card("Tallos prom. pedido", annual_cards, "tallos_promedio_pedido", lambda value: moneyless_number(value), "tallos/pedido"),
     ]
     metric_compare_table = sales_metric_comparison_display(context)
     active_compare_year = context.get("compare_year") or compare_year or (int(annual["anio"].max()) if not annual.empty else 0)
     active_base_year = context.get("base_year") or base_year or active_compare_year
+    comparison_mode = bool(context.get("comparison_mode"))
     product_compare_table = product_comparison_display(
         context["product_compare"] if context.get("ok") else pd.DataFrame(),
         active_base_year,
         active_compare_year,
         rows=20,
     )
-    comparison_mode = bool(context.get("comparison_mode"))
+    product_compare_frame = context["product_compare"] if context.get("ok") else pd.DataFrame()
+    price_product_fig = sales_price_product_figure(product_compare_frame, active_base_year, active_compare_year) if comparison_mode else empty_figure("Precio promedio por producto")
+    opportunity_fig = sales_opportunity_matrix_figure(product_compare_frame) if comparison_mode else empty_figure("Matriz de oportunidad")
     scope = sales_scope_summary(view, clients, products, countries, companies, colors)
+    concentration_cards = sales_concentration_cards(view, active_compare_year)
+    quality_card = sales_data_quality_summary(view, week_range)
     logo_uri = logo_data_uri()
     strategic_items = context["insights"] if context.get("ok") else ["No hay suficientes datos para construir la comparacion ejecutiva."]
     strategic_cards = [
@@ -7714,6 +8075,8 @@ def render_ventas_generales_tab_v2(
         if comparison_mode
         else pd.DataFrame()
     )
+    new_clients_table = new_lost_clients_display(view, active_base_year, active_compare_year, mode="new", rows=10) if comparison_mode else pd.DataFrame()
+    lost_clients_table = new_lost_clients_display(view, active_base_year, active_compare_year, mode="lost", rows=10) if comparison_mode else pd.DataFrame()
 
     report_panel = html.Div(
         [
@@ -7726,9 +8089,9 @@ def render_ventas_generales_tab_v2(
                             html.Div("Informe ejecutivo comercial", className="executive-title"),
                             html.Div(
                                 (
-                                    f"Ano base {active_base_year} vs ano comparativo {active_compare_year} | semanas {weeks_text}"
+                                    f"Año base {active_base_year} vs año comparativo {active_compare_year} | semanas {weeks_text}"
                                     if context.get("comparison_mode")
-                                    else f"Ano seleccionado {active_compare_year} | semanas {weeks_text}"
+                                    else f"Año seleccionado {active_compare_year} | semanas {weeks_text}"
                                 ),
                                 className="executive-subtitle",
                             ),
@@ -7751,9 +8114,33 @@ def render_ventas_generales_tab_v2(
             html.Div(executive_metrics, className="metrics-grid"),
             html.Div(
                 [
+                    html.Div("¿Qué explica el crecimiento?", className="panel-title"),
+                    panel_note("Separa el cambio de ventas en volumen, precio promedio y pedidos. Los porcentajes sobre base cero o base baja se etiquetan para no distorsionar la lectura."),
                     html.Div(
                         [
-                            html.Div("Ventas generales USD", className="panel-title"),
+                            make_card("Crecimiento USD", moneyless_number(context.get("consolidated_delta", 0), 2), sales_variation_label(context["base_metrics"].get("ventas_usd", 0), context["compare_metrics"].get("ventas_usd", 0), low_threshold=LOW_USD_BASE_THRESHOLD) if context.get("ok") else "sin comparativo"),
+                            make_card("Crecimiento tallos", moneyless_number(context["compare_metrics"].get("tallos_confirmados", 0) - context["base_metrics"].get("tallos_confirmados", 0), 0) if context.get("ok") else "0", sales_variation_label(context["base_metrics"].get("tallos_confirmados", 0), context["compare_metrics"].get("tallos_confirmados", 0), low_threshold=LOW_STEMS_BASE_THRESHOLD) if context.get("ok") else "sin comparativo"),
+                            make_card("Variación precio", moneyless_number(context["compare_metrics"].get("precio_usd_tallo", 0) - context["base_metrics"].get("precio_usd_tallo", 0), 4) if context.get("ok") else "0.0000", sales_variation_label(context["base_metrics"].get("precio_usd_tallo", 0), context["compare_metrics"].get("precio_usd_tallo", 0)) if context.get("ok") else "sin comparativo"),
+                            make_card("Variación pedidos", moneyless_number(context["compare_metrics"].get("pedidos", 0) - context["base_metrics"].get("pedidos", 0), 0) if context.get("ok") else "0", sales_variation_label(context["base_metrics"].get("pedidos", 0), context["compare_metrics"].get("pedidos", 0)) if context.get("ok") else "sin comparativo"),
+                        ],
+                        className="metrics-grid",
+                    ),
+                ],
+                className="table-panel section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div("Concentración comercial", className="panel-title"),
+                    panel_note("Mide dependencia del negocio: cuánto explican los principales clientes, productos, países y compañías."),
+                    html.Div(concentration_cards + [quality_card], className="scope-strip"),
+                ],
+                className="table-panel section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("¿Cómo vamos frente al año base?", className="panel-title"),
                             panel_note("Comparacion directa de facturacion real entre anos; si solo hay un ano visible, muestra su total real."),
                             dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Ventas generales USD")),
                         ],
@@ -7761,7 +8148,7 @@ def render_ventas_generales_tab_v2(
                     ),
                     html.Div(
                         [
-                            html.Div("Facturacion por producto", className="panel-title"),
+                            html.Div("¿Qué productos explican la facturación?", className="panel-title"),
                             panel_note("Barras por producto ordenadas por facturacion del ano seleccionado."),
                             dcc.Graph(figure=context["product_sales_bar_fig"] if context.get("ok") else empty_figure("Facturacion por producto")),
                         ],
@@ -7772,29 +8159,36 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Tallos por producto", className="panel-title"), panel_note("Volumen por producto; compara anos cuando existe base visible."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
-                    html.Div([html.Div("Tallos confirmados por semana", className="panel-title"), panel_note("Evolucion semanal de tallos reales para comparar nivel y estacionalidad entre anos."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
+                    html.Div([html.Div("¿Qué productos explican el volumen?", className="panel-title"), panel_note("Volumen por producto; compara anos cuando existe base visible."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
+                    html.Div([html.Div("¿Cómo evolucionó el volumen semanal?", className="panel-title"), panel_note("Evolucion semanal de tallos reales para comparar nivel y estacionalidad entre anos."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Evolucion del precio", className="panel-title"), panel_note("Precio promedio ponderado semanal: ventas USD divididas por tallos confirmados."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
-                    html.Div([html.Div("Resumen mensual USD", className="panel-title"), panel_note("Tendencia mensual del ano seleccionado y comparacion cuando existe base visible."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturacion USD por mes"))], className="panel"),
+                    html.Div([html.Div("¿Cómo evolucionó el precio?", className="panel-title"), panel_note("Precio promedio ponderado semanal: ventas USD divididas por tallos confirmados."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
+                    html.Div([html.Div("¿Cómo se comportó la facturación mensual?", className="panel-title"), panel_note("Mes comercial calculado desde año y semana ISO dentro del mismo año seleccionado."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturacion USD por mes"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Mix por producto", className="panel-title"), panel_note("Producto dominante del ano seleccionado y su participacion en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix por producto"))], className="panel"),
+                    html.Div([html.Div("¿Cómo está compuesto el mix comercial?", className="panel-title"), panel_note("Producto dominante del ano seleccionado y su participacion en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix por producto"))], className="panel"),
                     html.Div(
                         [
-                            html.Div("Lectura estratÃ©gica", className="panel-title"),
+                            html.Div("Lectura estratégica", className="panel-title"),
                             panel_note("Resumen ejecutivo calculado con los filtros actuales."),
                             html.Div(strategic_cards, className="strategy-grid"),
                         ],
                         className="strategy-panel",
                     ),
+                ],
+                className="grid-2 section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("¿El precio por producto mejoró?", className="panel-title"), panel_note("Top productos por venta del año comparativo; compara USD/tallo base vs actual."), dcc.Graph(figure=price_product_fig)], className="panel"),
+                    html.Div([html.Div("Matriz de oportunidad", className="panel-title"), panel_note("Cuadrantes: volumen vs precio. Evita lectura si no hay suficiente base comparable."), dcc.Graph(figure=opportunity_fig)], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -7823,6 +8217,27 @@ def render_ventas_generales_tab_v2(
                                 sort_by=[{"column_id": "Dif. tallos", "direction": "asc"}],
                                 table_id="ventas-top-tallos-caida",
                             ),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                ],
+                className="executive-table-grid section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Clientes nuevos", className="panel-title"),
+                            panel_note("Ventas en el año comparativo con base cero en el año base."),
+                            make_table(new_clients_table, 10, table_id="ventas-clientes-nuevos"),
+                        ],
+                        className="table-panel no-top-margin",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Clientes perdidos", className="panel-title"),
+                            panel_note("Clientes con venta positiva en el año base y cero en el comparativo."),
+                            make_table(lost_clients_table, 10, table_id="ventas-clientes-perdidos"),
                         ],
                         className="table-panel no-top-margin",
                     ),

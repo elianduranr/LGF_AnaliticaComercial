@@ -1009,6 +1009,50 @@ def get_fletes_type_options(
     return [{"label": value, "value": value} for value in values]
 
 
+def _fletes_options_from_frame(frame: pd.DataFrame, value_col: str, label_col: str | None = None) -> tuple[list[dict[str, str]], list[str]]:
+    if frame.empty or value_col not in frame.columns:
+        return [], []
+    label_col = label_col if label_col and label_col in frame.columns else value_col
+    work = frame[[value_col, label_col, "tallos_confirmados"]].copy() if "tallos_confirmados" in frame.columns else frame[[value_col, label_col]].copy()
+    work["_value"] = work[value_col].fillna("").astype(str).str.strip()
+    work["_label"] = work[label_col].fillna("").astype(str).str.strip()
+    work = work[~work["_value"].str.lower().isin({"", "nan", "none", "sin dato"})].copy()
+    if work.empty:
+        return [], []
+    if "tallos_confirmados" in work.columns:
+        grouped = work.groupby(["_value", "_label"], as_index=False)["tallos_confirmados"].sum().sort_values("tallos_confirmados", ascending=False)
+    else:
+        grouped = work.drop_duplicates(["_value", "_label"])
+    options = [{"label": row["_label"], "value": row["_value"]} for row in grouped.to_dict("records")]
+    return options, [option["value"] for option in options]
+
+
+def get_fletes_filter_options(
+    years: list[int] | None = None,
+    week_range: list[int] | None = None,
+) -> dict[str, tuple[list[dict[str, str]], list[str]]]:
+    """Opciones de filtros leidas desde la tabla propia de fletes."""
+    try:
+        frame, _ = _read_freight_scope(years, week_range, None, None, None, None, None, None)
+    except Exception:
+        empty = ([], [])
+        return {"companies": empty, "clients": empty, "countries": empty, "products": empty, "colors": empty, "types": empty}
+    if frame.empty:
+        empty = ([], [])
+        return {"companies": empty, "clients": empty, "countries": empty, "products": empty, "colors": empty, "types": empty}
+    client_frame = frame.copy()
+    if {"cliente", "cod_cliente"}.issubset(client_frame.columns):
+        client_frame["cliente_label"] = client_frame["cliente"].astype(str) + " | " + client_frame["cod_cliente"].astype(str)
+    return {
+        "companies": _fletes_options_from_frame(frame, "NomCompania"),
+        "clients": _fletes_options_from_frame(client_frame, "cod_cliente", "cliente_label"),
+        "countries": _fletes_options_from_frame(frame, "pais"),
+        "products": _fletes_options_from_frame(frame, "producto"),
+        "colors": _fletes_options_from_frame(frame, "color"),
+        "types": _fletes_options_from_frame(frame, "tipo_pedido_operativo"),
+    }
+
+
 def _render_fletes_dashboard(
     frame: pd.DataFrame,
     stats: dict[str, Any],
