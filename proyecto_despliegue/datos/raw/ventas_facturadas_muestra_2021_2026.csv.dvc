@@ -1,0 +1,5 @@
+outs:
+- md5: d95c807dd45672768201c84438f9d233
+  size: 28239671
+  hash: md5
+  path: ventas_facturadas_muestra_2021_2026.csv
