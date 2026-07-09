@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import zlib
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -403,6 +404,7 @@ SALES_VISUAL_COLS = [
     "NomCompania",
     "pais",
     "tipo_pedido_operativo",
+    "tipo_pedido_original",
     "producto",
     "color",
     "moneda_original",
@@ -416,6 +418,28 @@ SALES_VISUAL_COLS = [
 ]
 
 SALES_BOX_COLS = SALES_VISUAL_COLS + ["caja_operativa", "tipo_caja"]
+
+SALES_ORDER_LINE_COLS = [
+    "anio",
+    "semana_iso",
+    "cod_cliente",
+    "cliente",
+    "NomCompania",
+    "pais",
+    "tipo_pedido_operativo",
+    "tipo_pedido_original",
+    "tipo_orden_empaque",
+    "tipo_empaque",
+    "empaque",
+    "receta",
+    "codempaque",
+    "bulkbouquet",
+    "tipo_pedido_raw",
+    "producto",
+    "color",
+    "pedido",
+    "tallos_confirmados",
+]
 
 STRUCTURE_BOX_COLS = [
     "estructura_caja_id", "composicion_version_id", "composicion_firma", "fecha", "anio_semana", "cod_cliente", "cliente", "pedido",
@@ -573,6 +597,13 @@ def read_op_sales_sql_table(table_name: str, params: list | None = None, where: 
     except Exception as exc:
         print(f"ERROR leyendo {table_name} desde SQL Server: {exc}", file=sys.stderr, flush=True)
         return pd.DataFrame()
+
+
+def has_general_sales_detail(frame: pd.DataFrame) -> bool:
+    """General Sales needs type and color detail; older aggregates omit them."""
+    required = {"anio", "semana_iso", "cod_cliente", "producto", "color"}
+    type_cols = {"tipo_pedido_original", "tipo_pedido_operativo"}
+    return not frame.empty and required.issubset(frame.columns) and bool(type_cols.intersection(frame.columns))
 
 
 def read_result_or_csv(
@@ -1467,8 +1498,10 @@ def load_data(
     ventas_semana = read_op_sales_sql_table("op_sales.agg_sales_week_client_product")
     if ventas_semana.empty:
         ventas_semana = read_dashboard_sql_view(dashboard_db, "vw_ventas_generales_semana_cliente_producto")
-    if ventas_semana.empty:
-        ventas_semana = read_csv_if_exists(data_dir / "ventas_semana_cliente_producto.csv", SALES_VISUAL_COLS)
+    if not has_general_sales_detail(ventas_semana):
+        csv_ventas_semana = read_csv_if_exists(data_dir / "ventas_semana_cliente_producto.csv", SALES_VISUAL_COLS)
+        if has_general_sales_detail(csv_ventas_semana):
+            ventas_semana = csv_ventas_semana
     ventas_producto = read_result_or_csv("op_sales.result_descriptivo_ventas_producto_periodo", data_dir / "ventas_producto_periodo.csv", [col for col in SALES_VISUAL_COLS if col not in ["cod_cliente", "cliente"]]) if eager_results else pd.DataFrame()
     ventas_cliente = read_result_or_csv("op_sales.result_descriptivo_ventas_cliente_periodo", data_dir / "ventas_cliente_periodo.csv", ["anio", "semana_iso", "anio_semana", "cod_cliente", "cliente", "moneda_original", "tallos_confirmados", "ventas_usd", "valor_total_original", "pedidos", "cajas_ids", "precio_usd_tallo", "precio_moneda_original_tallo"]) if eager_results else pd.DataFrame()
     ventas_caja = read_result_or_csv("op_sales.result_descriptivo_ventas_caja_periodo", data_dir / "ventas_caja_periodo.csv", SALES_BOX_COLS) if eager_results else pd.DataFrame()
@@ -1543,6 +1576,8 @@ def load_data(
         "solid_forecast_historical_validation": solid_forecast_historical_validation,
         "solid_forecast_future": solid_forecast_future,
         "solid_forecast_error_market": solid_forecast_error_market,
+        "_data_dir": str(data_dir),
+        "_forecast_dir": str(forecast_dir or DEFAULT_FORECAST_DIR),
     }
 
 
@@ -1797,7 +1832,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
     if not perfil.empty:
         recommendation_options = [{"label": rec, "value": rec} for rec in sorted(perfil["recomendacion_compra"].dropna().unique())]
         segment_options = [{"label": seg, "value": seg} for seg in sorted(perfil["segmento_cliente"].dropna().unique())]
-    ventas_source = data.get("ventas_semana", pd.DataFrame())
+    ventas_source = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
     if ventas_source.empty:
         ventas_source = data.get("ventas_producto", pd.DataFrame())
     client_options = build_client_dropdown_options(perfil, [ventas_source])
@@ -1841,10 +1876,11 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 {"label": country, "value": country}
                 for country in sorted(ventas_source["pais"].dropna().astype(str).unique())
             ]
-        if "tipo_pedido_operativo" in ventas_source.columns:
+        sales_type_col = "tipo_pedido_original" if "tipo_pedido_original" in ventas_source.columns else "tipo_pedido_operativo"
+        if sales_type_col in ventas_source.columns:
             general_sales_type_options = [
                 {"label": tipo, "value": tipo}
-                for tipo in sorted(ventas_source["tipo_pedido_operativo"].dropna().astype(str).unique())
+                for tipo in sorted(ventas_source[sales_type_col].dropna().astype(str).unique())
                 if tipo.strip()
             ]
     product_sources = [
@@ -2875,7 +2911,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("general-sales-types", "value"),
     )
     def cascade_general_sales_filters(tab, years, week_range, companies, clients, countries, products, colors, order_types):
-        sales = data.get("ventas_semana", pd.DataFrame())
+        sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
         selected_companies = selected_values(companies)
         selected_clients = selected_values(clients)
         selected_countries = selected_values(countries)
@@ -2950,7 +2986,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if selected_colors and "color" in scope.columns:
             scope = scope[scope["color"].astype(str).isin(set(selected_colors))].copy()
 
-        type_options, type_values = tallos_options_from_frame(scope, "tipo_pedido_operativo")
+        type_col = "tipo_pedido_original" if "tipo_pedido_original" in scope.columns else "tipo_pedido_operativo"
+        type_options, type_values = tallos_options_from_frame(scope, type_col)
         selected_types = [value for value in selected_types if value in set(type_values)]
 
         return (
@@ -3080,7 +3117,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         Input("visual-tipo-filter", "value"),
     )
     def update_visual_tipo_options(tab: str, current_value: list[str] | None):
-        sales = data.get("ventas_semana", pd.DataFrame())
+        sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
         if tab != "visualizador_clientes_general" or sales.empty or "tipo_pedido_operativo" not in sales.columns:
             return [], []
         tipos = sorted(sales["tipo_pedido_operativo"].dropna().astype(str).unique())
@@ -3397,7 +3434,15 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors, order_types)
         if view.empty:
             return dash.no_update
-        context = build_sales_executive_context_v2(view, base_year, compare_year)
+        report_order_view = sales_order_lines_for_filters(data, years, week_range, clients, products, countries, companies, colors, order_types)
+        report_share_universe = filter_general_sales_frame(sales, years, week_range, None, products, countries, companies, colors, order_types)
+        context = build_sales_executive_context_v2(
+            view,
+            base_year,
+            compare_year,
+            order_view=report_order_view,
+            share_universe_view=report_share_universe,
+        )
         if not context.get("ok"):
             return dash.no_update
         scope = sales_scope_summary(view, clients, products, countries, companies, colors)
@@ -3405,7 +3450,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         report_type = "full" if "full" in triggered else "summary"
         report_lang = "en" if triggered.endswith("-en") else "es"
         weekly = summarize_sales_frame(view, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
-        report_pdf = build_sales_report_pdf(context, scope, weekly=weekly, report_type=report_type, view=view, lang=report_lang)
+        report_pdf = build_sales_report_pdf(context, scope, weekly=weekly, report_type=report_type, view=view, lang=report_lang, order_view=report_order_view)
         suffix = "full" if report_type == "full" else "summary_1_page"
         filename = f"sales_report_{report_lang}_{suffix}_{context.get('base_year', 'base')}_vs_{context.get('compare_year', 'comp')}.pdf"
         return dcc.send_bytes(report_pdf, filename=filename)
@@ -5252,7 +5297,7 @@ def sales_raw_export_frame(data: dict[str, pd.DataFrame], years, week_range, com
     """Return the most detailed available sales frame filtered like Ventas generales."""
     source = data.get("ventas_caja", pd.DataFrame())
     if source.empty:
-        source = data.get("ventas_semana", pd.DataFrame())
+        source = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
     if source.empty:
         return pd.DataFrame()
     out = filter_general_sales_frame(source, years, week_range, clients, products, countries, companies, colors, order_types)
@@ -6067,8 +6112,9 @@ def filter_general_sales_frame(
     if selected_colors and "color" in out.columns:
         out = out[out["color"].astype(str).isin(selected_colors)].copy()
     selected_types = selected_values(order_types)
-    if selected_types and "tipo_pedido_operativo" in out.columns:
-        out = out[out["tipo_pedido_operativo"].astype(str).isin(selected_types)].copy()
+    type_col = "tipo_pedido_original" if "tipo_pedido_original" in out.columns else "tipo_pedido_operativo"
+    if selected_types and type_col in out.columns:
+        out = out[out[type_col].astype(str).isin(selected_types)].copy()
     if "anio_semana" in out.columns and "week_start" not in out.columns and "semana_iso" in out.columns:
         out["week_start"] = pd.to_datetime(
             out["anio"].astype(str) + "-W" + pd.to_numeric(out["semana_iso"], errors="coerce").fillna(1).astype(int).astype(str).str.zfill(2) + "-1",
@@ -6083,6 +6129,87 @@ def filter_general_sales_frame(
         )
     if "week_start" in out.columns and "mes_num" not in out.columns:
         out["mes_num"] = pd.to_datetime(out["week_start"], errors="coerce").dt.month
+    return out
+
+
+def original_sales_type_label(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=object)
+    candidates = ["tipo_pedido_original", "tipo_orden_empaque", "tipo_empaque", "bulkbouquet", "codempaque", "tipo_pedido_raw", "tipo_pedido_operativo"]
+    out = pd.Series("sin_info", index=frame.index, dtype="object")
+    blank = {"", "sin_info", "nan", "none", "0", "0.0"}
+    for col in candidates:
+        if col not in frame.columns:
+            continue
+        values = frame[col].fillna("").astype(str).str.strip()
+        mask = out.astype(str).str.lower().isin(blank) & ~values.str.lower().isin(blank)
+        out.loc[mask] = values.loc[mask]
+    return out
+
+
+@lru_cache(maxsize=4)
+def load_sales_order_lines_cached(data_dir_text: str) -> pd.DataFrame:
+    """Load the minimum local line-level fields needed for true distinct orders."""
+    data_dir = Path(data_dir_text)
+    frame = read_csv_if_exists(data_dir / "historico_visualizador_comercial.csv", SALES_ORDER_LINE_COLS)
+    if frame.empty:
+        frame = read_csv_if_exists(data_dir / "historico_confirmado.csv", SALES_ORDER_LINE_COLS)
+    if frame.empty:
+        return frame
+    if "cod_cliente" in frame.columns:
+        frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
+    for col in ["anio", "semana_iso", "tallos_confirmados"]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
+    if "pedido" in frame.columns:
+        frame["pedido"] = frame["pedido"].astype(str).str.strip()
+        frame = frame[~frame["pedido"].str.lower().isin({"", "nan", "none"})].copy()
+    frame["tipo_pedido_original"] = original_sales_type_label(frame)
+    return frame
+
+
+def sales_order_lines_for_filters(
+    data: dict[str, pd.DataFrame],
+    years: list[int] | None,
+    week_range: list[int] | None,
+    clients: list[str] | None,
+    products: list[str] | None,
+    countries: list[str] | None = None,
+    companies: list[str] | None = None,
+    colors: list[str] | None = None,
+    order_types: list[str] | None = None,
+) -> pd.DataFrame:
+    data_dir_text = str(data.get("_data_dir", DEFAULT_DATA_DIR))
+    lines = load_sales_order_lines_cached(data_dir_text)
+    if lines.empty:
+        return pd.DataFrame()
+    return filter_general_sales_frame(lines, years, week_range, clients, products, countries, companies, colors, order_types)
+
+
+def enrich_sales_with_original_type(data: dict[str, pd.DataFrame], sales: pd.DataFrame) -> pd.DataFrame:
+    if sales.empty or "tipo_pedido_original" in sales.columns:
+        return sales
+    lines = load_sales_order_lines_cached(str(data.get("_data_dir", DEFAULT_DATA_DIR)))
+    if lines.empty or "tipo_pedido_original" not in lines.columns:
+        out = sales.copy()
+        out["tipo_pedido_original"] = out.get("tipo_pedido_operativo", pd.Series("sin_info", index=out.index)).astype(str)
+        return out
+    keys = [col for col in ["anio", "semana_iso", "cod_cliente", "tipo_pedido_operativo", "producto", "color"] if col in sales.columns and col in lines.columns]
+    if not keys:
+        out = sales.copy()
+        out["tipo_pedido_original"] = out.get("tipo_pedido_operativo", pd.Series("sin_info", index=out.index)).astype(str)
+        return out
+    work = lines[keys + ["tipo_pedido_original", "tallos_confirmados"]].copy()
+    work["tallos_confirmados"] = pd.to_numeric(work["tallos_confirmados"], errors="coerce").fillna(0)
+    label_map = (
+        work.groupby(keys + ["tipo_pedido_original"], dropna=False, as_index=False)["tallos_confirmados"]
+        .sum()
+        .sort_values(keys + ["tallos_confirmados"], ascending=[True] * len(keys) + [False])
+        .drop_duplicates(keys)
+        .drop(columns=["tallos_confirmados"])
+    )
+    out = sales.merge(label_map, on=keys, how="left")
+    out["tipo_pedido_original"] = out["tipo_pedido_original"].fillna(out.get("tipo_pedido_operativo", "sin_info")).astype(str)
     return out
 
 
@@ -6490,7 +6617,7 @@ def render_ventas_generales_tab(
     colors: list[str] | None = None,
 ) -> html.Div:
     """Present sales totals from the weekly aggregate without recipe-level detail."""
-    sales = data.get("ventas_semana", pd.DataFrame())
+    sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
     if sales.empty:
         return html.Div(
             "No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.",
@@ -6596,6 +6723,8 @@ def build_sales_executive_context_v2(
     view: pd.DataFrame,
     base_year: int | None,
     compare_year: int | None,
+    order_view: pd.DataFrame | None = None,
+    share_universe_view: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     """Build the executive year-over-year context used by Ventas generales."""
     context: dict[str, object] = {"ok": False, "message": "", "base_year": base_year, "compare_year": compare_year}
@@ -6622,13 +6751,29 @@ def build_sales_executive_context_v2(
         context["message"] = "No hay datos suficientes para el ano seleccionado."
         return context
 
-    def aggregate(frame: pd.DataFrame) -> dict[str, float]:
+    order_view = order_view if order_view is not None else pd.DataFrame()
+    share_universe_view = share_universe_view if share_universe_view is not None else view
+    order_year_series = pd.to_numeric(order_view["anio"], errors="coerce") if not order_view.empty and "anio" in order_view.columns else pd.Series(dtype=float)
+    universe_year_series = pd.to_numeric(share_universe_view["anio"], errors="coerce") if not share_universe_view.empty and "anio" in share_universe_view.columns else pd.Series(dtype=float)
+
+    def aggregate(frame: pd.DataFrame, year: int | None) -> dict[str, float]:
         stems = float(frame["tallos_confirmados"].sum())
         usd = float(frame["ventas_usd"].sum())
-        pedidos = float(frame["pedidos"].sum()) if "pedidos" in frame.columns else float(len(frame))
+        if year is not None and not order_view.empty and "pedido" in order_view.columns:
+            order_frame = order_view[order_year_series.eq(int(year))]
+            pedidos = float(order_frame["pedido"].nunique())
+        else:
+            pedidos = float(frame["pedidos"].sum()) if "pedidos" in frame.columns else float(len(frame))
+        if year is not None and not share_universe_view.empty and "tallos_confirmados" in share_universe_view.columns:
+            universe_frame = share_universe_view[universe_year_series.eq(int(year))]
+            universe_stems = float(universe_frame["tallos_confirmados"].sum())
+        else:
+            universe_stems = stems
         return {
             "ventas_usd": usd,
             "tallos_confirmados": stems,
+            "tallos_universo": universe_stems,
+            "participacion_cliente_tallos": stems / universe_stems if universe_stems > 0 else 0.0,
             "precio_usd_tallo": usd / stems if stems > 0 else 0.0,
             "pedidos": pedidos,
             "clientes_activos": float(frame["cod_cliente"].nunique()) if "cod_cliente" in frame.columns else 0.0,
@@ -6637,8 +6782,8 @@ def build_sales_executive_context_v2(
             "tallos_promedio_pedido": stems / pedidos if pedidos > 0 else 0.0,
         }
 
-    base_metrics = aggregate(base_frame)
-    compare_metrics = aggregate(compare_frame)
+    base_metrics = aggregate(base_frame, int(selected_base) if comparison_mode else None)
+    compare_metrics = aggregate(compare_frame, int(selected_compare))
     base_weeks = int(base_frame["semana_iso"].nunique()) if comparison_mode and "semana_iso" in base_frame.columns else 0
     compare_weeks = max(int(compare_frame["semana_iso"].nunique()), 1) if "semana_iso" in compare_frame.columns else 1
 
@@ -6847,7 +6992,7 @@ def sales_metric_comparison_display(context: dict[str, object]) -> pd.DataFrame:
         ("Clientes activos", "clientes_activos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
         ("Productos activos", "productos_activos", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
         ("Venta prom. pedido", "venta_promedio_pedido", lambda value: moneyless_number(value, 2), lambda value: moneyless_number(value, 2)),
-        ("Tallos prom. pedido", "tallos_promedio_pedido", lambda value: moneyless_number(value), lambda value: moneyless_number(value)),
+        ("% participacion cliente tallos", "participacion_cliente_tallos", lambda value: percent(value), lambda value: percent(value)),
     ]
     if not context.get("comparison_mode", True):
         return pd.DataFrame(
@@ -6947,7 +7092,7 @@ def product_comparison_display(product_compare: pd.DataFrame, base_year: int, co
     return out
 
 
-def client_sales_display(view: pd.DataFrame, rows: int = 30, ascending: bool = True) -> pd.DataFrame:
+def client_sales_display(view: pd.DataFrame, rows: int = 30, ascending: bool = True, order_view: pd.DataFrame | None = None) -> pd.DataFrame:
     if view.empty or "cod_cliente" not in view.columns:
         return pd.DataFrame()
     company_col = "NomCompania" if "NomCompania" in view.columns else ("cliente" if "cliente" in view.columns else None)
@@ -6963,6 +7108,16 @@ def client_sales_display(view: pd.DataFrame, rows: int = 30, ascending: bool = T
         .head(rows)
     )
     out["precio_usd_tallo"] = (out["ventas_usd"] / out["tallos_confirmados"].replace(0, np.nan)).fillna(0)
+    if order_view is not None and not order_view.empty and {"cod_cliente", "pedido"}.issubset(order_view.columns):
+        order_group_cols = ["cod_cliente"] + ([company_col] if company_col and company_col in order_view.columns else [])
+        distinct_orders = (
+            order_view.groupby(order_group_cols, dropna=False, as_index=False)["pedido"]
+            .nunique()
+            .rename(columns={"pedido": "pedidos_unicos"})
+        )
+        out = out.merge(distinct_orders, on=order_group_cols, how="left")
+        out["pedidos"] = out["pedidos_unicos"].fillna(out["pedidos"])
+        out = out.drop(columns=["pedidos_unicos"])
     out = out.rename(
         columns={
             "cod_cliente": "Cod. cliente",
@@ -7842,6 +7997,7 @@ def build_sales_report_pdf(
     report_type: str = "summary",
     view: pd.DataFrame | None = None,
     lang: str = "es",
+    order_view: pd.DataFrame | None = None,
 ) -> bytes:
     """Generate a compact native PDF without external dependencies."""
     lang = "en" if lang == "en" else "es"
@@ -7977,7 +8133,7 @@ def build_sales_report_pdf(
         y = 735
         _pdf_text(c, 36, y, pdf_label("dashboard_tables", lang), 13, (0.09, 0.13, 0.18), "F2")
         y -= 22
-        client_table = client_sales_display(view, rows=10, ascending=False)
+        client_table = client_sales_display(view, rows=10, ascending=False, order_view=order_view)
         client_table = translate_pdf_table(client_table, lang)
         client_cols = [col for col in (["Company", "Client", "Revenue USD", "Stems", "USD/stem"] if lang == "en" else ["Compania", "Cliente", "Facturacion USD", "Tallos", "Precio USD/tallo"]) if col in client_table.columns]
         if client_cols:
@@ -8129,7 +8285,7 @@ def render_ventas_generales_tab_v2(
     order_types: list[str] | None = None,
 ) -> html.Div:
     """Executive sales tab with yearly comparison and weekly context."""
-    sales = data.get("ventas_semana", pd.DataFrame())
+    sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
     if sales.empty:
         return html.Div("ventas_semana_cliente_producto.csv is missing. Run descriptives to enable General sales.", className="table-panel")
 
@@ -8148,13 +8304,21 @@ def render_ventas_generales_tab_v2(
             className="table-panel",
         )
 
-    context = build_sales_executive_context_v2(view, base_year, compare_year)
+    order_view = sales_order_lines_for_filters(data, years, week_range, clients, products, countries, companies, colors, order_types)
+    share_universe_view = filter_general_sales_frame(sales, years, week_range, None, products, countries, companies, colors, order_types)
+    context = build_sales_executive_context_v2(
+        view,
+        base_year,
+        compare_year,
+        order_view=order_view,
+        share_universe_view=share_universe_view,
+    )
 
     tallos = float(view["tallos_confirmados"].sum())
     ventas = float(view["ventas_usd"].sum())
     precio = ventas / tallos if tallos > 0 else 0.0
     weekly = summarize_sales_frame(view, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
-    annual = summarize_sales_frame(view, ["anio"]).sort_values("anio")
+    annual = context["annual_cards"].copy() if context.get("ok") else summarize_sales_frame(view, ["anio"]).sort_values("anio")
 
     tallos_fig = px.line(weekly, x="semana_iso", y="tallos_confirmados", color="anio", markers=True, title="Confirmed stems by week")
     tallos_fig.update_layout(xaxis_title="ISO week", yaxis_title="Confirmed stems")
@@ -8172,10 +8336,12 @@ def render_ventas_generales_tab_v2(
         pad = max((p_max - p_min) * 0.15, 0.005)
         precio_fig.update_yaxes(range=[max(0, p_min - pad), p_max + pad])
 
-    annual_display = annual.rename(columns={"anio": "Year", "tallos_confirmados": "Confirmed stems", "ventas_usd": "Sales USD", "precio_usd_tallo": "USD/stem"})[["Year", "Confirmed stems", "Sales USD", "USD/stem"]].copy()
+    annual_display = annual.rename(columns={"anio": "Year", "tallos_confirmados": "Confirmed stems", "ventas_usd": "Sales USD", "precio_usd_tallo": "USD/stem", "pedidos": "Orders", "participacion_cliente_tallos": "Client stem share"})[["Year", "Confirmed stems", "Sales USD", "USD/stem", "Orders", "Client stem share"]].copy()
     annual_display["Confirmed stems"] = annual_display["Confirmed stems"].map(moneyless_number)
     annual_display["Sales USD"] = annual_display["Sales USD"].map(lambda value: moneyless_number(value, 2))
     annual_display["USD/stem"] = annual_display["USD/stem"].map(lambda value: moneyless_number(value, 4))
+    annual_display["Orders"] = annual_display["Orders"].map(lambda value: moneyless_number(value, 0))
+    annual_display["Client stem share"] = annual_display["Client stem share"].map(percent)
     weeks_text = f"{int(week_range[0])}-{int(week_range[1])}" if week_range and len(week_range) == 2 else "all"
 
     export_buttons = html.Div(
@@ -8220,15 +8386,20 @@ def render_ventas_generales_tab_v2(
     )
 
     annual_cards = context["annual_cards"] if context.get("ok") else annual.copy()
+    share_totals = {
+        int(row.anio): f"total {moneyless_number(getattr(row, 'tallos_universo', 0))} stems"
+        for row in annual_cards.itertuples(index=False)
+        if hasattr(row, "tallos_universo")
+    }
     executive_metrics = [
         make_year_comparison_card("Sales USD", annual_cards, "ventas_usd", lambda value: moneyless_number(value, 2), "actual by year"),
         make_year_comparison_card("Confirmed stems", annual_cards, "tallos_confirmados", lambda value: moneyless_number(value), "same week window"),
         make_year_comparison_card("Average price", annual_cards, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/stem"),
-        make_year_comparison_card("Orders", annual_cards, "pedidos", lambda value: moneyless_number(value), "aggregated orders"),
+        make_year_comparison_card("Orders", annual_cards, "pedidos", lambda value: moneyless_number(value), "unique order numbers"),
         make_year_comparison_card("Active clients", annual_cards, "clientes_activos", lambda value: moneyless_number(value), "with sales"),
         make_year_comparison_card("Active products", annual_cards, "productos_activos", lambda value: moneyless_number(value), "with sales"),
         make_year_comparison_card("Avg. sale/order", annual_cards, "venta_promedio_pedido", lambda value: moneyless_number(value, 2), "USD/order"),
-        make_year_comparison_card("Avg. stems/order", annual_cards, "tallos_promedio_pedido", lambda value: moneyless_number(value), "stems/order"),
+        make_year_comparison_card("% client stem share", annual_cards, "participacion_cliente_tallos", lambda value: percent(value), "of filtered total stems", share_totals),
     ]
     metric_compare_table = sales_metric_comparison_display(context)
     active_compare_year = context.get("compare_year") or compare_year or (int(annual["anio"].max()) if not annual.empty else 0)
@@ -8261,7 +8432,7 @@ def render_ventas_generales_tab_v2(
     selected_clients = selected_values(clients)
     client_table_title = "Companies ranked by revenue" if not selected_clients else "Selected companies"
     client_table_note = "Sorted by revenue within the active filter. You can also sort the table manually." if not selected_clients else "Summary of selected companies within the active filter."
-    client_table = client_sales_display(view, rows=30, ascending=False)
+    client_table = client_sales_display(view, rows=30, ascending=False, order_view=order_view)
     product_week_matrix = sales_product_week_matrix_display(view, selected_clients)
     product_week_note = (
         "Selected client: products in rows and weeks in columns, with confirmed stems."

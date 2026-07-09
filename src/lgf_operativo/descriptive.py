@@ -33,7 +33,7 @@ DESCRIPTIVE_DASH_COLUMNS = {
     "pedidos_limpios_todos_estados": [
         "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "estado_canonico", "estado_categoria",
         "tipo_pedido_operativo", "origen_tipologia_operativa", "producto", "variedad", "color", "grado", "tipo_caja",
-        "tallos_x_ramo", "capuchon", "comida", "empaque", "tallos_analisis",
+        "tallos_x_ramo", "capuchon", "comida", "tipo_orden_empaque", "tipo_empaque", "empaque", "receta", "codempaque", "bulkbouquet", "tipo_pedido_raw", "tallos_analisis",
         "tallos_total", "tallos_confirmados", "faltante_tallos", "ventas_usd",
         "valor_unitario_original", "valor_total_original", "moneda_original",
         "sku_terminado", "sku_flexible", "llave_analisis_operativo", "color_componente_key",
@@ -45,7 +45,7 @@ DESCRIPTIVE_DASH_COLUMNS = {
         "fecha", "cod_cliente", "cliente", "NomCompania", "pais", "pedido", "tipo_pedido_operativo", "origen_tipologia_operativa",
         "familia_analisis_operativa", "enfoque_analisis_operativo", "rol_color_operativo",
         "producto", "variedad", "color", "grado", "tipo_caja", "tallos_x_ramo",
-        "capuchon", "comida", "empaque", "tallos_analisis", "tallos_total",
+        "capuchon", "comida", "tipo_orden_empaque", "tipo_empaque", "empaque", "receta", "codempaque", "bulkbouquet", "tipo_pedido_raw", "tallos_analisis", "tallos_total",
         "tallos_confirmados", "faltante_tallos", "ventas_usd", "valor_unitario_original",
         "valor_total_original", "moneda_original", "sku_terminado", "sku_flexible",
         "llave_analisis_operativo", "color_componente_key", "receta_estructura_key", "receta_programa_key", "receta_programa_tamano_key",

@@ -334,9 +334,18 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
     if "moneda_original" not in work.columns:
         work["moneda_original"] = "sin_info"
-    for col in ["pedido", "caja_operativa", "producto", "color", "tipo_caja", "tipo_pedido_operativo", "NomCompania", "pais"]:
+    for col in ["pedido", "caja_operativa", "producto", "color", "tipo_caja", "tipo_pedido_operativo", "tipo_orden_empaque", "tipo_empaque", "empaque", "receta", "codempaque", "bulkbouquet", "tipo_pedido_raw", "NomCompania", "pais"]:
         if col not in work.columns:
             work[col] = "sin_info"
+
+    def original_type_label(row: pd.Series) -> str:
+        for col in ["tipo_orden_empaque", "tipo_empaque", "bulkbouquet", "codempaque", "tipo_pedido_raw"]:
+            text = str(row.get(col, "")).strip()
+            if text and text.lower() not in {"sin_info", "nan", "none", "0", "0.0"}:
+                return text
+        return str(row.get("tipo_pedido_operativo", "sin_info")).strip()
+
+    work["tipo_pedido_original"] = work.apply(original_type_label, axis=1)
 
     def summarize(group_cols: list[str]) -> pd.DataFrame:
         out = work.groupby(group_cols, dropna=False, as_index=False).agg(
@@ -364,6 +373,7 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "NomCompania",
             "pais",
             "tipo_pedido_operativo",
+            "tipo_pedido_original",
             "producto",
             "color",
             "moneda_original",
@@ -371,7 +381,7 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     ).sort_values(["anio", "semana_iso", "cod_cliente", "tallos_confirmados"], ascending=[True, True, True, False])
 
     outputs["ventas_producto_periodo"] = summarize(
-        ["anio", "semana_iso", "anio_semana", "pais", "tipo_pedido_operativo", "producto", "color", "moneda_original"]
+        ["anio", "semana_iso", "anio_semana", "pais", "tipo_pedido_operativo", "tipo_pedido_original", "producto", "color", "moneda_original"]
     ).sort_values(["anio", "semana_iso", "tallos_confirmados"], ascending=[True, True, False])
 
     outputs["ventas_cliente_periodo"] = summarize(
@@ -388,6 +398,7 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "NomCompania",
             "pais",
             "tipo_pedido_operativo",
+            "tipo_pedido_original",
             "producto",
             "color",
             "caja_operativa",

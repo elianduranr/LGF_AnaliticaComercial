@@ -246,6 +246,13 @@ def materialize_aggregates_full(conn, scoped_to_affected_weeks: bool = False) ->
             MAX(NomCompania) AS NomCompania,
             MAX(pais) AS pais,
             tipo_pedido_operativo,
+            COALESCE(
+                NULLIF(MAX(tipo_orden_empaque), 'sin_info'),
+                NULLIF(MAX(tipo_empaque), 'sin_info'),
+                NULLIF(MAX(bulkbouquet), 'sin_info'),
+                NULLIF(MAX(codempaque), 'sin_info'),
+                tipo_pedido_operativo
+            ) AS tipo_pedido_original,
             producto,
             color,
             MAX(moneda_original) AS moneda_original,
@@ -370,7 +377,7 @@ def materialize_aggregates_incremental(conn, start_date: str, end_date: str) -> 
         """
         INSERT INTO op_sales.agg_sales_week_client_product (
             anio, semana_iso, anio_semana, cod_cliente, cliente, NomCompania, pais,
-            tipo_pedido_operativo, producto, color, moneda_original,
+            tipo_pedido_operativo, tipo_pedido_original, producto, color, moneda_original,
             tallos_confirmados, tallos_analisis, ventas_usd, valor_total_original,
             lineas, pedidos, cajas_ids, precio_usd_tallo
         )
@@ -383,6 +390,13 @@ def materialize_aggregates_incremental(conn, start_date: str, end_date: str) -> 
             MAX(f.NomCompania) AS NomCompania,
             MAX(f.pais) AS pais,
             f.tipo_pedido_operativo,
+            COALESCE(
+                NULLIF(MAX(f.tipo_orden_empaque), 'sin_info'),
+                NULLIF(MAX(f.tipo_empaque), 'sin_info'),
+                NULLIF(MAX(f.bulkbouquet), 'sin_info'),
+                NULLIF(MAX(f.codempaque), 'sin_info'),
+                f.tipo_pedido_operativo
+            ) AS tipo_pedido_original,
             f.producto,
             f.color,
             MAX(f.moneda_original) AS moneda_original,
