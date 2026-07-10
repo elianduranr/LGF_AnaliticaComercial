@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import unicodedata
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,41 @@ FREIGHT_TABLE_CANDIDATES = [
     ("Ventas", "Fletes_Distribuidoos"),
     ("Ventas", "Fletes_Distribuidos"),
 ]
+
+
+@lru_cache(maxsize=1)
+def get_client_negotiation_term_map() -> dict[str, str]:
+    """Return the latest visible freight/negotiation term by client."""
+    load_local_credentials()
+    try:
+        with get_connection() as con:
+            resolved = _resolve_freight_table(con)
+            if resolved is None:
+                return {}
+            schema, table = resolved
+            frame = pd.read_sql_query(
+                f"""
+                SELECT
+                    CAST(CODCUSTOM AS varchar(80)) AS cod_cliente,
+                    CAST(Tipo_Flete AS nvarchar(120)) AS termino_negociacion,
+                    COUNT_BIG(*) AS frecuencia
+                FROM [{schema}].[{table}]
+                WHERE NULLIF(LTRIM(RTRIM(CAST(CODCUSTOM AS varchar(80)))), '') IS NOT NULL
+                  AND NULLIF(LTRIM(RTRIM(CAST(Tipo_Flete AS nvarchar(120)))), '') IS NOT NULL
+                GROUP BY CAST(CODCUSTOM AS varchar(80)), CAST(Tipo_Flete AS nvarchar(120))
+                """,
+                con,
+            )
+    except Exception as exc:
+        print(f"No se pudieron cargar terminos de negociacion: {exc}", file=sys.stderr, flush=True)
+        return {}
+    if frame.empty:
+        return {}
+    frame["cod_cliente"] = frame["cod_cliente"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    frame["termino_negociacion"] = frame["termino_negociacion"].fillna("Sin dato").astype(str).str.strip().str.upper()
+    frame["frecuencia"] = pd.to_numeric(frame["frecuencia"], errors="coerce").fillna(0)
+    best = frame.sort_values(["cod_cliente", "frecuencia"], ascending=[True, False]).drop_duplicates("cod_cliente")
+    return dict(zip(best["cod_cliente"], best["termino_negociacion"]))
 
 
 def _selected_values(value: Any) -> list[str]:
@@ -445,8 +481,20 @@ def _aggregate(frame: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     work = frame.copy()
     work["_rate_cif_weight"] = work["rate_cif"] * work["flete_cif_distribuido"]
     work["_rate_del_weight"] = work["rate_del"] * work["flete_del_distribuido"]
-    work["_tallos_cif"] = np.where(work["flete_cif_distribuido"].gt(0), work["tallos_confirmados"], 0)
-    work["_tallos_del"] = np.where(work["flete_del_distribuido"].gt(0), work["tallos_confirmados"], 0)
+    negotiation_term = _ascii_upper_text(work.get("tipo_flete", pd.Series("", index=work.index))).str.strip()
+    has_cif_term = negotiation_term.str.contains(r"(?:^|[^A-Z])CIF(?:[^A-Z]|$)", regex=True, na=False)
+    has_del_term = negotiation_term.str.contains(r"(?:^|[^A-Z])DEL(?:[^A-Z]|$)", regex=True, na=False)
+    # DEL includes the international CIF leg plus the final-delivery leg.
+    work["_tallos_cif"] = np.where(
+        (has_cif_term | has_del_term) & work["flete_cif_distribuido"].gt(0),
+        work["tallos_confirmados"],
+        0,
+    )
+    work["_tallos_del"] = np.where(
+        has_del_term & work["flete_del_distribuido"].gt(0),
+        work["tallos_confirmados"],
+        0,
+    )
     grouped = work.groupby(group_cols, dropna=False, as_index=False).agg(
         tallos=("tallos_confirmados", "sum"),
         tallos_cif=("_tallos_cif", "sum"),
@@ -471,6 +519,112 @@ def _aggregate(frame: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     grouped["precio_venta_x_tallo"] = grouped["ventas_usd"] / grouped["tallos"].replace(0, np.nan)
     grouped = grouped.drop(columns=["rate_cif_num", "rate_del_num"])
     return grouped.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+
+def get_sales_freight_summary(
+    years: list[int] | None,
+    week_range: list[int] | None,
+    companies: list[str] | None,
+    clients: list[str] | None,
+    countries: list[str] | None,
+    products: list[str] | None,
+    colors: list[str] | None,
+    order_types: list[str] | None = None,
+) -> pd.DataFrame:
+    """Return annual freight totals aligned with General Sales filters.
+
+    Freight is aggregated from its distributed SQL source before it is joined
+    to sales KPIs, avoiding a many-to-many line-level merge.
+    """
+    # The card only needs annual totals. Avoid the detailed freight query unless
+    # an operational-type filter requires its normalization logic.
+    if not _selected_values(order_types):
+        try:
+            load_local_credentials(override=True)
+            os.environ["OP_SALES_USE_SQL_SERVER"] = "1"
+            with get_connection() as con:
+                resolved = _resolve_freight_table(con)
+                if resolved is None:
+                    return pd.DataFrame()
+                schema, table = resolved
+                filters = ["NULLIF(LTRIM(RTRIM(CAST(INVOICE AS varchar(120)))), '') IS NOT NULL"]
+                params: list[Any] = []
+                selected_years = [int(year) for year in _selected_values(years) if str(year).strip().isdigit()]
+                if selected_years:
+                    placeholders = ", ".join("?" for _ in selected_years)
+                    filters.append(f"ANO IN ({placeholders})")
+                    params.extend(selected_years)
+                if week_range and len(week_range) == 2:
+                    filters.append("SEMANA BETWEEN ? AND ?")
+                    params.extend([int(week_range[0]), int(week_range[1])])
+                _append_filter(filters, params, "NomCompania", companies)
+                _append_filter(filters, params, "CODCUSTOM", clients)
+                _append_filter(filters, params, "PAIS", countries)
+                _append_filter(filters, params, "PRODUCTO", products)
+                _append_filter(filters, params, "COLOR", colors)
+                where = " AND ".join(filters)
+                fast = pd.read_sql_query(
+                    f"""
+                    SELECT
+                        ANO AS anio,
+                        UPPER(LTRIM(RTRIM(CAST(Tipo_Flete AS nvarchar(120))))) AS terminos_flete,
+                        SUM(COALESCE(CAST(TallosConfirmados AS float), 0)) AS tallos,
+                        SUM(CASE WHEN
+                            (UPPER(CAST(Tipo_Flete AS nvarchar(120))) LIKE '%CIF%'
+                             OR UPPER(CAST(Tipo_Flete AS nvarchar(120))) LIKE '%DEL%')
+                            AND COALESCE(CAST(Total_Factura_cif AS float), 0) > 0
+                            THEN COALESCE(CAST(TallosConfirmados AS float), 0) ELSE 0 END) AS tallos_cif,
+                        SUM(CASE WHEN
+                            UPPER(CAST(Tipo_Flete AS nvarchar(120))) LIKE '%DEL%'
+                            AND COALESCE(CAST(Total_Factura_del AS float), 0) > 0
+                            THEN COALESCE(CAST(TallosConfirmados AS float), 0) ELSE 0 END) AS tallos_del,
+                        SUM(COALESCE(CAST(VENTAS_USD AS float), 0)) AS ventas_usd,
+                        SUM(COALESCE(CAST(Total_Factura_cif AS float), 0)) AS flete_cif,
+                        SUM(COALESCE(CAST(Total_Factura_del AS float), 0)) AS flete_del,
+                        SUM(COALESCE(CAST(Total_Flete AS float), 0)) AS flete_total,
+                        COUNT(DISTINCT CAST(INVOICE AS varchar(120))) AS facturas
+                    FROM [{schema}].[{table}]
+                    WHERE {where}
+                    GROUP BY ANO, UPPER(LTRIM(RTRIM(CAST(Tipo_Flete AS nvarchar(120)))))
+                    """,
+                    con,
+                    params=params,
+                )
+            if fast.empty:
+                return pd.DataFrame()
+            numeric = ["tallos", "tallos_cif", "tallos_del", "ventas_usd", "flete_cif", "flete_del", "flete_total", "facturas"]
+            for col in numeric:
+                fast[col] = pd.to_numeric(fast[col], errors="coerce").fillna(0)
+            terms = fast.groupby("anio")["terminos_flete"].agg(
+                lambda values: ", ".join(sorted({str(value).strip() for value in values if str(value).strip()}))
+            )
+            summary = fast.groupby("anio", as_index=False)[numeric].sum()
+            summary["cif_x_tallo"] = summary["flete_cif"] / summary["tallos_cif"].replace(0, np.nan)
+            summary["del_x_tallo"] = summary["flete_del"] / summary["tallos_del"].replace(0, np.nan)
+            summary["flete_x_tallo"] = summary["flete_total"] / summary["tallos"].replace(0, np.nan)
+            summary["precio_fob"] = summary["ventas_usd"] - summary["flete_total"]
+            summary["precio_fob_x_tallo"] = summary["precio_fob"] / summary["tallos"].replace(0, np.nan)
+            return summary.merge(terms.rename("terminos_flete").reset_index(), on="anio", how="left").replace([np.inf, -np.inf], np.nan).fillna(0)
+        except Exception as exc:
+            print(f"Fallo resumen rapido de fletes; usando detalle: {exc}", file=sys.stderr, flush=True)
+
+    try:
+        frame, _ = _read_freight_scope(
+            years, week_range, companies, clients, countries, products, colors, order_types
+        )
+    except Exception as exc:
+        print(f"No se pudo resumir flete para Ventas generales: {exc}", file=sys.stderr, flush=True)
+        return pd.DataFrame()
+    if frame.empty:
+        return pd.DataFrame()
+    summary = _aggregate(frame, ["anio"])
+    terms = (
+        frame.groupby("anio", dropna=False)["tipo_flete"]
+        .agg(lambda values: ", ".join(sorted({str(value).strip().upper() for value in values if str(value).strip()})))
+        .rename("terminos_flete")
+        .reset_index()
+    )
+    return summary.merge(terms, on="anio", how="left")
 
 
 def _display(

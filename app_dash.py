@@ -39,7 +39,7 @@ from dash import dash_table
 from dash import dcc
 from dash import html
 
-from fletes_dashboard import get_fletes_filter_options, render_fletes_tab
+from fletes_dashboard import get_client_negotiation_term_map, get_fletes_filter_options, get_sales_freight_summary, render_fletes_tab
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -408,6 +408,8 @@ SALES_VISUAL_COLS = [
     "producto",
     "color",
     "moneda_original",
+    "tallos_analisis",
+    "tallos_pedidos",
     "tallos_confirmados",
     "ventas_usd",
     "valor_total_original",
@@ -1510,9 +1512,13 @@ def load_data(
             frame["cod_cliente"] = normalize_code(frame["cod_cliente"])
     for frame in [ventas_semana, ventas_producto, ventas_cliente, ventas_caja]:
         if not frame.empty:
-            for col in ["anio", "semana_iso", "tallos_confirmados", "ventas_usd", "valor_total_original", "precio_usd_tallo", "precio_moneda_original_tallo"]:
+            for col in ["anio", "semana_iso", "tallos_analisis", "tallos_pedidos", "tallos_confirmados", "ventas_usd", "valor_total_original", "precio_usd_tallo", "precio_moneda_original_tallo"]:
                 if col in frame.columns:
                     frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0)
+            if "tallos_pedidos" not in frame.columns:
+                frame["tallos_pedidos"] = pd.to_numeric(
+                    frame.get("tallos_analisis", frame.get("tallos_confirmados", 0)), errors="coerce"
+                ).fillna(0)
 
     estructura_caja = read_result_or_csv("op_sales.result_descriptivo_estructura_caja", data_dir / "estructura_caja.csv", STRUCTURE_BOX_COLS, ["fecha"]) if eager_results else pd.DataFrame()
     estructura_componentes = read_result_or_csv("op_sales.result_descriptivo_estructura_componentes", data_dir / "estructura_componentes.csv", STRUCTURE_COMPONENT_COLS, ["fecha"]) if eager_results else pd.DataFrame()
@@ -1975,7 +1981,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         current_week = int(max_hist_date.isocalendar().week) if pd.notna(max_hist_date) else int(pd.Timestamp.today().isocalendar().week)
     else:
         current_week = int(pd.Timestamp.today().isocalendar().week)
-    app = Dash(__name__, title="LGF Commercial Analytics", suppress_callback_exceptions=True)
+    app = Dash(__name__, title="Analítica comercial LGF", suppress_callback_exceptions=True)
 
     @app.callback(
         Output({"type": "managed-table", "index": MATCH}, "filter_query"),
@@ -1996,14 +2002,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 [
                     html.Div(
                         [
-                            html.H1("LGF Commercial Analytics"),
-                            html.P("Client, sales, structures, freight and solid forecast dashboard."),
+                            html.H1("Analítica comercial LGF"),
+                            html.P("Visualizador de clientes, ventas, estructuras, fletes y pronóstico de sólidos."),
                         ],
                         className="header-copy",
                     ),
                     html.Div(
                         [
-                            html.Div(f"Source: {data_dir.resolve()}", className="source-line"),
+                            html.Div(f"Fuente: {data_dir.resolve()}", className="source-line"),
                             html.Div("Dash + Plotly", className="tech-pill"),
                         ],
                         className="header-meta",
@@ -2015,24 +2021,24 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 [
                     html.Aside(
                         [
-                            html.Label("Client"),
-                            dcc.Dropdown(id="client", options=client_options, value=[], multi=True, clearable=True, placeholder="All clients"),
-                            html.Div("Select one or more clients. The detailed viewer separates solids, assorted items, recipes and bulk orders.", className="filter-help"),
+                            html.Label("Cliente"),
+                            dcc.Dropdown(id="client", options=client_options, value=[], multi=True, clearable=True, placeholder="Todos los clientes"),
+                            html.Div("Selecciona uno o más clientes. El visualizador detallado separa sólidos, surtidos, recetas y pedidos bulk.", className="filter-help"),
                             html.Div(
                                 [
-                                    html.Label("Client product"),
+                                    html.Label("Producto del cliente"),
                                     dcc.Dropdown(
                                         id="client-product-filter",
                                         options=[],
                                         value=[],
                                         multi=True,
                                         clearable=True,
-                                        placeholder="All client products",
+                                        placeholder="Todos los productos del cliente",
                                     ),
                                     html.Div(
                                         [
-                                            html.Button("All", id="product-select-all", n_clicks=0, type="button"),
-                                            html.Button("Clear", id="product-clear", n_clicks=0, type="button"),
+                                            html.Button("Todos", id="product-select-all", n_clicks=0, type="button"),
+                                            html.Button("Limpiar", id="product-clear", n_clicks=0, type="button"),
                                         ],
                                         className="filter-actions",
                                     ),
@@ -2041,19 +2047,19 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Internal color"),
+                                    html.Label("Color interno"),
                                     dcc.Dropdown(
                                         id="client-color-filter",
                                         options=[],
                                         value=[],
                                         multi=True,
                                         clearable=True,
-                                        placeholder="All internal colors",
+                                        placeholder="Todos los colores internos",
                                     ),
                                     html.Div(
                                         [
-                                            html.Button("All", id="color-select-all", n_clicks=0, type="button"),
-                                            html.Button("Clear", id="color-clear", n_clicks=0, type="button"),
+                                            html.Button("Todos", id="color-select-all", n_clicks=0, type="button"),
+                                            html.Button("Limpiar", id="color-clear", n_clicks=0, type="button"),
                                         ],
                                         className="filter-actions",
                                     ),
@@ -2062,13 +2068,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Client operational SKU"),
+                                    html.Label("SKU operativo del cliente"),
                                     dcc.Dropdown(
                                         id="client-program-filter",
                                         options=[],
                                         value=None,
                                         clearable=True,
-                                        placeholder="All SKUs",
+                                        placeholder="Todos los SKU",
                                     ),
                                 ],
                                 id="client-program-filter-wrap",
@@ -2076,13 +2082,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("360 composition SKU"),
+                                    html.Label("SKU para composición 360"),
                                     dcc.Dropdown(
                                         id="selected-sku-operativo",
                                         options=[],
                                         value=None,
                                         clearable=True,
-                                        placeholder="All SKUs / select one for composition",
+                                        placeholder="Todos los SKU / selecciona uno para ver composición",
                                     ),
                                 ],
                                 id="selected-sku-operativo-wrap",
@@ -2090,7 +2096,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Operational SKU"),
+                                    html.Label("SKU operativo"),
                                     dcc.Dropdown(
                                         id="visual-sku-filter",
                                         options=[],
@@ -2098,13 +2104,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                         multi=True,
                                         clearable=True,
                                         searchable=True,
-                                        placeholder="All operational SKUs",
+                                        placeholder="Todos los SKU operativos",
                                         className="sku-multiselect",
                                     ),
                                     html.Div(
                                         [
-                                            html.Button("All", id="sku-select-all", n_clicks=0, type="button"),
-                                            html.Button("Clear", id="sku-clear", n_clicks=0, type="button"),
+                                            html.Button("Todos", id="sku-select-all", n_clicks=0, type="button"),
+                                            html.Button("Limpiar", id="sku-clear", n_clicks=0, type="button"),
                                         ],
                                         className="filter-actions",
                                     ),
@@ -2114,13 +2120,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Color view"),
+                                    html.Label("Vista del color"),
                                     dcc.Dropdown(
                                         id="client-color-view",
                                         options=[
-                                            {"label": "Selected week", "value": "selected_week"},
-                                            {"label": "Period average", "value": "period_average"},
-                                            {"label": "Period total", "value": "period_total"},
+                                            {"label": "Semana seleccionada", "value": "selected_week"},
+                                            {"label": "Promedio del período", "value": "period_average"},
+                                            {"label": "Total del período", "value": "period_total"},
                                         ],
                                         value="period_total",
                                         clearable=False,
@@ -2130,13 +2136,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                             ),
                             html.Div(
                                 [
-                                    html.Label("Internal detail"),
+                                    html.Label("Detalle interno"),
                                     dcc.Dropdown(
                                         id="client-internal-detail",
                                         options=[
-                                            {"label": "Internal color", "value": "color"},
-                                            {"label": "Color + variety", "value": "color_variedad"},
-                                            {"label": "Internal varieties", "value": "variedad"},
+                                            {"label": "Color interno", "value": "color"},
+                                            {"label": "Color + variedad", "value": "color_variedad"},
+                                            {"label": "Variedades internas", "value": "variedad"},
                                         ],
                                         value="color",
                                         clearable=False,
@@ -2154,23 +2160,23 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                 id="tabs",
                                 value="visualizador_clientes_general",
                                 children=[
-                                    dcc.Tab(label="Detailed client viewer", value="visualizador_clientes_general"),
-                                    dcc.Tab(label="General sales", value="ventas_generales"),
-                                    dcc.Tab(label="Freight", value="fletes"),
-                                    dcc.Tab(label="Buyer", value="comprador"),
-                                    dcc.Tab(label="Demand and inventory", value="demanda"),
-                                    dcc.Tab(label="Historical solid forecast", value="forecast_solidos"),
-                                    dcc.Tab(label="Admin", value="administrador"),
+                                    dcc.Tab(label="Visualizador detallado de clientes", value="visualizador_clientes_general"),
+                                    dcc.Tab(label="Ventas generales", value="ventas_generales"),
+                                    dcc.Tab(label="Fletes", value="fletes"),
+                                    dcc.Tab(label="Comprador", value="comprador"),
+                                    dcc.Tab(label="Demanda e inventario", value="demanda"),
+                                    dcc.Tab(label="Pronóstico histórico de sólidos", value="forecast_solidos"),
+                                    dcc.Tab(label="Administrador", value="administrador"),
                                 ],
                             ),
                             html.Div(
                                 [
                                     html.Div(
                                         [
-                                            html.Label("Analysis week"),
+                                            html.Label("Semana de análisis"),
                                             dcc.Dropdown(
                                                 id="analysis-week",
-                                                options=[{"label": f"Week {week}", "value": week} for week in range(1, 54)],
+                                                options=[{"label": f"Semana {week}", "value": week} for week in range(1, 54)],
                                                 value=current_week,
                                                 clearable=False,
                                             ),
@@ -2179,15 +2185,15 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Lookback weeks"),
+                                            html.Label("Semanas de historial"),
                                             dcc.Dropdown(
                                                 id="client-lookback-weeks",
                                                 options=[
-                                                    {"label": "4 weeks", "value": 4},
-                                                    {"label": "8 weeks", "value": 8},
-                                                    {"label": "12 weeks", "value": 12},
-                                                    {"label": "26 weeks", "value": 26},
-                                                    {"label": "52 weeks", "value": 52},
+                                                    {"label": "4 semanas", "value": 4},
+                                                    {"label": "8 semanas", "value": 8},
+                                                    {"label": "12 semanas", "value": 12},
+                                                    {"label": "26 semanas", "value": 26},
+                                                    {"label": "52 semanas", "value": 52},
                                                 ],
                                                 value=12,
                                                 clearable=False,
@@ -2197,21 +2203,21 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Sales years"),
+                                            html.Label("Años de ventas"),
                                             dcc.Dropdown(
                                                 id="visual-sales-years",
                                                 options=sales_year_options,
                                                 value=sales_default_years,
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="Select years",
+                                                placeholder="Selecciona años",
                                             ),
                                         ],
                                         className="demand-control visual-only-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Week range"),
+                                            html.Label("Rango de semanas"),
                                             dcc.RangeSlider(
                                                 id="visual-week-range",
                                                 min=1,
@@ -2227,24 +2233,24 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Operational type"),
+                                            html.Label("Tipo operativo"),
                                             dcc.Dropdown(
                                                 id="visual-tipo-filter",
                                                 options=[],
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All types",
+                                                placeholder="Todos los tipos",
                                             ),
                                         ],
                                         className="demand-control visual-only-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Comparison"),
+                                            html.Label("Comparación"),
                                             dcc.Checklist(
                                                 id="client-compare-last-year",
-                                                options=[{"label": "Show previous year", "value": "last_year"}],
+                                                options=[{"label": "Mostrar año anterior", "value": "last_year"}],
                                                 value=[],
                                                 inputStyle={"marginRight": "8px"},
                                             ),
@@ -2253,14 +2259,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Chart metric"),
+                                            html.Label("Métrica de la gráfica"),
                                             dcc.Dropdown(
                                                 id="client-volume-metric",
                                                 options=[
-                                                    {"label": "Confirmed stems", "value": "tallos_confirmados"},
-                                                    {"label": "Requested stems", "value": "tallos_pedidos"},
-                                                    {"label": "Sales USD", "value": "ventas_usd"},
-                                                    {"label": "Boxes", "value": "cajas_ids"},
+                                                    {"label": "Tallos confirmados", "value": "tallos_confirmados"},
+                                                    {"label": "Tallos pedidos", "value": "tallos_pedidos"},
+                                                    {"label": "Ventas USD", "value": "ventas_usd"},
+                                                    {"label": "Cajas", "value": "cajas_ids"},
                                                 ],
                                                 value="tallos_confirmados",
                                                 clearable=False,
@@ -2270,7 +2276,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Rows"),
+                                            html.Label("Filas"),
                                             dcc.Dropdown(
                                                 id="top-n",
                                                 options=[{"label": str(n), "value": n} for n in [10, 15, 20, 30, 40]],
@@ -2288,21 +2294,21 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                 [
                                     html.Div(
                                         [
-                                            html.Label("Years"),
+                                            html.Label("Años"),
                                             dcc.Dropdown(
                                                 id="general-sales-years",
                                                 options=sales_year_options,
                                                 value=sales_default_years,
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All years",
+                                                placeholder="Todos los años",
                                             ),
                                         ],
                                         className="demand-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Base year"),
+                                            html.Label("Año base"),
                                             dcc.Dropdown(
                                                 id="general-sales-base-year",
                                                 options=sales_base_year_options,
@@ -2315,7 +2321,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Comparison year"),
+                                            html.Label("Año comparativo"),
                                             dcc.Dropdown(
                                                 id="general-sales-compare-year",
                                                 options=sales_base_year_options,
@@ -2328,7 +2334,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Week range"),
+                                            html.Label("Rango de semanas"),
                                             dcc.RangeSlider(
                                                 id="general-sales-week-range",
                                                 min=1,
@@ -2344,56 +2350,56 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Company"),
+                                            html.Label("Compañía"),
                                             dcc.Dropdown(
                                                 id="general-sales-companies",
                                                 options=general_sales_company_options,
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All companies",
+                                                placeholder="Todas las compañías",
                                             ),
                                         ],
                                         className="demand-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Client"),
+                                            html.Label("Cliente"),
                                             dcc.Dropdown(
                                                 id="general-sales-clients",
                                                 options=general_sales_client_options,
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All clients",
+                                                placeholder="Todos los clientes",
                                             ),
                                         ],
                                         className="demand-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Country"),
+                                            html.Label("País"),
                                             dcc.Dropdown(
                                                 id="general-sales-countries",
                                                 options=general_sales_country_options,
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All countries",
+                                                placeholder="Todos los países",
                                             ),
                                         ],
                                         className="demand-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Product"),
+                                            html.Label("Producto"),
                                             dcc.Dropdown(
                                                 id="general-sales-products",
                                                 options=general_sales_product_options,
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All products",
+                                                placeholder="Todos los productos",
                                             ),
                                         ],
                                         className="demand-control",
@@ -2407,21 +2413,21 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All colors",
+                                                placeholder="Todos los colores",
                                             ),
                                         ],
                                         className="demand-control",
                                     ),
                                     html.Div(
                                         [
-                                            html.Label("Operational type"),
+                                            html.Label("Tipo operativo"),
                                             dcc.Dropdown(
                                                 id="general-sales-types",
                                                 options=general_sales_type_options,
                                                 value=[],
                                                 multi=True,
                                                 clearable=True,
-                                                placeholder="All types",
+                                                placeholder="Todos los tipos",
                                             ),
                                         ],
                                         className="demand-control",
@@ -2436,25 +2442,25 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                         [
                                             html.Div(
                                                 [
-                                                    html.Div("Forecast controls", className="forecast-controls-title"),
-                                                    html.Div("Select scope, project, validate and simulate.", className="forecast-controls-subtitle"),
+                                                    html.Div("Controles del pronóstico", className="forecast-controls-title"),
+                                                    html.Div("Selecciona el alcance, proyecta, valida y simula.", className="forecast-controls-subtitle"),
                                                 ]
                                             ),
-                                            html.Button("Clear filters", id="forecast-clear-filters", n_clicks=0, type="button"),
+                                            html.Button("Limpiar filtros", id="forecast-clear-filters", n_clicks=0, type="button"),
                                         ],
                                         className="forecast-controls-header",
                                     ),
                                     html.Div(
                                         [
-                                            html.Div("1. Commercial scope", className="forecast-filter-title"),
-                                            html.Div("Changes the projection, validation and summaries.", className="forecast-filter-effect"),
+                                            html.Div("1. Alcance comercial", className="forecast-filter-title"),
+                                            html.Div("Modifica la proyección, la validación y los resúmenes.", className="forecast-filter-effect"),
                                             html.Div(
                                                 [
-                                                    html.Div([html.Label("Market"), dcc.Dropdown(id="forecast-markets", options=forecast_market_options, value=[], multi=True, placeholder="All markets")], className="demand-control"),
-                                                    html.Div([html.Label("Country"), dcc.Dropdown(id="forecast-countries", options=forecast_country_options, value=[], multi=True, placeholder="All countries")], className="demand-control"),
-                                                    html.Div([html.Label("Client"), dcc.Dropdown(id="forecast-clients", options=forecast_client_options, value=[], multi=True, placeholder="All clients")], className="demand-control"),
-                                                    html.Div([html.Label("Product"), dcc.Dropdown(id="forecast-products", options=forecast_product_options, value=[], multi=True, placeholder="All products")], className="demand-control"),
-                                                    html.Div([html.Label("Color"), dcc.Dropdown(id="forecast-colors", options=forecast_color_options, value=[], multi=True, placeholder="All colors")], className="demand-control"),
+                                                    html.Div([html.Label("Mercado"), dcc.Dropdown(id="forecast-markets", options=forecast_market_options, value=[], multi=True, placeholder="Todos los mercados")], className="demand-control"),
+                                                    html.Div([html.Label("País"), dcc.Dropdown(id="forecast-countries", options=forecast_country_options, value=[], multi=True, placeholder="Todos los países")], className="demand-control"),
+                                                    html.Div([html.Label("Cliente"), dcc.Dropdown(id="forecast-clients", options=forecast_client_options, value=[], multi=True, placeholder="Todos los clientes")], className="demand-control"),
+                                                    html.Div([html.Label("Producto"), dcc.Dropdown(id="forecast-products", options=forecast_product_options, value=[], multi=True, placeholder="Todos los productos")], className="demand-control"),
+                                                    html.Div([html.Label("Color"), dcc.Dropdown(id="forecast-colors", options=forecast_color_options, value=[], multi=True, placeholder="Todos los colores")], className="demand-control"),
                                                 ],
                                                 className="forecast-filter-grid forecast-filter-grid-5",
                                             ),
@@ -2463,16 +2469,16 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Div("2. Future projection", className="forecast-filter-title"),
-                                            html.Div("Defines how many future weeks appear in the line, cards and projected tables.", className="forecast-filter-effect"),
+                                            html.Div("2. Proyección futura", className="forecast-filter-title"),
+                                            html.Div("Define cuántas semanas futuras aparecen en la línea, las tarjetas y las tablas proyectadas.", className="forecast-filter-effect"),
                                             html.Div(
                                                 [
                                                     html.Div(
                                                         [
-                                                            html.Label("Future horizon"),
+                                                            html.Label("Horizonte futuro"),
                                                             dcc.RadioItems(
                                                                 id="forecast-horizon-weeks",
-                                                                options=[{"label": "2 weeks", "value": 2}, {"label": "5 weeks", "value": 5}, {"label": "8 weeks", "value": 8}],
+                                                                options=[{"label": "2 semanas", "value": 2}, {"label": "5 semanas", "value": 5}, {"label": "8 semanas", "value": 8}],
                                                                 value=5,
                                                                 inline=True,
                                                                 inputStyle={"marginRight": "6px", "marginLeft": "12px"},
@@ -2489,13 +2495,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Div("3. Historical comparison", className="forecast-filter-title"),
-                                            html.Div("Changes the actual lines used to compare the forecast; it does not change the generated model.", className="forecast-filter-effect"),
+                                            html.Div("3. Comparación histórica", className="forecast-filter-title"),
+                                            html.Div("Modifica las líneas reales usadas para comparar el pronóstico; no cambia el modelo generado.", className="forecast-filter-effect"),
                                             html.Div(
                                                 [
-                                                    html.Div([html.Label("Historical period"), dcc.DatePickerRange(id="forecast-date-range", min_date_allowed=forecast_date_min, max_date_allowed=forecast_date_max, start_date=forecast_date_min, end_date=forecast_date_max, display_format="YYYY-MM-DD")], className="demand-control"),
-                                                    html.Div([html.Label("Historical years"), dcc.Dropdown(id="forecast-years", options=forecast_year_options, value=forecast_default_years, multi=True, placeholder="All years")], className="demand-control"),
-                                                    html.Div([html.Label("Historical ISO weeks"), dcc.RangeSlider(id="forecast-week-range", min=1, max=53, step=1, value=[1, 53], marks={1: "1", 13: "13", 26: "26", 39: "39", 53: "53"}, allowCross=False, tooltip={"placement": "bottom", "always_visible": False})], className="demand-control slider-control"),
+                                                    html.Div([html.Label("Período histórico"), dcc.DatePickerRange(id="forecast-date-range", min_date_allowed=forecast_date_min, max_date_allowed=forecast_date_max, start_date=forecast_date_min, end_date=forecast_date_max, display_format="YYYY-MM-DD")], className="demand-control"),
+                                                    html.Div([html.Label("Años históricos"), dcc.Dropdown(id="forecast-years", options=forecast_year_options, value=forecast_default_years, multi=True, placeholder="Todos los años")], className="demand-control"),
+                                                    html.Div([html.Label("Semanas ISO históricas"), dcc.RangeSlider(id="forecast-week-range", min=1, max=53, step=1, value=[1, 53], marks={1: "1", 13: "13", 26: "26", 39: "39", 53: "53"}, allowCross=False, tooltip={"placement": "bottom", "always_visible": False})], className="demand-control slider-control"),
                                                 ],
                                                 className="forecast-filter-grid",
                                             ),
@@ -2504,14 +2510,14 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Div("4. Historical validation", className="forecast-filter-title"),
-                                            html.Div("Measures WAPE and bias in a selected past window and lets you review the final backtest.", className="forecast-filter-effect"),
+                                            html.Div("4. Validación histórica", className="forecast-filter-title"),
+                                            html.Div("Mide WAPE y sesgo en una ventana pasada seleccionada y permite revisar el backtest final.", className="forecast-filter-effect"),
                                             html.Div(
                                                 [
-                                                    html.Div([html.Label("Evaluated year"), dcc.Dropdown(id="forecast-validation-year", options=validation_year_options, value=validation_default_year, clearable=False, placeholder="No comparable period")], className="demand-control"),
-                                                    html.Div([html.Label("Evaluated duration"), dcc.RadioItems(id="forecast-validation-weeks", options=[{"label": "2 weeks", "value": 2}, {"label": "5 weeks", "value": 5}, {"label": "8 weeks", "value": 8}], value=validation_default_weeks, inline=True, inputStyle={"marginRight": "6px", "marginLeft": "12px"}, labelStyle={"display": "inline-flex", "alignItems": "center"})], className="demand-control"),
-                                                    html.Div([html.Label("Window start"), dcc.Dropdown(id="forecast-validation-start-week", options=validation_start_week_options, value=validation_default_start_week, clearable=False, placeholder="No valid window")], className="demand-control"),
-                                                    html.Div([html.Label("Final backtest model"), dcc.Dropdown(id="forecast-model", options=forecast_model_options, value=forecast_default_model, clearable=False)], className="demand-control"),
+                                                    html.Div([html.Label("Año evaluado"), dcc.Dropdown(id="forecast-validation-year", options=validation_year_options, value=validation_default_year, clearable=False, placeholder="Sin período comparable")], className="demand-control"),
+                                                    html.Div([html.Label("Duración evaluada"), dcc.RadioItems(id="forecast-validation-weeks", options=[{"label": "2 semanas", "value": 2}, {"label": "5 semanas", "value": 5}, {"label": "8 semanas", "value": 8}], value=validation_default_weeks, inline=True, inputStyle={"marginRight": "6px", "marginLeft": "12px"}, labelStyle={"display": "inline-flex", "alignItems": "center"})], className="demand-control"),
+                                                    html.Div([html.Label("Inicio de la ventana"), dcc.Dropdown(id="forecast-validation-start-week", options=validation_start_week_options, value=validation_default_start_week, clearable=False, placeholder="Sin ventana válida")], className="demand-control"),
+                                                    html.Div([html.Label("Modelo del backtest final"), dcc.Dropdown(id="forecast-model", options=forecast_model_options, value=forecast_default_model, clearable=False)], className="demand-control"),
                                                 ],
                                                 className="forecast-filter-grid",
                                             ),
@@ -2520,13 +2526,13 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                     ),
                                     html.Div(
                                         [
-                                            html.Div("5. Commercial scenario", className="forecast-filter-title"),
-                                            html.Div("Simulates a hypothesis over the visible forecast; it does not retrain the model.", className="forecast-filter-effect"),
+                                            html.Div("5. Escenario comercial", className="forecast-filter-title"),
+                                            html.Div("Simula una hipótesis sobre el pronóstico visible; no vuelve a entrenar el modelo.", className="forecast-filter-effect"),
                                             html.Div(
                                                 [
-                                                    html.Div([html.Label("Scenario client"), dcc.Dropdown(id="forecast-scenario-client", options=forecast_client_options, value=None, clearable=True, placeholder="Select client")], className="demand-control"),
-                                                    html.Div([html.Label("Scenario product"), dcc.Dropdown(id="forecast-scenario-product", options=forecast_product_options, value=None, clearable=True, placeholder="Any product")], className="demand-control"),
-                                                    html.Div([html.Label("Scenario color"), dcc.Dropdown(id="forecast-scenario-color", options=forecast_color_options, value=None, clearable=True, placeholder="Any color")], className="demand-control"),
+                                                    html.Div([html.Label("Cliente del escenario"), dcc.Dropdown(id="forecast-scenario-client", options=forecast_client_options, value=None, clearable=True, placeholder="Selecciona un cliente")], className="demand-control"),
+                                                    html.Div([html.Label("Producto del escenario"), dcc.Dropdown(id="forecast-scenario-product", options=forecast_product_options, value=None, clearable=True, placeholder="Cualquier producto")], className="demand-control"),
+                                                    html.Div([html.Label("Color del escenario"), dcc.Dropdown(id="forecast-scenario-color", options=forecast_color_options, value=None, clearable=True, placeholder="Cualquier color")], className="demand-control"),
                                                     html.Div([html.Label("Probabilidad de compra"), dcc.Slider(id="forecast-scenario-probability", min=50, max=150, step=5, value=100, marks={50: "50%", 100: "100%", 150: "150%"}, tooltip={"placement": "bottom", "always_visible": False})], className="demand-control slider-control"),
                                                     html.Div([html.Label("Volumen si compra"), dcc.Slider(id="forecast-scenario-volume", min=50, max=150, step=5, value=100, marks={50: "50%", 100: "100%", 150: "150%"}, tooltip={"placement": "bottom", "always_visible": False})], className="demand-control slider-control"),
                                                 ],
@@ -2552,7 +2558,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                                                     {"label": "Solidos: color/caja/SKU", "value": "solidos"},
                                                     {"label": "Estructuras mixtas: receta/composicion", "value": "estructuras"},
                                                     {"label": "Bulk: producto/color base", "value": "bulk"},
-                                                    {"label": "All formats", "value": "todos"},
+                                                    {"label": "Todos los formatos", "value": "todos"},
                                                 ],
                                                 value="solidos",
                                                 clearable=False,
@@ -2806,9 +2812,9 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 general_sales_types,
             )
         if tab == "comprador":
-            return render_reserved_module("Buyer", "This module is reserved for the projection and inventory matching phase.")
+            return render_reserved_module("Comprador", "Este módulo está reservado para la fase de proyección y cruce con inventario.")
         if tab == "demanda":
-            return render_reserved_module("Demand and inventory", "This module is reserved until the inventory projection is incorporated.")
+            return render_reserved_module("Demanda e inventario", "Este módulo está reservado hasta incorporar la proyección de inventario.")
         if tab == "forecast_solidos":
             return render_forecast_solidos_tab(
                 data,
@@ -3673,7 +3679,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 .metric-card-comparison { min-height: 128px; }
                 .metric-title { color: #667382; font-size: 12px; font-weight: 700; text-transform: uppercase; }
                 .metric-value { font-size: 26px; line-height: 34px; font-weight: 800; color: #17202a; overflow-wrap: anywhere; }
-                .metric-detail { color: #6f7c8a; font-size: 12px; }
+                .metric-detail { color: #4f5d6b; font-size: 13px; line-height: 1.35; font-weight: 600; }
                 .delta-badge { border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 800; white-space: nowrap; }
                 .delta-badge.positive { color: #006B4A; background: #E3F5EE; }
                 .delta-badge.negative { color: #A5281B; background: #FCE8E6; }
@@ -3722,8 +3728,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 .year-comparison { margin: 8px 0 6px; display: flex; flex-direction: column; gap: 5px; }
                 .year-row { display: grid; grid-template-columns: 44px minmax(70px, 1fr) minmax(96px, auto); gap: 6px; align-items: baseline; font-size: 12px; }
                 .year-label { font-weight: 700; color: #44505e; }
-                .year-value { font-size: 16px; font-weight: 800; color: #17202a; text-align: right; overflow-wrap: anywhere; }
-                .year-value-note { display: block; margin-top: 2px; color: #8a96a3; font-size: 10px; line-height: 1.2; font-weight: 600; }
+                .year-value { font-size: 17px; font-weight: 800; color: #17202a; text-align: right; overflow-wrap: anywhere; }
+                .year-value-note { display: block; margin-top: 3px; color: #536171; font-size: 12px; line-height: 1.3; font-weight: 700; }
                 .year-delta { text-align: right; font-weight: 700; font-size: 11px; }
                 .year-delta.positive { color: #00875A; }
                 .year-delta.negative { color: #C0392B; }
@@ -5205,6 +5211,7 @@ def summarize_sales_frame(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFra
         return pd.DataFrame()
     out = df.groupby(group_cols, dropna=False, as_index=False).agg(
         tallos_confirmados=("tallos_confirmados", "sum"),
+        tallos_pedidos=("tallos_pedidos", "sum") if "tallos_pedidos" in df.columns else ("tallos_confirmados", "sum"),
         ventas_usd=("ventas_usd", "sum"),
         valor_total_original=("valor_total_original", "sum"),
         pedidos=("pedidos", "sum") if "pedidos" in df.columns else ("tallos_confirmados", "size"),
@@ -5212,7 +5219,96 @@ def summarize_sales_frame(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFra
     )
     out["precio_usd_tallo"] = (out["ventas_usd"] / out["tallos_confirmados"].replace(0, np.nan)).fillna(0)
     out["precio_moneda_original_tallo"] = (out["valor_total_original"] / out["tallos_confirmados"].replace(0, np.nan)).fillna(0)
+    out["cumplimiento"] = (out["tallos_confirmados"] / out["tallos_pedidos"].replace(0, np.nan)).fillna(0)
+    out["tasa_usd_por_moneda"] = (out["ventas_usd"] / out["valor_total_original"].replace(0, np.nan)).fillna(0)
     return out
+
+
+def enrich_sales_currency_context(frame: pd.DataFrame) -> pd.DataFrame:
+    """Expose the effective conversion carried by the sales values.
+
+    The current SQL source labels every row as dollars, although original total
+    and USD total differ for part of the history.  The applied rate is therefore
+    the reliable field; EUR/GBP labels are inferred conservatively from it.
+    """
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    original = pd.to_numeric(out.get("valor_total_original", 0), errors="coerce").fillna(0)
+    usd = pd.to_numeric(out.get("ventas_usd", 0), errors="coerce").fillna(0)
+    out["tasa_usd_por_moneda"] = (usd / original.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    reported = out.get("moneda_original", pd.Series("sin_info", index=out.index)).fillna("sin_info").astype(str).str.strip()
+    rate = out["tasa_usd_por_moneda"]
+    inferred = np.select(
+        [rate.between(0.97, 1.03, inclusive="both"), rate.gt(1.20), rate.gt(1.03)],
+        ["USD", "GBP (inferida por tasa)", "EUR (inferida por tasa)"],
+        default=reported.str.upper(),
+    )
+    company = out.get("NomCompania", pd.Series("", index=out.index)).fillna("").astype(str).str.upper().str.strip()
+    is_arabella = company.str.contains("ARABELLA", regex=False)
+    is_global = company.str.contains("GLOBAL", regex=False)
+    is_gaitana = company.str.contains("GAITANA", regex=False)
+    inferred = np.where(is_arabella, "EUR", inferred)
+    inferred = np.where(is_global, "GBP", inferred)
+    inferred = np.where(is_gaitana & rate.between(0.97, 1.03, inclusive="both"), "USD", inferred)
+    inferred = np.where(is_gaitana & rate.notna() & ~rate.between(0.97, 1.03, inclusive="both"), "EUR", inferred)
+    out["moneda_visual"] = inferred
+    return out
+
+
+def sales_currency_figures(view: pd.DataFrame) -> tuple[go.Figure, go.Figure]:
+    if view.empty:
+        return empty_figure("Precio unitario en moneda original"), empty_figure("Tasa de conversión aplicada")
+    work = enrich_sales_currency_context(view)
+    valid = work[work["valor_total_original"].gt(0) & work["ventas_usd"].gt(0)].copy()
+    if valid.empty:
+        return empty_figure("Precio unitario en moneda original"), empty_figure("Tasa de conversión aplicada")
+    weekly = valid.groupby(["anio", "semana_iso", "moneda_visual"], dropna=False, as_index=False).agg(
+        tallos_confirmados=("tallos_confirmados", "sum"),
+        ventas_usd=("ventas_usd", "sum"),
+        valor_total_original=("valor_total_original", "sum"),
+    )
+    weekly["precio_original_tallo"] = weekly["valor_total_original"] / weekly["tallos_confirmados"].replace(0, np.nan)
+    weekly["tasa_usd_por_moneda"] = weekly["ventas_usd"] / weekly["valor_total_original"].replace(0, np.nan)
+    weekly["serie"] = weekly["anio"].astype("Int64").astype(str) + " | " + weekly["moneda_visual"].astype(str)
+
+    original_fig = px.line(
+        weekly, x="semana_iso", y="precio_original_tallo", color="serie", markers=True,
+        hover_data=["moneda_visual", "ventas_usd", "valor_total_original", "tallos_confirmados"],
+        title="Precio unitario en moneda original por semana",
+    )
+    original_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Moneda original/tallo")
+    apply_common_layout(original_fig, 360)
+
+    rate_source = valid[valid["moneda_visual"].astype(str).str.startswith(("EUR", "GBP", "USD"))].copy()
+    if rate_source.empty:
+        rate_fig = empty_figure("Evolución de la tasa efectiva de conversión")
+        return original_fig, rate_fig
+    rate_source["moneda_tasa"] = rate_source["moneda_visual"].astype(str).str.extract(r"^(EUR|GBP|USD)", expand=False)
+    rate_weekly = rate_source.groupby(["anio", "semana_iso", "moneda_tasa"], dropna=False, as_index=False).agg(
+        ventas_usd=("ventas_usd", "sum"),
+        valor_total_original=("valor_total_original", "sum"),
+    )
+    rate_weekly["tasa_usd_por_moneda"] = rate_weekly["ventas_usd"] / rate_weekly["valor_total_original"].replace(0, np.nan)
+    rate_weekly["fecha_semana"] = pd.to_datetime(
+        rate_weekly["anio"].astype(int).astype(str)
+        + "-W"
+        + rate_weekly["semana_iso"].astype(int).astype(str).str.zfill(2)
+        + "-1",
+        format="%G-W%V-%u",
+        errors="coerce",
+    )
+    rate_weekly = rate_weekly.sort_values("fecha_semana")
+    rate_fig = px.line(
+        rate_weekly, x="fecha_semana", y="tasa_usd_por_moneda", color="moneda_tasa", markers=True,
+        hover_data=["anio", "semana_iso", "moneda_tasa", "ventas_usd", "valor_total_original"],
+        color_discrete_map={"EUR": "#4E79A7", "GBP": CORPORATE_BURGUNDY, "USD": "#59A14F"},
+        title="Evolución semanal de las tasas efectivas por moneda",
+    )
+    rate_fig.update_traces(line={"width": 3})
+    rate_fig.update_layout(xaxis_title="Fecha de inicio de semana", yaxis_title="USD por unidad de moneda", legend_title_text="Moneda")
+    apply_common_layout(rate_fig, 360)
+    return original_fig, rate_fig
 
 
 def format_sales_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -5775,35 +5871,35 @@ def operational_internal_label(row: pd.Series, mode: str = "color") -> str:
 
 def visual_operational_reading(df: pd.DataFrame, selected: pd.Series | None, years: list[int] | None, week_range: list[int] | None) -> str:
     if df.empty:
-        return "There is no commercial history for the selected filters."
+        return "No hay historial comercial para los filtros seleccionados."
     total_stems = df["tallos_confirmados"].sum()
     total_usd = df["ventas_usd"].sum()
     price = total_usd / total_stems if total_stems else 0
     top_skus = summarize_visual_operational(df, ["sku_operativo"]).sort_values("tallos_confirmados", ascending=False).head(3)["sku_operativo"].astype(str).tolist()
-    scope = f"Client {selected.get('cod_cliente')}" if selected is not None else f"{moneyless_number(df['cod_cliente'].nunique() if 'cod_cliente' in df.columns else 0)} clients"
-    years_text = ", ".join(map(str, sorted(set(map(int, years or []))))) if years else "all years"
-    weeks_text = f"weeks {week_range[0]}-{week_range[1]}" if week_range and len(week_range) == 2 else "all weeks"
+    scope = f"El cliente {selected.get('cod_cliente')}" if selected is not None else f"Los {moneyless_number(df['cod_cliente'].nunique() if 'cod_cliente' in df.columns else 0)} clientes"
+    years_text = ", ".join(map(str, sorted(set(map(int, years or []))))) if years else "todos los años"
+    weeks_text = f"las semanas {week_range[0]}-{week_range[1]}" if week_range and len(week_range) == 2 else "todas las semanas"
     has_non_solid = not df[df["tipo_operativo_norm"].ne("SOLIDO")].empty
-    note = " For assorted items or recipes, variety remains an additional SKU detail." if has_non_solid else ""
+    note = " Para surtidos o recetas, la variedad se conserva como detalle adicional del SKU." if has_non_solid else ""
     separated_value_note = ""
     if selected is not None and str(selected.get("cod_cliente", "")).replace(".0", "") == "1070":
-        separated_value_note = " For this client, sales are recorded in lines separated from stems; the average price follows the filtered commercial scope."
+        separated_value_note = " Para este cliente, las ventas se registran en líneas separadas de los tallos; el precio promedio respeta el alcance comercial filtrado."
     return (
-        f"{scope} moved {moneyless_number(total_stems)} confirmed stems in {years_text} and {weeks_text}. "
-        f"The average price was {moneyless_number(price, 4)} USD per stem. "
-        f"The heaviest SKUs are {', '.join(top_skus) if top_skus else 'no dominant SKU'}.{note}{separated_value_note}"
+        f"{scope} registró {moneyless_number(total_stems)} tallos confirmados en {years_text} y {weeks_text}. "
+        f"El precio promedio fue de {moneyless_number(price, 4)} USD por tallo. "
+        f"Los SKU con mayor volumen son {', '.join(top_skus) if top_skus else 'sin un SKU dominante'}.{note}{separated_value_note}"
     )
 
 
 def visual_week_figure(df: pd.DataFrame, metric: str, show_last_year: bool) -> go.Figure:
     title_metric = {
-        "tallos_confirmados": "Confirmed stems",
-        "tallos_pedidos": "Requested stems",
-        "ventas_usd": "Sales USD",
-        "cajas_ids": "Boxes",
-    }.get(metric, "Confirmed stems")
+        "tallos_confirmados": "Tallos confirmados",
+        "tallos_pedidos": "Tallos pedidos",
+        "ventas_usd": "Ventas USD",
+        "cajas_ids": "Cajas",
+    }.get(metric, "Tallos confirmados")
     if df.empty:
-        return empty_figure(f"Weekly evolution - {title_metric}")
+        return empty_figure(f"Evolución semanal - {title_metric}")
     metric_col = "cajas" if metric == "cajas_ids" else metric
     weekly = summarize_visual_operational(df, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
     fig = px.line(
@@ -5813,15 +5909,15 @@ def visual_week_figure(df: pd.DataFrame, metric: str, show_last_year: bool) -> g
         color="anio",
         markers=True,
         hover_data=["tallos_confirmados", "tallos_pedidos", "ventas_usd", "precio_usd_tallo", "pedidos"],
-        title=f"Weekly evolution by year - {title_metric}" + (" vs previous year" if show_last_year else ""),
+        title=f"Evolución semanal por año - {title_metric}" + (" vs año anterior" if show_last_year else ""),
     )
-    fig.update_layout(xaxis_title="Week", yaxis_title=title_metric, xaxis=dict(dtick=2))
+    fig.update_layout(xaxis_title="Semana", yaxis_title=title_metric, xaxis=dict(dtick=2))
     return apply_common_layout(fig, 430)
 
 
 def visual_price_figure(df: pd.DataFrame, show_last_year: bool) -> go.Figure:
     if df.empty:
-        return empty_figure("Price evolution")
+        return empty_figure("Evolución del precio")
     weekly = summarize_visual_operational(df, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
     fig = px.line(
         weekly,
@@ -5830,9 +5926,9 @@ def visual_price_figure(df: pd.DataFrame, show_last_year: bool) -> go.Figure:
         color="anio",
         markers=True,
         hover_data=["tallos_confirmados", "ventas_usd", "tallos_pedidos", "cumplimiento"],
-        title="Weekly USD/stem price evolution" + (" vs previous year" if show_last_year else ""),
+        title="Evolución semanal del precio USD/tallo" + (" vs año anterior" if show_last_year else ""),
     )
-    fig.update_layout(xaxis_title="Week", yaxis_title="USD/stem", xaxis=dict(dtick=2))
+    fig.update_layout(xaxis_title="Semana", yaxis_title="USD/tallo", xaxis=dict(dtick=2))
     return apply_common_layout(fig, 360)
 
 
@@ -6617,7 +6713,7 @@ def render_ventas_generales_tab(
     colors: list[str] | None = None,
 ) -> html.Div:
     """Present sales totals from the weekly aggregate without recipe-level detail."""
-    sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
+    sales = enrich_sales_currency_context(enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame())))
     if sales.empty:
         return html.Div(
             "No existe ventas_semana_cliente_producto.csv. Ejecuta descriptivos para habilitar Ventas generales.",
@@ -6758,7 +6854,9 @@ def build_sales_executive_context_v2(
 
     def aggregate(frame: pd.DataFrame, year: int | None) -> dict[str, float]:
         stems = float(frame["tallos_confirmados"].sum())
+        requested = float(frame["tallos_pedidos"].sum()) if "tallos_pedidos" in frame.columns else stems
         usd = float(frame["ventas_usd"].sum())
+        original = float(frame["valor_total_original"].sum()) if "valor_total_original" in frame.columns else usd
         if year is not None and not order_view.empty and "pedido" in order_view.columns:
             order_frame = order_view[order_year_series.eq(int(year))]
             pedidos = float(order_frame["pedido"].nunique())
@@ -6772,9 +6870,13 @@ def build_sales_executive_context_v2(
         return {
             "ventas_usd": usd,
             "tallos_confirmados": stems,
+            "tallos_pedidos": requested,
+            "cumplimiento": stems / requested if requested > 0 else 0.0,
             "tallos_universo": universe_stems,
             "participacion_cliente_tallos": stems / universe_stems if universe_stems > 0 else 0.0,
             "precio_usd_tallo": usd / stems if stems > 0 else 0.0,
+            "precio_moneda_original_tallo": original / stems if stems > 0 else 0.0,
+            "tasa_usd_por_moneda": usd / original if original > 0 else 0.0,
             "pedidos": pedidos,
             "clientes_activos": float(frame["cod_cliente"].nunique()) if "cod_cliente" in frame.columns else 0.0,
             "productos_activos": float(frame["producto"].nunique()) if "producto" in frame.columns else 0.0,
@@ -8287,18 +8389,18 @@ def render_ventas_generales_tab_v2(
     """Executive sales tab with yearly comparison and weekly context."""
     sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
     if sales.empty:
-        return html.Div("ventas_semana_cliente_producto.csv is missing. Run descriptives to enable General sales.", className="table-panel")
+        return html.Div("Falta ventas_semana_cliente_producto.csv. Ejecuta los descriptivos para habilitar Ventas generales.", className="table-panel")
 
     view = filter_general_sales_frame(sales, years, week_range, clients, products, countries, companies, colors, order_types)
     if view.empty:
         available_years = sorted(pd.to_numeric(sales["anio"], errors="coerce").dropna().astype(int).unique().tolist()) if "anio" in sales.columns else []
-        years_text = ", ".join(map(str, available_years)) if available_years else "no available years"
+        years_text = ", ".join(map(str, available_years)) if available_years else "sin años disponibles"
         return html.Div(
             [
-                html.Div("General sales", className="panel-title"),
+                html.Div("Ventas generales", className="panel-title"),
                 panel_note(
-                    f"There are no sales for the selected filters. Available years in this dataset: {years_text}. "
-                    "Review the week range, client, product or color filter."
+                    f"No hay ventas para los filtros seleccionados. Años disponibles en estos datos: {years_text}. "
+                    "Revisa el rango de semanas o los filtros de cliente, producto o color."
                 ),
             ],
             className="table-panel",
@@ -8320,13 +8422,13 @@ def render_ventas_generales_tab_v2(
     weekly = summarize_sales_frame(view, ["anio", "semana_iso"]).sort_values(["anio", "semana_iso"])
     annual = context["annual_cards"].copy() if context.get("ok") else summarize_sales_frame(view, ["anio"]).sort_values("anio")
 
-    tallos_fig = px.line(weekly, x="semana_iso", y="tallos_confirmados", color="anio", markers=True, title="Confirmed stems by week")
-    tallos_fig.update_layout(xaxis_title="ISO week", yaxis_title="Confirmed stems")
+    tallos_fig = px.line(weekly, x="semana_iso", y="tallos_confirmados", color="anio", markers=True, title="Tallos confirmados por semana")
+    tallos_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Tallos confirmados")
     apply_common_layout(tallos_fig, 370)
     tallos_fig.update_yaxes(tickformat=",d")
 
-    precio_fig = px.line(weekly, x="semana_iso", y="precio_usd_tallo", color="anio", markers=True, title="Average USD/stem by week")
-    precio_fig.update_layout(xaxis_title="ISO week", yaxis_title="USD/stem")
+    precio_fig = px.line(weekly, x="semana_iso", y="precio_usd_tallo", color="anio", markers=True, title="Precio promedio USD/tallo por semana")
+    precio_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="USD/tallo")
     apply_common_layout(precio_fig, 345)
     precio_fig.update_yaxes(tickformat=",.4f")
     price_values = pd.to_numeric(weekly.get("precio_usd_tallo", pd.Series(dtype=float)), errors="coerce").dropna()
@@ -8336,25 +8438,44 @@ def render_ventas_generales_tab_v2(
         pad = max((p_max - p_min) * 0.15, 0.005)
         precio_fig.update_yaxes(range=[max(0, p_min - pad), p_max + pad])
 
-    annual_display = annual.rename(columns={"anio": "Year", "tallos_confirmados": "Confirmed stems", "ventas_usd": "Sales USD", "precio_usd_tallo": "USD/stem", "pedidos": "Orders", "participacion_cliente_tallos": "Client stem share"})[["Year", "Confirmed stems", "Sales USD", "USD/stem", "Orders", "Client stem share"]].copy()
-    annual_display["Confirmed stems"] = annual_display["Confirmed stems"].map(moneyless_number)
-    annual_display["Sales USD"] = annual_display["Sales USD"].map(lambda value: moneyless_number(value, 2))
-    annual_display["USD/stem"] = annual_display["USD/stem"].map(lambda value: moneyless_number(value, 4))
-    annual_display["Orders"] = annual_display["Orders"].map(lambda value: moneyless_number(value, 0))
-    annual_display["Client stem share"] = annual_display["Client stem share"].map(percent)
+    cumplimiento_fig = px.line(
+        weekly, x="semana_iso", y="cumplimiento", color="anio", markers=True,
+        hover_data=["tallos_pedidos", "tallos_confirmados"],
+        title="Cumplimiento semanal: tallos confirmados / tallos pedidos",
+    )
+    cumplimiento_fig.update_layout(xaxis_title="Semana ISO", yaxis_title="Cumplimiento")
+    cumplimiento_fig.update_yaxes(tickformat=".1%")
+    apply_common_layout(cumplimiento_fig, 360)
+    rate_history = sales.copy()
+    if years and "anio" in rate_history.columns:
+        selected_rate_years = {int(year) for year in selected_values(years)}
+        rate_history = rate_history[
+            pd.to_numeric(rate_history["anio"], errors="coerce").isin(selected_rate_years)
+        ].copy()
+    _, tasa_conversion_fig = sales_currency_figures(rate_history)
+
+    annual_display = annual.rename(columns={"anio": "Año", "tallos_pedidos": "Tallos pedidos", "tallos_confirmados": "Tallos confirmados", "cumplimiento": "Cumplimiento", "ventas_usd": "Ventas USD", "precio_usd_tallo": "USD/tallo", "tasa_usd_por_moneda": "Tasa USD/original", "pedidos": "Pedidos", "participacion_cliente_tallos": "Participación del cliente"})[["Año", "Tallos pedidos", "Tallos confirmados", "Cumplimiento", "Ventas USD", "USD/tallo", "Tasa USD/original", "Pedidos", "Participación del cliente"]].copy()
+    annual_display["Tallos pedidos"] = annual_display["Tallos pedidos"].map(moneyless_number)
+    annual_display["Tallos confirmados"] = annual_display["Tallos confirmados"].map(moneyless_number)
+    annual_display["Ventas USD"] = annual_display["Ventas USD"].map(lambda value: moneyless_number(value, 2))
+    annual_display["USD/tallo"] = annual_display["USD/tallo"].map(lambda value: moneyless_number(value, 4))
+    annual_display["Pedidos"] = annual_display["Pedidos"].map(lambda value: moneyless_number(value, 0))
+    annual_display["Participación del cliente"] = annual_display["Participación del cliente"].map(percent)
+    annual_display["Cumplimiento"] = annual_display["Cumplimiento"].map(percent)
+    annual_display["Tasa USD/original"] = annual_display["Tasa USD/original"].map(lambda value: moneyless_number(value, 4))
     weeks_text = f"{int(week_range[0])}-{int(week_range[1])}" if week_range and len(week_range) == 2 else "all"
 
     export_buttons = html.Div(
         [
             html.Button(
-                "PDF EN summary",
+                "PDF en inglés — resumen",
                 id="general-sales-export-summary-en",
                 n_clicks=0,
                 type="button",
                 className="executive-button secondary",
             ),
             html.Button(
-                "PDF EN full",
+                "PDF en inglés — completo",
                 id="general-sales-export-full-en",
                 n_clicks=0,
                 type="button",
@@ -8375,7 +8496,7 @@ def render_ventas_generales_tab_v2(
                 className="executive-button secondary",
             ),
             html.Button(
-                "Raw Excel",
+                "Excel base cruda",
                 id="general-sales-export-raw",
                 n_clicks=0,
                 type="button",
@@ -8387,20 +8508,135 @@ def render_ventas_generales_tab_v2(
 
     annual_cards = context["annual_cards"] if context.get("ok") else annual.copy()
     share_totals = {
-        int(row.anio): f"total {moneyless_number(getattr(row, 'tallos_universo', 0))} stems"
+        int(row.anio): f"total {moneyless_number(getattr(row, 'tallos_universo', 0))} tallos"
         for row in annual_cards.itertuples(index=False)
         if hasattr(row, "tallos_universo")
     }
+    fulfillment_totals = {
+        int(row.anio): (
+            f"{moneyless_number(getattr(row, 'tallos_confirmados', 0))} confirmados / "
+            f"{moneyless_number(getattr(row, 'tallos_pedidos', 0))} pedidos"
+        )
+        for row in annual_cards.itertuples(index=False)
+    }
+    currency_card_frame = enrich_sales_currency_context(view)
+    filtered_sales_usd = float(pd.to_numeric(currency_card_frame["ventas_usd"], errors="coerce").fillna(0).sum())
+    currency_card_frame = currency_card_frame[
+        currency_card_frame["valor_total_original"].gt(0)
+        & currency_card_frame["ventas_usd"].gt(0)
+        & ~currency_card_frame["moneda_visual"].astype(str).eq("USD")
+    ].copy()
+    converted_sales_usd = float(pd.to_numeric(currency_card_frame.get("ventas_usd", 0), errors="coerce").fillna(0).sum()) if not currency_card_frame.empty else 0.0
+    converted_share = converted_sales_usd / filtered_sales_usd if filtered_sales_usd > 0 else 0.0
+    # Moneda original is only useful when the active filters isolate a genuinely
+    # converted commercial scope. Mixed/global selections stay in USD only.
+    if converted_share < 0.95:
+        currency_card_frame = currency_card_frame.iloc[0:0].copy()
+    original_price_cards = []
+    if not currency_card_frame.empty:
+        currency_summary = currency_card_frame.groupby(["anio", "moneda_visual"], dropna=False, as_index=False).agg(
+            tallos_confirmados=("tallos_confirmados", "sum"),
+            ventas_usd=("ventas_usd", "sum"),
+            valor_total_original=("valor_total_original", "sum"),
+        )
+        currency_summary["precio_original"] = currency_summary["valor_total_original"] / currency_summary["tallos_confirmados"].replace(0, np.nan)
+        currency_summary["precio_usd"] = currency_summary["ventas_usd"] / currency_summary["tallos_confirmados"].replace(0, np.nan)
+        currency_summary["tasa"] = currency_summary["ventas_usd"] / currency_summary["valor_total_original"].replace(0, np.nan)
+        currency_totals = currency_summary.groupby("moneda_visual", as_index=False)["ventas_usd"].sum().sort_values("ventas_usd", ascending=False)
+        for currency_row in currency_totals.itertuples(index=False):
+            currency_label = str(currency_row.moneda_visual)
+            currency_name = currency_label.split(" (")[0]
+            currency_annual = currency_summary[currency_summary["moneda_visual"].astype(str).eq(currency_label)].copy()
+            currency_details = {
+                int(row.anio): (
+                    f"Equivale a {moneyless_number(row.precio_usd, 4)} USD/tallo | "
+                    f"1 {currency_name} = {moneyless_number(row.tasa, 4)} USD"
+                )
+                for row in currency_annual.itertuples(index=False)
+            }
+            original_price_cards.append(
+                make_year_comparison_card(
+                    f"Precio promedio en {currency_name} por tallo",
+                    currency_annual,
+                    "precio_original",
+                    lambda value, unit=currency_name: f"{moneyless_number(value, 4)} {unit}/tallo",
+                    f"Moneda original: {currency_name} por tallo",
+                    currency_details,
+                )
+            )
+    freight_cards = []
+    freight_summary = get_sales_freight_summary(
+        years, week_range, companies, clients, countries, products, colors, order_types
+    )
+    if not freight_summary.empty:
+        freight_years = annual_cards[["anio", "ventas_usd", "tallos_confirmados"]].merge(
+            freight_summary,
+            on="anio",
+            how="inner",
+            suffixes=("_ventas", "_flete"),
+        )
+        freight_years["fob_bogota"] = freight_years["ventas_usd_ventas"] - freight_years["flete_total"]
+        freight_years["fob_bogota_x_tallo"] = freight_years["fob_bogota"] / freight_years["tallos_confirmados"].replace(0, np.nan)
+        freight_details = {
+            int(row.anio): (
+                f"Factura {moneyless_number(row.ventas_usd_ventas, 2)} USD − "
+                f"CIF {moneyless_number(row.flete_cif, 2)} USD − "
+                f"DEL {moneyless_number(row.flete_del, 2)} USD = "
+                f"FOB Bogotá {moneyless_number(row.fob_bogota, 2)} USD | {row.terminos_flete}"
+            )
+            for row in freight_years.itertuples(index=False)
+        }
+        freight_cards.append(
+            make_year_comparison_card(
+                "Precio FOB Bogotá",
+                freight_years,
+                "fob_bogota_x_tallo",
+                lambda value: f"{moneyless_number(value, 4)} USD/tallo",
+                "Precio facturado menos flete CIF y DEL",
+                freight_details,
+            )
+        )
+        if float(freight_years["flete_cif"].sum()) > 0:
+            cif_details = {
+                int(row.anio): f"CIF total {moneyless_number(row.flete_cif, 2)} USD | {moneyless_number(row.tallos_cif)} tallos con CIF"
+                for row in freight_years.itertuples(index=False)
+            }
+            freight_cards.append(
+                make_year_comparison_card("Flete CIF por tallo", freight_years, "cif_x_tallo", lambda value: f"{moneyless_number(value, 4)} USD/tallo", "Componente CIF", cif_details)
+            )
+        if float(freight_years["flete_del"].sum()) > 0:
+            del_details = {
+                int(row.anio): f"DEL total {moneyless_number(row.flete_del, 2)} USD | {moneyless_number(row.tallos_del)} tallos con DEL"
+                for row in freight_years.itertuples(index=False)
+            }
+            freight_cards.append(
+                make_year_comparison_card("Flete DEL por tallo", freight_years, "del_x_tallo", lambda value: f"{moneyless_number(value, 4)} USD/tallo", "Componente DEL", del_details)
+            )
+    has_original_currency = bool(original_price_cards)
+    if not has_original_currency:
+        annual_display = annual_display.drop(columns=["Tasa USD/original"], errors="ignore")
+    conversion_metric_cards = (
+        [make_year_comparison_card(
+            "Tasa de conversión promedio",
+            annual_cards,
+            "tasa_usd_por_moneda",
+            lambda value: f"{moneyless_number(value, 4)} USD/original",
+            "USD por 1 unidad de moneda original",
+        )]
+        if has_original_currency
+        else []
+    )
     executive_metrics = [
-        make_year_comparison_card("Sales USD", annual_cards, "ventas_usd", lambda value: moneyless_number(value, 2), "actual by year"),
-        make_year_comparison_card("Confirmed stems", annual_cards, "tallos_confirmados", lambda value: moneyless_number(value), "same week window"),
-        make_year_comparison_card("Average price", annual_cards, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/stem"),
-        make_year_comparison_card("Orders", annual_cards, "pedidos", lambda value: moneyless_number(value), "unique order numbers"),
-        make_year_comparison_card("Active clients", annual_cards, "clientes_activos", lambda value: moneyless_number(value), "with sales"),
-        make_year_comparison_card("Active products", annual_cards, "productos_activos", lambda value: moneyless_number(value), "with sales"),
-        make_year_comparison_card("Avg. sale/order", annual_cards, "venta_promedio_pedido", lambda value: moneyless_number(value, 2), "USD/order"),
-        make_year_comparison_card("% client stem share", annual_cards, "participacion_cliente_tallos", lambda value: percent(value), "of filtered total stems", share_totals),
-    ]
+        make_year_comparison_card("Ventas", annual_cards, "ventas_usd", lambda value: f"{moneyless_number(value, 2)} USD", "valor real por año"),
+        make_year_comparison_card("Tallos confirmados", annual_cards, "tallos_confirmados", lambda value: f"{moneyless_number(value)} tallos", "misma ventana semanal"),
+        make_year_comparison_card("Cumplimiento", annual_cards, "cumplimiento", lambda value: percent(value), "confirmados / pedidos", fulfillment_totals),
+        make_year_comparison_card("Precio promedio facturado", annual_cards, "precio_usd_tallo", lambda value: f"{moneyless_number(value, 4)} USD/tallo", "ventas facturadas USD / tallos confirmados"),
+        make_year_comparison_card("Pedidos", annual_cards, "pedidos", lambda value: f"{moneyless_number(value)} pedidos", "números de pedido únicos"),
+        make_year_comparison_card("Clientes activos", annual_cards, "clientes_activos", lambda value: f"{moneyless_number(value)} clientes", "con ventas"),
+        make_year_comparison_card("Productos activos", annual_cards, "productos_activos", lambda value: f"{moneyless_number(value)} productos", "con ventas"),
+        make_year_comparison_card("Venta prom./pedido", annual_cards, "venta_promedio_pedido", lambda value: f"{moneyless_number(value, 2)} USD/pedido", "promedio por pedido único"),
+        make_year_comparison_card("% participación en tallos", annual_cards, "participacion_cliente_tallos", lambda value: percent(value), "del total de tallos filtrado", share_totals),
+    ] + conversion_metric_cards + original_price_cards + freight_cards
     metric_compare_table = sales_metric_comparison_display(context)
     active_compare_year = context.get("compare_year") or compare_year or (int(annual["anio"].max()) if not annual.empty else 0)
     active_base_year = context.get("base_year") or base_year or active_compare_year
@@ -8412,13 +8648,28 @@ def render_ventas_generales_tab_v2(
         rows=20,
     )
     product_compare_frame = context["product_compare"] if context.get("ok") else pd.DataFrame()
-    price_product_fig = sales_price_product_figure(product_compare_frame, active_base_year, active_compare_year) if comparison_mode else empty_figure("Average price by product")
-    opportunity_fig = sales_opportunity_matrix_figure(product_compare_frame) if comparison_mode else empty_figure("Opportunity matrix")
+    price_product_fig = sales_price_product_figure(product_compare_frame, active_base_year, active_compare_year) if comparison_mode else empty_figure("Precio promedio por producto")
+    opportunity_fig = sales_opportunity_matrix_figure(product_compare_frame) if comparison_mode else empty_figure("Matriz de oportunidad")
     scope = sales_scope_summary(view, clients, products, countries, companies, colors)
+    selected_scope_clients = selected_values(clients)
+    if selected_scope_clients:
+        negotiation_map = get_client_negotiation_term_map()
+        negotiation_pairs = [
+            (code, negotiation_map.get(str(code).replace(".0", ""), "Sin dato"))
+            for code in selected_scope_clients
+        ]
+        if len(negotiation_pairs) == 1:
+            negotiation_label = negotiation_pairs[0][1]
+        else:
+            negotiation_label = ", ".join(f"{code}: {term}" for code, term in negotiation_pairs[:4])
+            if len(negotiation_pairs) > 4:
+                negotiation_label += f" + {len(negotiation_pairs) - 4} más"
+    else:
+        negotiation_label = "Selecciona un cliente"
     concentration_cards = sales_concentration_cards(view, active_compare_year)
     quality_card = sales_data_quality_summary(view, week_range)
     logo_uri = logo_data_uri()
-    strategic_items = sales_pdf_insights(context, "en") if context.get("ok") else ["There is not enough data to build the executive comparison."]
+    strategic_items = sales_pdf_insights(context, "es") if context.get("ok") else ["No hay datos suficientes para construir la comparación ejecutiva."]
     strategic_cards = [
         html.Div(
             [
@@ -8430,14 +8681,14 @@ def render_ventas_generales_tab_v2(
         for idx, item in enumerate(strategic_items[:4], start=1)
     ]
     selected_clients = selected_values(clients)
-    client_table_title = "Companies ranked by revenue" if not selected_clients else "Selected companies"
-    client_table_note = "Sorted by revenue within the active filter. You can also sort the table manually." if not selected_clients else "Summary of selected companies within the active filter."
+    client_table_title = "Clientes ordenados por facturación" if not selected_clients else "Clientes seleccionados"
+    client_table_note = "Ordenados por facturación dentro del filtro activo. También puedes ordenar la tabla manualmente." if not selected_clients else "Resumen de los clientes seleccionados dentro del filtro activo."
     client_table = client_sales_display(view, rows=30, ascending=False, order_view=order_view)
     product_week_matrix = sales_product_week_matrix_display(view, selected_clients)
     product_week_note = (
-        "Selected client: products in rows and weeks in columns, with confirmed stems."
+        "Cliente seleccionado: productos en filas y semanas en columnas, con tallos confirmados."
         if len(selected_clients) == 1
-        else "Without a single selected client, rows are split by client and product to avoid mixing portfolios."
+        else "Sin un único cliente seleccionado, las filas se separan por cliente y producto para no mezclar portafolios."
     )
     country_growth_table = (
         growth_by_dimension_display(view, active_base_year, active_compare_year, ["pais"], ["pais"], rows=25)
@@ -8483,13 +8734,13 @@ def render_ventas_generales_tab_v2(
                     html.Div(
                         [
                             html.Img(src=logo_uri, className="executive-logo") if logo_uri else html.Div("La Gaitana", className="executive-logo-text"),
-                            html.Div("General sales", className="executive-kicker"),
-                            html.Div("Commercial executive report", className="executive-title"),
+                            html.Div("Ventas generales", className="executive-kicker"),
+                            html.Div("Informe ejecutivo comercial", className="executive-title"),
                             html.Div(
                                 (
-                                    f"Base year {active_base_year} vs comparison year {active_compare_year} | weeks {weeks_text}"
+                                    f"Año base {active_base_year} vs año comparativo {active_compare_year} | semanas {weeks_text}"
                                     if context.get("comparison_mode")
-                                    else f"Selected year {active_compare_year} | weeks {weeks_text}"
+                                    else f"Año seleccionado {active_compare_year} | semanas {weeks_text}"
                                 ),
                                 className="executive-subtitle",
                             ),
@@ -8501,25 +8752,26 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Companies", className="scope-label"), html.Div(scope["companias"], className="scope-value")], className="scope-card scope-card-wide"),
-                    html.Div([html.Div("Clients", className="scope-label"), html.Div(scope["clientes"], className="scope-value")], className="scope-card scope-card-wide"),
-                    html.Div([html.Div("Countries", className="scope-label"), html.Div(scope["paises"], className="scope-value")], className="scope-card scope-card-wide"),
-                    html.Div([html.Div("Products", className="scope-label"), html.Div(scope["productos"], className="scope-value")], className="scope-card scope-card-wide"),
-                    html.Div([html.Div("Visible clients", className="scope-label"), html.Div(scope["clientes_count"], className="scope-number")], className="scope-card"),
+                    html.Div([html.Div("Compañías", className="scope-label"), html.Div(scope["companias"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Clientes", className="scope-label"), html.Div(scope["clientes"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Países", className="scope-label"), html.Div(scope["paises"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Productos", className="scope-label"), html.Div(scope["productos"], className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Término de negociación", className="scope-label"), html.Div(negotiation_label, className="scope-value")], className="scope-card scope-card-wide"),
+                    html.Div([html.Div("Clientes visibles", className="scope-label"), html.Div(scope["clientes_count"], className="scope-number")], className="scope-card"),
                 ],
                 className="scope-strip",
             ),
             html.Div(executive_metrics, className="metrics-grid"),
             html.Div(
                 [
-                    html.Div("What explains growth?", className="panel-title"),
-                    panel_note("Separates the sales change into volume, average price and orders. Zero or low-base percentages are labeled to avoid distorted readings."),
+                    html.Div("¿Qué explica el crecimiento?", className="panel-title"),
+                    panel_note("Separa el cambio en ventas entre volumen, precio promedio y pedidos. Los porcentajes con base cero o muy baja se identifican para evitar lecturas distorsionadas."),
                     html.Div(
                         [
-                            make_card("USD growth", moneyless_number(context.get("consolidated_delta", 0), 2), sales_variation_label(context["base_metrics"].get("ventas_usd", 0), context["compare_metrics"].get("ventas_usd", 0), low_threshold=LOW_USD_BASE_THRESHOLD) if context.get("ok") else "no comparison"),
-                            make_card("Stem growth", moneyless_number(context["compare_metrics"].get("tallos_confirmados", 0) - context["base_metrics"].get("tallos_confirmados", 0), 0) if context.get("ok") else "0", sales_variation_label(context["base_metrics"].get("tallos_confirmados", 0), context["compare_metrics"].get("tallos_confirmados", 0), low_threshold=LOW_STEMS_BASE_THRESHOLD) if context.get("ok") else "no comparison"),
-                            make_card("Price change", moneyless_number(context["compare_metrics"].get("precio_usd_tallo", 0) - context["base_metrics"].get("precio_usd_tallo", 0), 4) if context.get("ok") else "0.0000", sales_variation_label(context["base_metrics"].get("precio_usd_tallo", 0), context["compare_metrics"].get("precio_usd_tallo", 0)) if context.get("ok") else "no comparison"),
-                            make_card("Order change", moneyless_number(context["compare_metrics"].get("pedidos", 0) - context["base_metrics"].get("pedidos", 0), 0) if context.get("ok") else "0", sales_variation_label(context["base_metrics"].get("pedidos", 0), context["compare_metrics"].get("pedidos", 0)) if context.get("ok") else "no comparison"),
+                            make_card("Crecimiento de ventas", f"{moneyless_number(context.get('consolidated_delta', 0), 2)} USD", sales_variation_label(context["base_metrics"].get("ventas_usd", 0), context["compare_metrics"].get("ventas_usd", 0), low_threshold=LOW_USD_BASE_THRESHOLD) if context.get("ok") else "sin comparación"),
+                            make_card("Crecimiento de tallos", f"{moneyless_number(context['compare_metrics'].get('tallos_confirmados', 0) - context['base_metrics'].get('tallos_confirmados', 0), 0) if context.get('ok') else '0'} tallos", sales_variation_label(context["base_metrics"].get("tallos_confirmados", 0), context["compare_metrics"].get("tallos_confirmados", 0), low_threshold=LOW_STEMS_BASE_THRESHOLD) if context.get("ok") else "sin comparación"),
+                            make_card("Cambio de precio", f"{moneyless_number(context['compare_metrics'].get('precio_usd_tallo', 0) - context['base_metrics'].get('precio_usd_tallo', 0), 4) if context.get('ok') else '0.0000'} USD/tallo", sales_variation_label(context["base_metrics"].get("precio_usd_tallo", 0), context["compare_metrics"].get("precio_usd_tallo", 0)) if context.get("ok") else "sin comparación"),
+                            make_card("Cambio de pedidos", f"{moneyless_number(context['compare_metrics'].get('pedidos', 0) - context['base_metrics'].get('pedidos', 0), 0) if context.get('ok') else '0'} pedidos", sales_variation_label(context["base_metrics"].get("pedidos", 0), context["compare_metrics"].get("pedidos", 0)) if context.get("ok") else "sin comparación"),
                         ],
                         className="metrics-grid",
                     ),
@@ -8528,8 +8780,8 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div("Commercial concentration", className="panel-title"),
-                    panel_note("Measures business dependency: how much top clients, products, countries and companies explain."),
+                    html.Div("Concentración comercial", className="panel-title"),
+                    panel_note("Mide la dependencia del negocio: cuánto explican los principales clientes, productos, países y compañías."),
                     html.Div(concentration_cards + [quality_card], className="scope-strip"),
                 ],
                 className="table-panel section-gap",
@@ -8557,21 +8809,27 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Which products explain volume?", className="panel-title"), panel_note("Volume by product; compares years when a visible base exists."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Stems by product"))], className="panel panel-feature"),
-                    html.Div([html.Div("How did weekly volume evolve?", className="panel-title"), panel_note("Weekly confirmed stems to compare level and seasonality across years."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
+                    html.Div([html.Div("¿Qué productos explican el volumen?", className="panel-title"), panel_note("Volumen por producto; compara los años cuando existe una base visible."), dcc.Graph(figure=context["product_bar_fig"] if context.get("ok") else empty_figure("Tallos por producto"))], className="panel panel-feature"),
+                    html.Div([html.Div("¿Cómo evolucionó el volumen semanal?", className="panel-title"), panel_note("Tallos confirmados por semana para comparar nivel y estacionalidad entre años."), dcc.Graph(figure=tallos_fig)], className="panel panel-feature"),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("How did price evolve?", className="panel-title"), panel_note("Weekly weighted average price: USD sales divided by confirmed stems."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
-                    html.Div([html.Div("How did monthly revenue behave?", className="panel-title"), panel_note("Commercial month calculated from year and ISO week within the selected year."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Revenue USD by month"))], className="panel"),
+                    html.Div([html.Div("¿Cómo evolucionó el precio?", className="panel-title"), panel_note("Precio promedio ponderado semanal: ventas USD divididas entre tallos confirmados."), dcc.Graph(figure=precio_fig)], className="panel panel-feature"),
+                    html.Div([html.Div("¿Cómo se comportó la facturación mensual?", className="panel-title"), panel_note("Mes comercial calculado a partir del año y la semana ISO dentro del año seleccionado."), dcc.Graph(figure=context["monthly_fig"] if context.get("ok") else empty_figure("Facturación USD por mes"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
             html.Div(
                 [
-                    html.Div([html.Div("How is the commercial mix composed?", className="panel-title"), panel_note("Dominant product in the selected year and its stem share."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Product mix"))], className="panel"),
+                    html.Div([html.Div("¿Qué porcentaje de tallos se confirmó?", className="panel-title"), panel_note("Cumplimiento dinámico: tallos confirmados divididos entre tallos pedidos para cada semana y filtro activo."), dcc.Graph(figure=cumplimiento_fig)], className="panel"),
+                ],
+                className="section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("¿Cómo se compone el mix comercial?", className="panel-title"), panel_note("Producto dominante en el año seleccionado y su participación en tallos."), dcc.Graph(figure=context["mix_fig"] if context.get("ok") else empty_figure("Mix de productos"))], className="panel"),
                     html.Div(
                         [
                             html.Div("Lectura estratégica", className="panel-title"),
@@ -8585,8 +8843,8 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div([html.Div("Did product price improve?", className="panel-title"), panel_note("Top products by comparison-year sales; compares base vs current USD/stem."), dcc.Graph(figure=price_product_fig)], className="panel"),
-                    html.Div([html.Div("Opportunity matrix", className="panel-title"), panel_note("Quadrants: volume vs price. Avoid reading when the comparable base is too small."), dcc.Graph(figure=opportunity_fig)], className="panel"),
+                    html.Div([html.Div("¿Mejoró el precio por producto?", className="panel-title"), panel_note("Principales productos por ventas del año comparativo; contrasta USD/tallo base frente al actual."), dcc.Graph(figure=price_product_fig)], className="panel"),
+                    html.Div([html.Div("Matriz de oportunidad", className="panel-title"), panel_note("Cuadrantes: volumen frente a precio. Evita interpretarla cuando la base comparable sea demasiado pequeña."), dcc.Graph(figure=opportunity_fig)], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -8625,16 +8883,16 @@ def render_ventas_generales_tab_v2(
                 [
                     html.Div(
                         [
-                            html.Div("New clients", className="panel-title"),
-                            panel_note("Sales in the comparison year with zero base-year sales."),
+                            html.Div("Clientes nuevos", className="panel-title"),
+                            panel_note("Ventas en el año comparativo con ventas iguales a cero en el año base."),
                             make_table(new_clients_table, 10, table_id="ventas-clientes-nuevos"),
                         ],
                         className="table-panel no-top-margin",
                     ),
                     html.Div(
                         [
-                            html.Div("Lost clients", className="panel-title"),
-                            panel_note("Clients with positive base-year sales and zero comparison-year sales."),
+                            html.Div("Clientes perdidos", className="panel-title"),
+                            panel_note("Clientes con ventas positivas en el año base y ventas iguales a cero en el año comparativo."),
                             make_table(lost_clients_table, 10, table_id="ventas-clientes-perdidos"),
                         ],
                         className="table-panel no-top-margin",
@@ -8646,8 +8904,8 @@ def render_ventas_generales_tab_v2(
                 [
                     html.Div(
                         [
-                            html.Div("Growth by country", className="panel-title"),
-                            panel_note("Sorted by comparison-year revenue from highest to lowest. The table can be sorted and filters can be reset."),
+                            html.Div("Crecimiento por país", className="panel-title"),
+                            panel_note("Ordenado de mayor a menor facturación del año comparativo. La tabla permite ordenar y restablecer filtros."),
                             make_table(
                                 country_growth_table,
                                 12,
@@ -8659,8 +8917,8 @@ def render_ventas_generales_tab_v2(
                     ),
                     html.Div(
                         [
-                            html.Div("Growth by company", className="panel-title"),
-                            panel_note("Sorted by comparison-year revenue from highest to lowest. The table can be sorted and filters can be reset."),
+                            html.Div("Crecimiento por compañía", className="panel-title"),
+                            panel_note("Ordenado de mayor a menor facturación del año comparativo. La tabla permite ordenar y restablecer filtros."),
                             make_table(
                                 company_growth_table,
                                 12,
@@ -8677,8 +8935,8 @@ def render_ventas_generales_tab_v2(
                 [
                     html.Div(
                         [
-                            html.Div("Growth by client", className="panel-title"),
-                            panel_note("Clients sorted by comparison-year revenue from highest to lowest."),
+                            html.Div("Crecimiento por cliente", className="panel-title"),
+                            panel_note("Clientes ordenados de mayor a menor facturación del año comparativo."),
                             make_table(
                                 client_growth_table,
                                 12,
@@ -8690,16 +8948,16 @@ def render_ventas_generales_tab_v2(
                     ),
                     html.Div(
                         [
-                            html.Div("General comparison", className="panel-title"),
-                            panel_note("Actual values for the selected years, absolute difference and percentage variation."),
+                            html.Div("Comparación general", className="panel-title"),
+                            panel_note("Valores reales de los años seleccionados, diferencia absoluta y variación porcentual."),
                             make_table(metric_compare_table, 8, table_id="ventas-comparativo-general"),
                         ],
                         className="table-panel no-top-margin",
                     ),
                     html.Div(
                         [
-                            html.Div("Product comparison", className="panel-title"),
-                            panel_note("Products sorted by comparison-year USD. Includes sales, stems, differences and share."),
+                            html.Div("Comparación por producto", className="panel-title"),
+                            panel_note("Productos ordenados por USD del año comparativo. Incluye ventas, tallos, diferencias y participación."),
                             make_table(
                                 product_compare_table,
                                 12,
@@ -8722,11 +8980,19 @@ def render_ventas_generales_tab_v2(
             ),
             html.Div(
                 [
-                    html.Div("Confirmed stems by product and week", className="panel-title"),
+                    html.Div("Tallos confirmados por producto y semana", className="panel-title"),
                     panel_note(product_week_note),
                     make_table(product_week_matrix, 15, sort_by=[{"column_id": "Total", "direction": "desc"}], table_id="ventas-producto-semana-matriz"),
                 ],
                 className="table-panel section-gap",
+            ),
+            html.Div(
+                [
+                    html.Div("Evolución histórica de las tasas de conversión", className="panel-title"),
+                    panel_note("Gráfica temporal para los años seleccionados, independiente de los demás filtros comerciales. Series: Arabella = EUR, Global = GBP y Gaitana = USD; en Gaitana, una tasa distinta de 1 se interpreta como EUR."),
+                    dcc.Graph(figure=tasa_conversion_fig),
+                ],
+                className="panel section-gap",
             ),
         ],
         className="sales-executive-panel",
@@ -8734,12 +9000,12 @@ def render_ventas_generales_tab_v2(
 
     weekly_panel = html.Div(
         [
-            html.Div("Complementary annual summary", className="panel-title"),
-            panel_note("Totals for the selected weekly period; price is not a simple average, it is weighted by stems."),
+            html.Div("Resumen anual complementario", className="panel-title"),
+            panel_note("Totales del período semanal seleccionado; el precio no es un promedio simple, está ponderado por tallos."),
             html.Div(
                 [
-                    html.Div([html.Div("Summary by year", className="panel-title"), make_table(annual_display, 8)], className="table-panel no-top-margin"),
-                    html.Div([html.Div("Actual consolidated", className="panel-title"), panel_note("Actual selected-year result and comparison when a visible base exists. Annualized projections are not included."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Actual consolidated USD"))], className="panel"),
+                    html.Div([html.Div("Resumen por año", className="panel-title"), make_table(annual_display, 8)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Consolidado real", className="panel-title"), panel_note("Resultado real del año seleccionado y comparación cuando existe una base visible. No incluye proyecciones anualizadas."), dcc.Graph(figure=context["consolidated_fig"] if context.get("ok") else empty_figure("Consolidado real USD"))], className="panel"),
                 ],
                 className="grid-2 section-gap",
             ),
@@ -8773,7 +9039,7 @@ def render_visualizador_clientes_general(
     selected_codes = selected_values(selected_code)
     if not selected_codes:
         return html.Div(
-            "Select one or more clients to load the detailed viewer.",
+            "Selecciona uno o más clientes para cargar el visualizador detallado.",
             className="table-panel",
         )
 
@@ -8783,7 +9049,7 @@ def render_visualizador_clientes_general(
         visual_tipo_filter, product_filter, color_filter, sku_filter
     )
     if view.empty:
-        return html.Div("There is no commercial history for the selected filters.", className="table-panel")
+        return html.Div("No hay historial comercial para los filtros seleccionados.", className="table-panel")
     universe_view = filter_visual_operational_base(
         data, filtered, None, visual_sales_years, visual_week_range,
         visual_tipo_filter, product_filter, color_filter, sku_filter
@@ -8828,35 +9094,35 @@ def render_visualizador_clientes_general(
             ).fillna(0)
     compare_year_cards = annual["anio"].nunique() > 1 if not annual.empty else False
     if compare_year_cards:
-        reading += " The following cards split each year and show the change versus the previous selected year."
+        reading += " Las siguientes tarjetas separan cada año y muestran el cambio frente al año seleccionado anterior."
         share_totals = {
             int(row.anio): f"total {moneyless_number(row.tallos_universo)} tallos"
             for row in annual.itertuples(index=False)
             if hasattr(row, "tallos_universo")
         }
         metric_cards = [
-            make_year_comparison_card("Confirmed stems", annual, "tallos_confirmados", lambda value: moneyless_number(value), "same weekly window"),
-            make_year_comparison_card("Sales USD", annual, "ventas_usd", lambda value: moneyless_number(value, 2), "confirmed sales"),
-            make_year_comparison_card("Average price", annual, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/stem"),
-            make_year_comparison_card("Orders", annual, "pedidos", lambda value: moneyless_number(value), "unique orders"),
-            make_year_comparison_card("Active SKUs", annual, "skus_activos", lambda value: moneyless_number(value), "operational SKU"),
-            make_year_comparison_card("% stem share", annual, "participacion_tallos", lambda value: percent(value), "of filtered total stems", share_totals),
-            make_year_comparison_card("Boxes", annual, "cajas", lambda value: moneyless_number(value), "box IDs"),
+            make_year_comparison_card("Tallos confirmados", annual, "tallos_confirmados", lambda value: moneyless_number(value), "misma ventana semanal"),
+            make_year_comparison_card("Ventas USD", annual, "ventas_usd", lambda value: moneyless_number(value, 2), "ventas confirmadas"),
+            make_year_comparison_card("Precio promedio", annual, "precio_usd_tallo", lambda value: moneyless_number(value, 4), "USD/tallo"),
+            make_year_comparison_card("Pedidos", annual, "pedidos", lambda value: moneyless_number(value), "pedidos únicos"),
+            make_year_comparison_card("SKU activos", annual, "skus_activos", lambda value: moneyless_number(value), "SKU operativo"),
+            make_year_comparison_card("% participación en tallos", annual, "participacion_tallos", lambda value: percent(value), "del total de tallos filtrado", share_totals),
+            make_year_comparison_card("Cajas", annual, "cajas", lambda value: moneyless_number(value), "identificadores de caja"),
         ]
         if volume_metric == "tallos_pedidos":
             metric_cards.append(
-                make_year_comparison_card("% fulfillment", annual, "cumplimiento", lambda value: percent(value), "confirmed vs requested")
+                make_year_comparison_card("% cumplimiento", annual, "cumplimiento", lambda value: percent(value), "confirmados vs pedidos")
             )
     else:
         metric_cards = [
-            make_card("Confirmed stems", moneyless_number(total_stems), "main metric"),
-            make_card("Sales USD", moneyless_number(total_usd, 2), f"{moneyless_number(usd_price, 4)} USD/stem"),
-            make_card("Average price", moneyless_number(usd_price, 4), "USD/stem"),
-            make_card("Orders", moneyless_number(pedidos), "unique orders"),
-            make_card("Active SKUs", moneyless_number(sku_count), "operational SKU"),
-            make_card("% stem share", percent(stems_share), f"total {moneyless_number(universe_total_stems)} stems"),
-            make_card("Boxes", moneyless_number(cajas), "box IDs"),
-            make_card("% fulfillment", percent(fulfillment), "confirmed vs requested") if volume_metric == "tallos_pedidos" else html.Div(),
+            make_card("Tallos confirmados", moneyless_number(total_stems), "métrica principal"),
+            make_card("Ventas USD", moneyless_number(total_usd, 2), f"{moneyless_number(usd_price, 4)} USD/tallo"),
+            make_card("Precio promedio", moneyless_number(usd_price, 4), "USD/tallo"),
+            make_card("Pedidos", moneyless_number(pedidos), "pedidos únicos"),
+            make_card("SKU activos", moneyless_number(sku_count), "SKU operativo"),
+            make_card("% participación en tallos", percent(stems_share), f"total {moneyless_number(universe_total_stems)} tallos"),
+            make_card("Cajas", moneyless_number(cajas), "identificadores de caja"),
+            make_card("% cumplimiento", percent(fulfillment), "confirmados vs pedidos") if volume_metric == "tallos_pedidos" else html.Div(),
         ]
 
     week_fig = visual_week_figure(trend_view, volume_metric or "tallos_confirmados", show_last_year)
@@ -8870,9 +9136,9 @@ def render_visualizador_clientes_general(
         color_discrete_map=color_map_for(sku_table, "tipo_pedido_operativo"),
         orientation="h",
         hover_data=["sku_operativo_general", "sku_operativo_detalle", "producto_familia", "capuchon", "comida", "empaque", "participacion", "ventas_usd", "precio_usd_tallo", "pedidos", "cajas"],
-        title="Operational SKU ranking",
+        title="Ranking de SKU operativos",
     )
-    sku_fig.update_layout(yaxis={"categoryorder": "total ascending"}, xaxis_title="Confirmed stems", yaxis_title="Operational SKU")
+    sku_fig.update_layout(yaxis={"categoryorder": "total ascending"}, xaxis_title="Tallos confirmados", yaxis_title="SKU operativo")
     apply_common_layout(sku_fig, 520)
 
     composition = visual_color_composition(view, sku_table, sku_filter, color_view or "period_total", analysis_week, internal_detail or "color")
@@ -8889,7 +9155,7 @@ def render_visualizador_clientes_general(
             hover_data=["sku_operativo", "tallos_confirmados", "ventas_usd", "precio_usd_tallo"],
             title=composition_title,
         )
-        comp_fig.update_layout(xaxis_title="Internal color", yaxis_title="Share", showlegend=False)
+        comp_fig.update_layout(xaxis_title="Detalle interno", yaxis_title="Participación", showlegend=False)
         apply_common_layout(comp_fig, 420)
 
     tipo_mix = summarize_visual_operational(view, ["tipo_pedido_operativo"]).sort_values("tallos_confirmados", ascending=False)
@@ -8903,13 +9169,13 @@ def render_visualizador_clientes_general(
             color="tipo_pedido_operativo",
             color_discrete_map=color_map_for(tipo_mix, "tipo_pedido_operativo"),
             hover_data=["participacion", "ventas_usd", "pedidos"],
-            title="Mix by operational type",
+            title="Mix por tipo operativo",
             hole=0.35,
         )
         apply_pie_label_style(tipo_fig)
         apply_common_layout(tipo_fig, 420)
     else:
-        tipo_fig = empty_figure("Mix by operational type")
+        tipo_fig = empty_figure("Mix por tipo operativo")
 
     recent_history = visual_recent_history(view, analysis_week, top_n, sku_view_mode="detalle" if str(internal_detail).lower() == "variedad" else "general")
     client_table = summarize_visual_operational(view, ["cod_cliente", "cliente"]).sort_values(["tallos_confirmados", "ventas_usd"], ascending=False).head(max(top_n, 15))
@@ -8918,22 +9184,22 @@ def render_visualizador_clientes_general(
 
     tipo_selected = set(normalize_operational_type(pd.Series(visual_tipo_filter or [])).tolist())
     if tipo_selected == {"SOLIDO"}:
-        view_note = "Solids view: color is part of the operational SKU identity."
+        view_note = "Vista de sólidos: el color forma parte de la identidad del SKU operativo."
     elif tipo_selected and "SOLIDO" not in tipo_selected:
-        view_note = "Structures view: the ranking prioritizes the actual order type; color remains internal composition."
+        view_note = "Vista de estructuras: el ranking prioriza el tipo de pedido real; el color se conserva como composición interna."
     else:
-        view_note = "All-types view: SOLIDO is read as product/color SKU; other types keep their order structure."
+        view_note = "Vista de todos los tipos: SÓLIDO se interpreta como SKU de producto/color; los demás tipos conservan la estructura del pedido."
     internal_note = {
-        "color": "Internal detail by color.",
-        "color_variedad": "Internal detail by color and variety.",
-        "variedad": "Internal detail by variety.",
-    }.get(str(internal_detail), "Internal detail by color.")
+        "color": "Detalle interno por color.",
+        "color_variedad": "Detalle interno por color y variedad.",
+        "variedad": "Detalle interno por variedad.",
+    }.get(str(internal_detail), "Detalle interno por color.")
 
     return html.Div(
         [
             html.Div(
                 [
-                    html.Div("Operational sales reading", className="panel-title"),
+                    html.Div("Lectura de ventas operativas", className="panel-title"),
                     html.Div([html.Div(reading), html.Div(view_note, className="metric-detail"), html.Div(internal_note, className="metric-detail")], className="reading-text"),
                 ],
                 className="reading-panel",
@@ -8947,16 +9213,16 @@ def render_visualizador_clientes_general(
             html.Div([html.Div(dcc.Graph(figure=tipo_fig), className="panel")], className="section-gap"),
             html.Div(
                 [
-                    html.Div([html.Div("Operational SKU ranking", className="panel-title"), make_table(format_operational_display(sku_table), 12)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Ranking de SKU operativos", className="panel-title"), make_table(format_operational_display(sku_table), 12)], className="table-panel no-top-margin"),
                     html.Div([html.Div(composition_title, className="panel-title"), panel_note(composition_note), make_table(format_operational_display(composition), 12)], className="table-panel no-top-margin"),
                 ],
                 className="grid-2 section-gap",
             ),
-            html.Div([html.Div("Recent history by SKU", className="panel-title"), make_table(format_operational_display(recent_history), 14)], className="table-panel"),
+            html.Div([html.Div("Historial reciente por SKU", className="panel-title"), make_table(format_operational_display(recent_history), 14)], className="table-panel"),
             html.Div(
                 [
-                    html.Div([html.Div("Client detail", className="panel-title"), make_table(format_operational_display(client_table), 10)], className="table-panel no-top-margin"),
-                    html.Div([html.Div("Week / SKU / internal color detail", className="panel-title"), make_table(format_operational_display(week_detail), 10)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Detalle por cliente", className="panel-title"), make_table(format_operational_display(client_table), 10)], className="table-panel no-top-margin"),
+                    html.Div([html.Div("Detalle por semana / SKU / color interno", className="panel-title"), make_table(format_operational_display(week_detail), 10)], className="table-panel no-top-margin"),
                 ],
                 className="grid-2 section-gap",
             ),
