@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.lgf_operativo.cleaning import reconcile_tipo_pedido_operativo
+
 
 DEFAULT_INPUT = Path("resultados") / "descriptivos" / "historico_visualizador_comercial.csv"
 DEFAULT_OUTPUT = Path("resultados") / "dashboard_operativo.sqlite"
@@ -79,7 +81,7 @@ def load_company_map(path: Path) -> dict[str, str]:
 
 
 def prepare_chunk(chunk: pd.DataFrame, company_map: dict[str, str] | None = None) -> pd.DataFrame:
-    out = chunk.copy()
+    out = reconcile_tipo_pedido_operativo(chunk)
     out["cod_cliente"] = normalize_code(out["cod_cliente"])
     for col in [
         "NomCompania", "pais", "variedad", "tipo_caja", "tallos_x_ramo", "capuchon", "comida",

@@ -40,6 +40,7 @@ from dash import dcc
 from dash import html
 
 from fletes_dashboard import get_client_negotiation_term_map, get_fletes_filter_options, get_sales_freight_summary, render_fletes_tab
+from src.lgf_operativo.cleaning import reconcile_tipo_pedido_operativo
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -545,7 +546,7 @@ def read_dashboard_sql_view(db_path: Path, view_name: str) -> pd.DataFrame:
         return pd.DataFrame()
     with sqlite3.connect(db_path) as con:
         try:
-            return pd.read_sql_query(f"SELECT * FROM {view_name}", con)
+            return reconcile_tipo_pedido_operativo(pd.read_sql_query(f"SELECT * FROM {view_name}", con))
         except Exception:
             return pd.DataFrame()
 
@@ -595,7 +596,8 @@ def read_op_sales_sql_table(table_name: str, params: list | None = None, where: 
         from src.lgf_operativo.op_sales_sql import get_connection
 
         with get_connection() as con:
-            return pd.read_sql_query(f"SELECT * FROM {table_name}{where}", con, params=params or [])
+            frame = pd.read_sql_query(f"SELECT * FROM {table_name}{where}", con, params=params or [])
+            return reconcile_tipo_pedido_operativo(frame)
     except Exception as exc:
         print(f"ERROR leyendo {table_name} desde SQL Server: {exc}", file=sys.stderr, flush=True)
         return pd.DataFrame()
@@ -623,7 +625,7 @@ def read_result_or_csv(
         for col in parse_dates:
             if col in frame.columns:
                 frame[col] = pd.to_datetime(frame[col], errors="coerce")
-    return frame
+    return reconcile_tipo_pedido_operativo(frame)
 
 
 def read_client_sku_week_from_sql(client_code: str | None) -> pd.DataFrame:
@@ -6231,7 +6233,17 @@ def filter_general_sales_frame(
 def original_sales_type_label(frame: pd.DataFrame) -> pd.Series:
     if frame.empty:
         return pd.Series(dtype=object)
-    candidates = ["tipo_pedido_original", "tipo_orden_empaque", "tipo_empaque", "bulkbouquet", "codempaque", "tipo_pedido_raw", "tipo_pedido_operativo"]
+    candidates = [
+        "tipo_pedido_original",
+        "tipo_orden_empaque",
+        "tipo_empaque",
+        "bulkbouquet",
+        "codempaque",
+        "empaque",
+        "receta",
+        "tipo_pedido_raw",
+        "tipo_pedido_operativo",
+    ]
     out = pd.Series("sin_info", index=frame.index, dtype="object")
     blank = {"", "sin_info", "nan", "none", "0", "0.0"}
     for col in candidates:

@@ -348,14 +348,16 @@ def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
     tipo[is_solido_variedad] = "SOLIDO"
     subtipo[is_solido_variedad] = "solido_por_variedad"
 
-    tipo[is_bouquet] = "BOUQUET"
-    subtipo[is_bouquet] = "bouquet"
-
     tipo[is_surtido] = "SURTIDO"
     subtipo[is_surtido] = "surtido_general"
 
     tipo[is_surtido_m] = "SURTIDO_M"
     subtipo[is_surtido_m] = "surtido_m"
+
+    # A named finished format is more specific than generic composition words.
+    # For example, "bouquet unico mixed" is a BOUQUET, not a SURTIDO.
+    tipo[is_bouquet] = "BOUQUET"
+    subtipo[is_bouquet] = "bouquet"
 
     tipo[is_bqt] = "BQT"
     subtipo[is_bqt] = "bqt"
@@ -374,7 +376,10 @@ def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
         origen_tipologia[from_reference] = "referencia_historica_no_ambigua"
 
     # Current explicit special-format labels are stronger than a historical
-    # fallback: these named recipes must always be treated as mixed structures.
+    # fallback: these named recipes must always retain their real source name.
+    tipo[is_bouquet] = "BOUQUET"
+    subtipo[is_bouquet] = "bouquet"
+    origen_tipologia[is_bouquet] = "marca_explicita_fuente"
     tipo[is_rainbow] = "RAINBOW"
     subtipo[is_rainbow] = "rainbow"
     origen_tipologia[is_rainbow] = "marca_explicita_fuente"
@@ -427,6 +432,49 @@ def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
         "es_pedido_no_solido": ~tipo.eq("SOLIDO"),
         "es_rainbow": tipo.eq("RAINBOW"),
     })
+
+
+def reconcile_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
+    """Correct stale operational labels using the original descriptive fields.
+
+    Result tables and dashboard caches can outlive a classifier change. This
+    keeps their visible type aligned with the source wording whenever the frame
+    still contains enough original packaging/recipe detail to classify it.
+    """
+    if df.empty or "tipo_pedido_operativo" not in df.columns:
+        return df
+    descriptor_cols = [
+        "tipo_orden_empaque",
+        "tipo_empaque",
+        "empaque",
+        "receta",
+        "bulkbouquet",
+        "codempaque",
+        "caja_id",
+    ]
+    available = [col for col in descriptor_cols if col in df.columns]
+    if not available:
+        return df
+
+    classified = classify_tipo_pedido_operativo(df)
+    has_source_detail = pd.Series(False, index=df.index)
+    blank = {"", "sin_info", "nan", "none", "0", "0.0"}
+    for col in available:
+        values = df[col].fillna("").astype(str).str.strip().str.lower()
+        has_source_detail |= ~values.isin(blank)
+    usable = has_source_detail & classified["tipo_pedido_operativo"].ne("OTRO_NO_CLASIFICADO")
+    if not usable.any():
+        return df
+
+    out = df.copy()
+    out.loc[usable, "tipo_pedido_operativo"] = classified.loc[usable, "tipo_pedido_operativo"]
+    if "subtipo_pedido_operativo" in out.columns:
+        out.loc[usable, "subtipo_pedido_operativo"] = classified.loc[usable, "subtipo_pedido_operativo"]
+    for col in ["es_pedido_solido", "es_pedido_no_solido", "es_rainbow"]:
+        if col in out.columns:
+            out.loc[usable, col] = classified.loc[usable, col]
+    return out
+
 
 def add_client_identifiers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()

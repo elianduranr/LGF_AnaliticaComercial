@@ -339,7 +339,15 @@ def build_sales_visualizer_tables(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             work[col] = "sin_info"
 
     def original_type_label(row: pd.Series) -> str:
-        for col in ["tipo_orden_empaque", "tipo_empaque", "bulkbouquet", "codempaque", "tipo_pedido_raw"]:
+        for col in [
+            "tipo_orden_empaque",
+            "tipo_empaque",
+            "bulkbouquet",
+            "codempaque",
+            "empaque",
+            "receta",
+            "tipo_pedido_raw",
+        ]:
             text = str(row.get(col, "")).strip()
             if text and text.lower() not in {"sin_info", "nan", "none", "0", "0.0"}:
                 return text
