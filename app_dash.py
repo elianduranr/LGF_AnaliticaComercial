@@ -982,10 +982,12 @@ def admin_run_command(command: list[str], job_id: str | None = None, timeout_sec
     env = os.environ.copy()
     env.update(load_local_credentials())
     env["OP_SALES_USE_SQL_SERVER"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    project_root = Path(__file__).resolve().parent
     started = time.monotonic()
     process = subprocess.Popen(
         command,
-        cwd=Path.cwd(),
+        cwd=project_root,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -1884,10 +1886,10 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 {"label": country, "value": country}
                 for country in sorted(ventas_source["pais"].dropna().astype(str).unique())
             ]
-        sales_type_col = "tipo_pedido_operativo"
+        sales_type_col = "tipo_pedido_original" if "tipo_pedido_original" in ventas_source.columns else "tipo_pedido_operativo"
         if sales_type_col in ventas_source.columns:
             general_sales_type_options = [
-                {"label": operational_type_label(tipo), "value": tipo}
+                {"label": tipo, "value": tipo}
                 for tipo in sorted(ventas_source[sales_type_col].dropna().astype(str).unique())
                 if tipo.strip()
             ]
@@ -2994,16 +2996,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if selected_colors and "color" in scope.columns:
             scope = scope[scope["color"].astype(str).isin(set(selected_colors))].copy()
 
-        type_col = "tipo_pedido_operativo"
+        type_col = "tipo_pedido_original" if "tipo_pedido_original" in scope.columns else "tipo_pedido_operativo"
         type_options, type_values = tallos_options_from_frame(scope, type_col)
-        type_options = [
-            {
-                **option,
-                "label": operational_type_label(option["value"])
-                + (" | " + option["label"].split(" | ", 1)[1] if " | " in option["label"] else ""),
-            }
-            for option in type_options
-        ]
         selected_types = [value for value in selected_types if value in set(type_values)]
 
         return (
@@ -3137,7 +3131,7 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if tab != "visualizador_clientes_general" or sales.empty or "tipo_pedido_operativo" not in sales.columns:
             return [], []
         tipos = sorted(sales["tipo_pedido_operativo"].dropna().astype(str).unique())
-        options = [{"label": operational_type_label(tipo), "value": tipo} for tipo in tipos]
+        options = [{"label": tipo, "value": tipo} for tipo in tipos]
         valid = set(tipos)
         value = [tipo for tipo in (current_value or []) if tipo in valid]
         return options, value
@@ -5429,11 +5423,6 @@ def selected_values(value) -> list[str]:
     return [text] if text else []
 
 
-def operational_type_label(value: object) -> str:
-    """Present the canonical order type without exposing storage separators."""
-    return str(value).strip().upper().replace("_", " ")
-
-
 def selected_label(value, default: str = "todos") -> str:
     values = selected_values(value)
     if not values:
@@ -6223,7 +6212,7 @@ def filter_general_sales_frame(
     if selected_colors and "color" in out.columns:
         out = out[out["color"].astype(str).isin(selected_colors)].copy()
     selected_types = selected_values(order_types)
-    type_col = "tipo_pedido_operativo"
+    type_col = "tipo_pedido_original" if "tipo_pedido_original" in out.columns else "tipo_pedido_operativo"
     if selected_types and type_col in out.columns:
         out = out[out[type_col].astype(str).isin(selected_types)].copy()
     if "anio_semana" in out.columns and "week_start" not in out.columns and "semana_iso" in out.columns:

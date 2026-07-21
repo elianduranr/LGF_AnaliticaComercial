@@ -104,7 +104,11 @@ def ejecutar_reporte_ventas(fecha1, fecha2):
 
 def cargar_divisas(primer_dia, ultimo_dia, anio):
     # Un anio ISO puede comenzar o terminar en el anio calendario vecino.
-    tipos_dato = [f"Real_{year}" for year in range(primer_dia.year, ultimo_dia.year + 1)]
+    # Se consulta un margen anterior para poder usar la ultima tasa publicada en
+    # fines de semana y festivos. Las ventas son diarias, pero LGF_Divisas no
+    # necesariamente contiene una fila para cada fecha calendario.
+    fecha_consulta_inicial = primer_dia - timedelta(days=31)
+    tipos_dato = [f"Real_{year}" for year in range(fecha_consulta_inicial.year, ultimo_dia.year + 1)]
     placeholders = ", ".join(["?"] * len(tipos_dato))
     query = f"""
     SELECT Fecha_dt, EUR_USD, GBP_USD
@@ -119,9 +123,9 @@ def cargar_divisas(primer_dia, ultimo_dia, anio):
     ORDER BY Fecha_dt;
     """
     with pyodbc.connect(conn_str_gaitana()) as conn:
-        df_divisas = pd.read_sql(query, conn, params=tipos_dato + [primer_dia, ultimo_dia])
+        df_divisas = pd.read_sql(query, conn, params=tipos_dato + [fecha_consulta_inicial, ultimo_dia])
     if df_divisas.empty:
-        raise ValueError(f"No se encontraron divisas para {tipos_dato} entre {primer_dia} y {ultimo_dia}.")
+        raise ValueError(f"No se encontraron divisas para {tipos_dato} entre {fecha_consulta_inicial} y {ultimo_dia}.")
     df_divisas["Fecha_dt"] = pd.to_datetime(df_divisas["Fecha_dt"])
     df_divisas[["EUR_USD", "GBP_USD"]] = df_divisas[["EUR_USD", "GBP_USD"]].astype(float)
     tasas_distintas = df_divisas.groupby("Fecha_dt")[["EUR_USD", "GBP_USD"]].nunique(dropna=False)
@@ -132,6 +136,13 @@ def cargar_divisas(primer_dia, ultimo_dia, anio):
     if duplicados:
         print(f"Divisas duplicadas identicas eliminadas para {tipos_dato}: {duplicados:,}")
     df_divisas = df_divisas.drop_duplicates(subset=["Fecha_dt"]).set_index("Fecha_dt").sort_index()
+    calendario = pd.date_range(primer_dia, ultimo_dia, freq="D")
+    df_divisas = df_divisas.reindex(df_divisas.index.union(calendario)).sort_index().ffill().reindex(calendario)
+    if df_divisas[["EUR_USD", "GBP_USD"]].isna().any().any():
+        raise ValueError(
+            f"No hay una tasa de divisas anterior disponible para completar el rango {primer_dia} a {ultimo_dia}."
+        )
+    df_divisas.index.name = "Fecha_dt"
     df_divisas["USD/EUR"] = 1 / df_divisas["EUR_USD"]
     df_divisas["USD/GBP"] = 1 / df_divisas["GBP_USD"]
     tasas = df_divisas[["USD/EUR", "USD/GBP"]].reset_index().rename(columns={"Fecha_dt": "FECHA"})

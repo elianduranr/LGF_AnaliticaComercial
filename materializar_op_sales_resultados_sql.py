@@ -1,4 +1,4 @@
-"""Materializa agregados y resultados del Dash en SQL Server op_sales.
+r"""Materializa agregados y resultados del Dash en SQL Server op_sales.
 
 Uso:
     .\carac_clients\Scripts\python.exe materializar_op_sales_resultados_sql.py
@@ -139,6 +139,19 @@ def aggregate_tables_exist(conn) -> bool:
         """
     ).fetchone()
     return bool(row and int(row[0]) == 2)
+
+
+def ensure_aggregate_schema(conn) -> None:
+    """Apply additive aggregate migrations before an incremental refresh."""
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        IF COL_LENGTH('op_sales.agg_sales_week_client_product', 'tipo_pedido_original') IS NULL
+            ALTER TABLE op_sales.agg_sales_week_client_product
+            ADD tipo_pedido_original NVARCHAR(250) NULL;
+        """
+    )
+    conn.commit()
 
 
 def create_aggregate_indexes(conn) -> None:
@@ -357,6 +370,7 @@ def materialize_aggregates_incremental(conn, start_date: str, end_date: str) -> 
         print("No existen ambos agregados; se crean solo con las semanas afectadas.", flush=True)
         materialize_aggregates_full(conn, scoped_to_affected_weeks=True)
         return
+    ensure_aggregate_schema(conn)
 
     print("Borrando semanas afectadas en op_sales.agg_sales_week_client_product", flush=True)
     cursor.execute(
