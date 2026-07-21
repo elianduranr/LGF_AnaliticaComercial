@@ -39,7 +39,7 @@ La clave operativa base para solidos debe agrupar por `producto + color`; la var
 
 ### No solidos
 
-En `SURTIDO_M`, `RAINBOW`, `BOUQUET`, `COMBO`, `ASSORTED` y formatos similares, el SKU visible debe representar la estructura del pedido. Cualquier `SURTIDO` legacy se trata como `SURTIDO_M`.
+En `SURTIDO "M"`, `RAINBOW`, `BOUQUET`, `COMBO` y `BQT`, el SKU visible representa la estructura del pedido. El tipo proviene exclusivamente de `TIPEMPAQUE`.
 
 El color no define el SKU. El color es composicion interna.
 

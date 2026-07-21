@@ -99,7 +99,7 @@ def cross_forecast_inventory(forecast: pd.DataFrame, inv: pd.DataFrame) -> pd.Da
     pais = out["pais"].fillna("").astype(str).str.upper() if "pais" in out.columns else pd.Series("", index=out.index)
     is_usa = pais.str.contains(r"\bUSA\b|UNITED STATES|ESTADOS UNIDOS|EEUU", regex=True, na=False)
     tipo = out["tipo_pedido_operativo"].fillna("").astype(str).str.upper() if "tipo_pedido_operativo" in out.columns else pd.Series("", index=out.index)
-    is_easy_buy = tipo.isin(["SOLIDO", "SURTIDO", "SURTIDO_M"])
+    is_easy_buy = tipo.isin(["SOLIDO", 'SURTIDO "M"'])
     is_rainbow = tipo.eq("RAINBOW")
     score = out["score_compra_terminada"].fillna(0)
 

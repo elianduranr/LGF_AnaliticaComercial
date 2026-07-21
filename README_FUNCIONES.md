@@ -9,11 +9,10 @@ Este documento identifica los componentes del flujo activo. Los archivos de inve
 | Funcion | Descripcion | Entradas | Salidas | Donde se usa |
 |---|---|---|---|---|
 | `clean_historical_orders()` | Normaliza columnas crudas, fechas, tallos, estados, tipo de pedido y llaves/SKUs operativos. | DataFrame crudo del acumulado historico. | DataFrame limpio de ordenes. | Descriptivos y forecast. |
-| `build_tipo_pedido_reference()` / `attach_tipo_pedido_reference()` | Respaldo de contingencia para recuperar tipos no ambiguos solo si llega un extracto incompleto sin campos originales de receta. | Historico enriquecido anterior / referencia materializada. | Clasificacion restaurada y origen auditable. | Uso manual opcional en descriptivos y forecast. |
 | `split_orders_by_estado()` | Separa confirmado, pendiente, en proceso y cambios. | Ordenes limpias. | Diccionario de DataFrames por estado. | Descriptivos. |
-| `classify_tipo_pedido_operativo()` | Clasifica `SOLIDO`, `SURTIDO`, `SURTIDO_M`, `RAINBOW`, `BOUQUET`, `BQT`, `COMBO`, `BULK`, etc.; formatos especiales explicitos prevalecen sobre marcas genericas de solido y se leen como estructuras mixtas. | Lineas normalizadas. | Variables de tipo operativo y fuente de clasificacion. | Todos los analisis operativos. |
+| `classify_tipo_pedido_operativo()` | Toma exclusivamente `TIPEMPAQUE`; consolida las dos variantes solidas como `SOLIDO` y conserva los demas nombres del sistema. No usa empaque, receta, caja ni referencias historicas para inferir el tipo. | Lineas normalizadas. | Tipo operativo y valor fuente auditable. | Todos los analisis operativos. |
 
-**Regla de entrada:** la fuente cruda canonica es `bases de datos historicas/historic_sales_acum.csv` con campos originales de receta y estructura. La clasificacion normal se hace directamente desde esa fuente y no requiere un ejecutor adicional de referencia tipologica.
+**Regla de entrada:** `TIPEMPAQUE` es la unica autoridad del tipo operativo. Los campos de receta y estructura se conservan para analisis de composicion, pero no intervienen en esa clasificacion.
 
 ## Generacion De Descriptivos
 

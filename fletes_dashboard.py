@@ -272,38 +272,13 @@ def _freight_type_columns(con, schema: str, table: str) -> dict[str, str]:
 
 
 def _normalize_freight_order_type(frame: pd.DataFrame) -> pd.Series:
+    """Return the type recorded in TIPEMPAQUE without cross-field inference."""
     if frame.empty:
         return pd.Series(dtype="object")
-    direct = frame.get("tipo_pedido_operativo_raw", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
-    direct_upper = _ascii_upper_text(direct)
-    usable_direct = ~direct_upper.isin({"", "NAN", "NONE", "SIN DATO", "SIN_DATO"})
-    text = pd.Series("", index=frame.index, dtype="object")
-    for col in [
-        "tipo_orden_empaque_raw",
-        "tipo_empaque_raw",
-        "empaque_raw",
-        "receta_raw",
-        "bulkbouquet_raw",
-        "codempaque_raw",
-    ]:
-        if col in frame.columns:
-            text = text.str.cat(frame[col].fillna("").astype(str), sep=" ")
-    raw = _ascii_upper_text(text)
-    out = pd.Series("Sin dato", index=frame.index, dtype="object")
-    out = out.mask(raw.str.contains("RAINBOW", regex=False, na=False), "RAINBOW")
-    out = out.mask(raw.str.contains("COMBO", regex=False, na=False), "COMBO")
-    out = out.mask(raw.str.contains("BOUQUET|\\bBQT\\b", regex=True, na=False), "BOUQUET")
-    out = out.mask(raw.str.contains("SURTIDO", regex=False, na=False), "SURTIDO_M")
-    out = out.mask(raw.str.contains("BULK", regex=False, na=False), "BULK")
-    out = out.mask(raw.str.contains("SOLIDO|SOLID", regex=True, na=False), "SOLIDO")
-    direct_clean = direct_upper.str.replace(r"\s+", "_", regex=True)
-    direct_clean = direct_clean.mask(direct_upper.str.contains("RAINBOW", regex=False, na=False), "RAINBOW")
-    direct_clean = direct_clean.mask(direct_upper.str.contains("COMBO", regex=False, na=False), "COMBO")
-    direct_clean = direct_clean.mask(direct_upper.str.contains("BOUQUET|\\bBQT\\b", regex=True, na=False), "BOUQUET")
-    direct_clean = direct_clean.mask(direct_upper.str.contains("SURTIDO", regex=False, na=False), "SURTIDO_M")
-    direct_clean = direct_clean.mask(direct_upper.str.contains("BULK", regex=False, na=False), "BULK")
-    direct_clean = direct_clean.mask(direct_upper.str.contains("SOLIDO|SOLID", regex=True, na=False), "SOLIDO")
-    out = out.mask(usable_direct, direct_clean)
+    source = frame.get("tipo_empaque_raw", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+    source_upper = _ascii_upper_text(source)
+    out = source_upper.where(~source_upper.isin({"", "NAN", "NONE", "SIN DATO", "SIN_DATO"}), "Sin dato")
+    out = out.mask(source_upper.isin({"SOLIDO POR VARIEDAD", "SOLIDO POR COLOR"}), "SOLIDO")
     return out
 
 

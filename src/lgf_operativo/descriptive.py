@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .cleaning import clean_historical_orders, load_tipo_pedido_reference, split_orders_by_estado, summarize_estado
+from .cleaning import clean_historical_orders, reconcile_tipo_pedido_operativo, split_orders_by_estado, summarize_estado
 from .io_utils import read_table, resolve_path, write_outputs
 from .metrics import (
     build_client_profile,
@@ -80,20 +80,14 @@ def _clean_cache_paths(
     hist_path: Path,
     output_dir: str | Path,
     historical_sheet: str | None,
-    tipo_reference_path: str | Path | None = None,
 ) -> tuple[Path, Path]:
     stat = hist_path.stat()
-    reference = Path(tipo_reference_path) if tipo_reference_path else None
-    reference_stat = reference.stat() if reference and reference.exists() else None
     payload = {
         "path": str(hist_path.resolve()).lower(),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "sheet": historical_sheet,
-        "version": 11,
-        "tipo_reference": str(reference.resolve()).lower() if reference and reference.exists() else "",
-        "tipo_reference_size": reference_stat.st_size if reference_stat else 0,
-        "tipo_reference_mtime_ns": reference_stat.st_mtime_ns if reference_stat else 0,
+        "version": 12,
     }
     key = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     cache_dir = Path(output_dir) / "_cache"
@@ -105,18 +99,14 @@ def _load_or_clean_historical(
     hist_path: Path,
     output_dir: str | Path,
     historical_sheet: str | None,
-    tipo_reference_path: str | Path | None,
     use_cache: bool,
     progress: PipelineProgress,
 ) -> pd.DataFrame:
-    cache_path, cache_dir = _clean_cache_paths(hist_path, output_dir, historical_sheet, tipo_reference_path)
+    cache_path, cache_dir = _clean_cache_paths(hist_path, output_dir, historical_sheet)
     if use_cache and cache_path.exists():
         progress.note(f"Usando cache limpio: {cache_path}")
         return pd.read_pickle(cache_path)
-    tipo_reference = load_tipo_pedido_reference(tipo_reference_path)
-    if tipo_reference:
-        progress.note(f"Aplicando referencia tipologica: {tipo_reference_path}")
-    pedidos_all = clean_historical_orders(raw_hist, tipo_reference=tipo_reference)
+    pedidos_all = clean_historical_orders(raw_hist)
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
         pedidos_all.to_pickle(cache_path)
@@ -134,7 +124,6 @@ def run_descriptive_pipeline(
     write_excel: bool = True,
     analysis_year: int | None = None,
     analysis_years: list[int] | tuple[int, ...] | None = None,
-    tipo_reference_path: str | Path | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Build only descriptive outputs for client/product analysis.
 
@@ -149,10 +138,6 @@ def run_descriptive_pipeline(
     analysis_years : sequence of int, optional
         Calendar years included in the descriptive window. If omitted together
         with ``analysis_year``, all historical years are processed.
-    tipo_reference_path : path-like, optional
-        Emergency fallback for reduced historical extracts that do not contain
-        the source recipe fields. The complete accumulated base is classified
-        directly and must not provide this argument.
     """
     if analysis_year is not None and analysis_years:
         raise ValueError("Usa analysis_year o analysis_years, no ambos.")
@@ -193,7 +178,7 @@ def run_descriptive_pipeline(
         if hist_path is None or not hist_path.exists():
             raise FileNotFoundError(f"No encontre el historico: {historical_path}")
         progress.finish(str(hist_path))
-        cache_path, _ = _clean_cache_paths(hist_path, output_dir, historical_sheet, tipo_reference_path)
+        cache_path, _ = _clean_cache_paths(hist_path, output_dir, historical_sheet)
         cache_ready = use_cache and cache_path.exists()
 
     progress.start("Leer historico", 12)
@@ -216,7 +201,7 @@ def run_descriptive_pipeline(
         "receta_programa_tamano_key",
     }
     if raw_source_is_frame and cleaned_markers.issubset(raw_hist.columns):
-        pedidos_all = raw_hist.copy()
+        pedidos_all = reconcile_tipo_pedido_operativo(raw_hist.copy())
         pedidos_all["fecha"] = pd.to_datetime(pedidos_all["fecha"], errors="coerce")
         iso = pedidos_all["fecha"].dt.isocalendar()
         if "anio" not in pedidos_all.columns:
@@ -228,11 +213,10 @@ def run_descriptive_pipeline(
         if "mes_num" not in pedidos_all.columns:
             pedidos_all["mes_num"] = pedidos_all["fecha"].dt.month.astype(int)
     elif raw_source_is_frame:
-        tipo_reference = load_tipo_pedido_reference(tipo_reference_path)
-        pedidos_all = clean_historical_orders(raw_hist, tipo_reference=tipo_reference)
+        pedidos_all = clean_historical_orders(raw_hist)
     else:
         pedidos_all = _load_or_clean_historical(
-            raw_hist, hist_path, output_dir, historical_sheet, tipo_reference_path, use_cache, progress
+            raw_hist, hist_path, output_dir, historical_sheet, use_cache, progress
         )
     progress.finish(f"{pedidos_all.shape[0]:,} filas limpias")
 

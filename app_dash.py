@@ -3854,7 +3854,7 @@ def filter_operational_scope(df: pd.DataFrame, scope: str | None = "solidos", pr
         if scope == "solidos":
             out = out[tipo.eq("SOLIDO")].copy()
         elif scope == "estructuras":
-            out = out[tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BQT", "BOUQUET", "COMBO"])].copy()
+            out = out[tipo.isin(['SURTIDO "M"', "RAINBOW", "BQT", "BOUQUET", "COMBO"])].copy()
         elif scope == "bulk":
             out = out[tipo.eq("BULK")].copy()
     if product and "producto" in out.columns:
@@ -5411,7 +5411,7 @@ def sales_raw_export_frame(data: dict[str, pd.DataFrame], years, week_range, com
     return out[preferred + extra].copy()
 
 
-NON_SOLID_TYPES = {"SURTIDO", "SURTIDO_M", "RAINBOW", "COMBO", "BOUQUET", "BQT", "BULK", "MIX", "ASSORTED"}
+NON_SOLID_TYPES = {'SURTIDO "M"', "RAINBOW", "COMBO", "BOUQUET", "BQT"}
 
 
 def selected_values(value) -> list[str]:

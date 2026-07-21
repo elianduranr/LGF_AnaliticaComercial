@@ -214,8 +214,15 @@ def build_client_profile(df: pd.DataFrame) -> pd.DataFrame:
         fill_value=0,
     )
     tipo_total = tipo_share.sum(axis=1).replace(0, np.nan)
-    for tipo_name in ["SOLIDO", "SURTIDO", "SURTIDO_M", "RAINBOW", "BQT", "COMBO", "BOUQUET", "BULK"]:
-        col = f"share_{tipo_name.lower()}"
+    type_share_columns = {
+        "SOLIDO": "share_solido",
+        'SURTIDO "M"': "share_surtido_m",
+        "RAINBOW": "share_rainbow",
+        "BQT": "share_bqt",
+        "COMBO": "share_combo",
+        "BOUQUET": "share_bouquet",
+    }
+    for tipo_name, col in type_share_columns.items():
         base = base.merge(
             (tipo_share.get(tipo_name, pd.Series(0, index=tipo_share.index)) / tipo_total)
             .fillna(0)
@@ -224,7 +231,9 @@ def build_client_profile(df: pd.DataFrame) -> pd.DataFrame:
             on=CLIENT_KEYS,
             how="left",
         )
-    base["share_facil_compra"] = base[["share_solido", "share_surtido", "share_surtido_m"]].sum(axis=1).clip(0, 1)
+    base["share_surtido"] = 0.0
+    base["share_bulk"] = 0.0
+    base["share_facil_compra"] = base[["share_solido", "share_surtido_m"]].sum(axis=1).clip(0, 1)
     base["share_estructuras_mixtas"] = base[
         ["share_surtido", "share_surtido_m", "share_rainbow", "share_bouquet", "share_bqt", "share_combo"]
     ].sum(axis=1).clip(0, 1)
@@ -869,7 +878,7 @@ def build_operational_sku_composition(
     return out[cols].sort_values(["cod_cliente", "sku_operativo", "tallos_promedio_semana_normal"], ascending=[True, True, False]).reset_index(drop=True)
 
 
-MIXED_STRUCTURE_TYPES = ["SURTIDO", "SURTIDO_M", "RAINBOW", "BQT", "COMBO", "BOUQUET", "BULK"]
+MIXED_STRUCTURE_TYPES = ['SURTIDO "M"', "RAINBOW", "BQT", "COMBO", "BOUQUET"]
 
 
 def _top_join(series: pd.Series, n: int = 8) -> str:

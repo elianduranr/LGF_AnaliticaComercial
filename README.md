@@ -209,7 +209,7 @@ Los graficos y tablas de esta vista incluyen `fecha_semana` y/o `semana_label` p
 - `forecast_modelo_estacional.csv`: forecast robusto con boosting estacional. Usa histórico confirmado, recencia, país, ciudad, semana ISO, ventanas florales pico, cliente, producto/color, estructura operativa y rezagos históricos.
 - `forecast_pendientes_reales.csv`: pendientes reales convertidos al formato de demanda futura.
 - `demanda_operativa_futura.csv`: demanda final usada para inventario. Usa Pendiente primero y forecast solo donde no hay Pendiente para ese cliente/fecha. Por defecto `run_mvp.py` usa el baseline rapido; el modelo estacional queda disponible con `--forecast-model seasonal_boosting`.
-- `cliente_estructuras_repetidas.csv`: tabla accionable para Cliente 360. En SOLIDO evalua SKU terminado; en SURTIDO_M evalua mezcla; en recetas evalua composicion; en BULK evalua producto-color. El clasificador normaliza cualquier `SURTIDO` legacy a `SURTIDO_M`.
+- `cliente_estructuras_repetidas.csv`: tabla accionable para Cliente 360. En `SOLIDO` evalua SKU terminado; en `SURTIDO "M"` evalua mezcla; y en recetas evalua composicion.
 - `cliente_semana_tipica.csv`: comportamiento por semana del ano para seleccionar una semana y ver estructura, mediana, promedio, comportamiento reciente, confianza y clasificacion.
 - `cliente_sku_operativo_resumen.csv`: base principal del 360 para pedido tipico. SOLIDO se lee por SKU terminado exacto; surtidos/rainbow/combo/bouquet se leen como estructura operativa; BULK por producto-color.
 - `cliente_sku_operativo_composicion.csv`: composicion interna de cada SKU operativo por producto, color, variedad, porcentaje, tallos/ramos promedio y estabilidad.
@@ -239,13 +239,13 @@ python run_mvp.py --forecast-model seasonal_boosting --output "outputs_modelo"
 
 ## Corrección v3 - tipos de pedido operativos
 
-Esta versión diferencia explícitamente los formatos de pedido usando `TIPORDENEMPAQUE`, `TIPEMPAQUE`, `EMPAQUE` y `RECETA`.
+Esta version toma el formato operativo exclusivamente de `TIPEMPAQUE`. Los campos `TIPORDENEMPAQUE`, `EMPAQUE` y `RECETA` se conservan como atributos independientes y nunca reclasifican el tipo.
 
 Clasifica y exporta:
 
-- `tipo_pedido_operativo`: `RAINBOW`, `SURTIDO_M`, `SOLIDO`, `COMBO`, `BULK`, `OTRO_NO_CLASIFICADO`. Cualquier `SURTIDO` legacy se normaliza a `SURTIDO_M`.
+- `tipo_pedido_operativo`: `SOLIDO`, `SURTIDO "M"`, `BOUQUET`, `COMBO`, `RAINBOW` o `BQT`, de acuerdo con `TIPEMPAQUE`.
 - `subtipo_pedido_operativo`: por ejemplo `solido_por_color`, `solido_por_variedad`, `surtido_m`, `rainbow`.
-- `tipo_pedido_raw`: texto base usado para clasificar.
+- `tipo_pedido_raw`: valor normalizado de `TIPEMPAQUE` usado como fuente auditable.
 - `estructura_pedido`: llave de estructura de pedido para forecast y perfiles.
 
 El forecast estructural ahora agrupa por tipo de pedido operativo además de cliente, producto, variedad, color, grado, caja, tallos por ramo, capuchón, comida y empaque. Esto evita mezclar, por ejemplo, una línea Rainbow con una línea Sólido o Surtido M aunque compartan color/producto.

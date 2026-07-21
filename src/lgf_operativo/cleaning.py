@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import Iterable
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -101,17 +100,6 @@ ESTADO_CATEGORIA = {
     "reproceso": "cambio_sobre_confirmado",
     "otro": "otro_no_clasificado",
 }
-
-REFERENCE_EXACT_KEYS = [
-    "fecha", "cod_cliente", "pedido", "caja_operativa", "producto",
-    "variedad", "color", "grado", "tipo_caja",
-]
-REFERENCE_STABLE_KEYS = ["cod_cliente", "caja_operativa", "producto", "variedad", "color"]
-REFERENCE_BOX_KEYS = ["cod_cliente", "caja_operativa"]
-VALID_OPERATIONAL_TYPES = {
-    "SOLIDO", "SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO", "BULK"
-}
-
 
 def strip_accents(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
@@ -212,78 +200,6 @@ def parse_date(series: pd.Series) -> pd.Series:
     return parsed
 
 
-def build_tipo_pedido_reference(enriched_history: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Build unambiguous mappings from an earlier enriched historical output.
-
-    This bridge is used only when a newer accumulated sales extract omits the
-    detailed recipe/packaging columns that originally identified SURTIDO,
-    RAINBOW and related mixed formats.
-    """
-    reference = enriched_history.copy()
-    required = set(REFERENCE_EXACT_KEYS + ["tipo_pedido_operativo"])
-    missing = required.difference(reference.columns)
-    if missing:
-        raise ValueError(f"Referencia tipologica incompleta; faltan columnas: {sorted(missing)}")
-    reference["fecha"] = pd.to_datetime(reference["fecha"], errors="coerce")
-    for col in set(REFERENCE_EXACT_KEYS + REFERENCE_STABLE_KEYS + REFERENCE_BOX_KEYS) - {"fecha"}:
-        reference[col] = reference[col].fillna("sin_info").astype(str)
-    reference["tipo_pedido_operativo"] = reference["tipo_pedido_operativo"].astype(str).str.upper()
-    reference = reference[reference["tipo_pedido_operativo"].isin(VALID_OPERATIONAL_TYPES)].copy()
-
-    outputs = {}
-    for name, keys in [
-        ("exacta", REFERENCE_EXACT_KEYS),
-        ("estable", REFERENCE_STABLE_KEYS),
-        ("caja", REFERENCE_BOX_KEYS),
-    ]:
-        grouped = (
-            reference.groupby(keys, dropna=False)["tipo_pedido_operativo"]
-            .agg(n_tipos="nunique", tipo_pedido_referencia="first")
-            .reset_index()
-        )
-        outputs[name] = grouped[grouped["n_tipos"].eq(1)].drop(columns="n_tipos")
-    return outputs
-
-
-def load_tipo_pedido_reference(path: str | Path | None) -> dict[str, pd.DataFrame] | None:
-    """Loads a previously materialized operational-type reference, if present."""
-    if path is None or not Path(path).exists():
-        return None
-    loaded = pd.read_pickle(Path(path), compression="gzip")
-    return loaded if isinstance(loaded, dict) else None
-
-
-def attach_tipo_pedido_reference(
-    df: pd.DataFrame,
-    reference: dict[str, pd.DataFrame] | None,
-) -> pd.DataFrame:
-    """Attach prior non-ambiguous order types to rows from reduced extracts."""
-    if not reference:
-        return df
-    out = df.copy()
-    caja_id = normalize_key_series(out["caja_id"])
-    id_caja = normalize_key_series(out["id_caja"]) if "id_caja" in out.columns else pd.Series("sin_info", index=out.index)
-    out["caja_operativa_referencia"] = caja_id.where(~caja_id.isin(["sin_info", "nan", "none", ""]), id_caja)
-    out["caja_operativa"] = out["caja_operativa_referencia"]
-    out["fecha"] = pd.to_datetime(out["fecha"], errors="coerce")
-    for col in set(REFERENCE_EXACT_KEYS + REFERENCE_STABLE_KEYS + REFERENCE_BOX_KEYS) - {"fecha"}:
-        out[col] = out[col].fillna("sin_info").astype(str)
-    out["tipo_pedido_referencia"] = pd.Series(pd.NA, index=out.index, dtype="object")
-    for name, keys in [
-        ("exacta", REFERENCE_EXACT_KEYS),
-        ("estable", REFERENCE_STABLE_KEYS),
-        ("caja", REFERENCE_BOX_KEYS),
-    ]:
-        mapping = reference.get(name)
-        if mapping is None or mapping.empty:
-            continue
-        pending = out["tipo_pedido_referencia"].isna()
-        candidate = out.loc[pending, keys].merge(mapping, on=keys, how="left")["tipo_pedido_referencia"]
-        out.loc[pending, "tipo_pedido_referencia"] = candidate.to_numpy()
-    out.drop(columns=["caja_operativa_referencia"], inplace=True)
-    return out
-
-
 def classify_estado(estado: pd.Series) -> pd.DataFrame:
     estado_norm = normalize_text_series(estado)
     estado_canonico = estado_norm.map(ESTADO_CANONICO).fillna("otro")
@@ -301,121 +217,48 @@ def classify_estado(estado: pd.Series) -> pd.DataFrame:
 
 
 def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
-    """Classify the operational order structure.
+    """Use source-system ``TIPEMPAQUE`` as the sole operational-type authority.
 
-    This separates formats such as Surtido, Surtido M, Sólido, Rainbow, Combo, etc.
-    The classifier uses TIPORDENEMPAQUE, TIPEMPAQUE, EMPAQUE and RECETA because the format
-    may appear in different columns depending on the source.
+    The two solid variants are consolidated as ``SOLIDO``. Every other value
+    is preserved as supplied by the system (apart from case/text cleanup).
     """
-    cols = ["tipo_orden_empaque", "tipo_empaque", "empaque", "receta", "bulkbouquet", "codempaque", "caja_id"]
-    tmp = df.copy()
-    for col in cols:
-        if col not in tmp.columns:
-            tmp[col] = "sin_info"
-        tmp[col] = normalize_text_series(tmp[col])
+    if "tipo_empaque" in df.columns:
+        raw = normalize_text_series(df["tipo_empaque"])
+    else:
+        raw = pd.Series("sin_info", index=df.index, dtype="object")
 
-    raw = tmp["tipo_orden_empaque"].astype(str)
-    for col in ["tipo_empaque", "empaque", "receta", "bulkbouquet", "codempaque", "caja_id"]:
-        raw = raw.str.cat(tmp[col].astype(str), sep=" ")
-    raw = normalize_text_series(raw)
+    tipo = raw.str.upper()
+    tipo = tipo.where(~raw.isin(["solido por variedad", "solido por color"]), "SOLIDO")
+    tipo = tipo.where(raw.ne("sin_info"), "TIPO_EMPAQUE_NO_INFORMADO")
+    subtipo = normalize_key_series(raw)
+    origen_tipologia = pd.Series("tipo_empaque_sistema", index=df.index, dtype="object")
 
-    tipo = pd.Series("OTRO_NO_CLASIFICADO", index=tmp.index, dtype="object")
-    subtipo = pd.Series("sin_info", index=tmp.index, dtype="object")
-    origen_tipologia = pd.Series("regla_campos_fuente", index=tmp.index, dtype="object")
-
-    is_rainbow = raw.str.contains(r"\brainbow\b", regex=True, na=False)
-    is_surtido_m = raw.str.contains(r"surtido\s*[\"']?m[\"']?\b|mixed\s*m\b|\bmixed\s+special\b", regex=True, na=False)
-    is_surtido = raw.str.contains(r"\bsurtido\b|\bmixed\b|\bmix\b|\bassorted\b|\bassort\b|\basstd\b", regex=True, na=False)
-    is_solido_color = raw.str.contains(r"solido\s+por\s+color|solid\s+by\s+color", regex=True, na=False)
-    is_solido_variedad = raw.str.contains(r"solido\s+por\s+variedad|solid\s+by\s+variety", regex=True, na=False)
-    is_solido = raw.str.contains(r"\bsolido\b|\bsolid\b", regex=True, na=False)
-    is_bouquet = raw.str.contains(r"\bbouquet\b", regex=True, na=False)
-    is_bqt = raw.str.contains(r"\bbqt\b", regex=True, na=False)
-    is_combo = raw.str.contains(r"\bcombo\b", regex=True, na=False)
-    is_bulk = raw.str.contains(r"\bbulk\b|\bbulkbouquet\b", regex=True, na=False)
-
-    # Priority matters: recipe/mixed structures override generic labels such
-    # as "Solido" that can coexist in packaging fields (for example Combo).
-    tipo[is_bulk] = "BULK"
-    subtipo[is_bulk] = "bulk"
-
-    tipo[is_solido] = "SOLIDO"
-    subtipo[is_solido] = "solido_general"
-
-    tipo[is_solido_color] = "SOLIDO"
-    subtipo[is_solido_color] = "solido_por_color"
-
-    tipo[is_solido_variedad] = "SOLIDO"
-    subtipo[is_solido_variedad] = "solido_por_variedad"
-
-    tipo[is_surtido] = "SURTIDO"
-    subtipo[is_surtido] = "surtido_general"
-
-    tipo[is_surtido_m] = "SURTIDO_M"
-    subtipo[is_surtido_m] = "surtido_m"
-
-    # A named finished format is more specific than generic composition words.
-    # For example, "bouquet unico mixed" is a BOUQUET, not a SURTIDO.
-    tipo[is_bouquet] = "BOUQUET"
-    subtipo[is_bouquet] = "bouquet"
-
-    tipo[is_bqt] = "BQT"
-    subtipo[is_bqt] = "bqt"
-
-    tipo[is_combo] = "COMBO"
-    subtipo[is_combo] = "combo"
-
-    tipo[is_rainbow] = "RAINBOW"
-    subtipo[is_rainbow] = "rainbow"
-
-    if "tipo_pedido_referencia" in tmp.columns:
-        referencia = tmp["tipo_pedido_referencia"].fillna("").astype(str).str.upper()
-        from_reference = referencia.isin(VALID_OPERATIONAL_TYPES)
-        tipo[from_reference] = referencia[from_reference]
-        subtipo[from_reference] = "referencia_historica"
-        origen_tipologia[from_reference] = "referencia_historica_no_ambigua"
-
-    # Current explicit special-format labels are stronger than a historical
-    # fallback: these named recipes must always retain their real source name.
-    tipo[is_bouquet] = "BOUQUET"
-    subtipo[is_bouquet] = "bouquet"
-    origen_tipologia[is_bouquet] = "marca_explicita_fuente"
-    tipo[is_rainbow] = "RAINBOW"
-    subtipo[is_rainbow] = "rainbow"
-    origen_tipologia[is_rainbow] = "marca_explicita_fuente"
-    tipo[is_bqt] = "BQT"
-    subtipo[is_bqt] = "bqt"
-    origen_tipologia[is_bqt] = "marca_explicita_fuente"
-    tipo[is_combo] = "COMBO"
-    subtipo[is_combo] = "combo"
-    origen_tipologia[is_combo] = "marca_explicita_fuente"
-
-    facilidad = pd.Series("REVISAR_OPERACION", index=tmp.index, dtype="object")
-    facilidad[tipo.isin(["SOLIDO", "SURTIDO", "SURTIDO_M"])] = "FACIL_COMPRAR_TERMINADO"
+    facilidad = pd.Series("REVISAR_OPERACION", index=df.index, dtype="object")
+    facilidad[tipo.isin(["SOLIDO", 'SURTIDO "M"'])] = "FACIL_COMPRAR_TERMINADO"
     facilidad[tipo.eq("RAINBOW")] = "NO_COMPRAR_RAINBOW_ARMAR_INTERNO"
     facilidad[tipo.isin(["COMBO", "BULK", "BOUQUET", "BQT"])] = "VALIDAR_FORMATO_ANTES_COMPRAR"
 
-    nivel_disponibilidad = pd.Series("COLOR", index=tmp.index, dtype="object")
+    nivel_disponibilidad = pd.Series("COLOR", index=df.index, dtype="object")
     nivel_disponibilidad[tipo.eq("SOLIDO") & subtipo.eq("solido_por_variedad")] = "COLOR_VARIEDAD"
     nivel_disponibilidad[tipo.eq("RAINBOW")] = "REGLA_GENERAL_PEDIDO"
 
-    enfoque_analisis = pd.Series("REVISION_OPERATIVA", index=tmp.index, dtype="object")
+    enfoque_analisis = pd.Series("REVISION_OPERATIVA", index=df.index, dtype="object")
     enfoque_analisis[tipo.eq("SOLIDO")] = "SKU_SOLIDO_COLOR_CAJA"
-    enfoque_analisis[tipo.isin(["SURTIDO", "SURTIDO_M"])] = "ESTRUCTURA_MEZCLA_COLOR_COMPONENTE"
+    enfoque_analisis[tipo.eq('SURTIDO "M"')] = "ESTRUCTURA_MEZCLA_COLOR_COMPONENTE"
     enfoque_analisis[tipo.eq("RAINBOW")] = "RECETA_RAINBOW_COLOR_COMPONENTE"
     enfoque_analisis[tipo.eq("BQT")] = "RECETA_BQT_ESTRUCTURA"
     enfoque_analisis[tipo.eq("BOUQUET")] = "RECETA_BOUQUET_ESTRUCTURA"
     enfoque_analisis[tipo.eq("COMBO")] = "COMBO_ESTRUCTURA_CAJA"
     enfoque_analisis[tipo.eq("BULK")] = "BULK_ESTRUCTURA_PEDIDO"
 
-    rol_color = pd.Series("COLOR_REFERENCIAL", index=tmp.index, dtype="object")
+    rol_color = pd.Series("COLOR_REFERENCIAL", index=df.index, dtype="object")
     rol_color[tipo.eq("SOLIDO")] = "COLOR_DEFINITORIO_SKU"
-    rol_color[tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "COLOR_COMPONENTE_ESTRUCTURA"
+    rol_color[tipo.isin(['SURTIDO "M"', "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "COLOR_COMPONENTE_ESTRUCTURA"
     rol_color[tipo.eq("BULK")] = "COLOR_COMPONENTE_ESTRUCTURA"
 
-    familia_analisis = pd.Series("OTROS_FORMATOS", index=tmp.index, dtype="object")
+    familia_analisis = pd.Series("OTROS_FORMATOS", index=df.index, dtype="object")
     familia_analisis[tipo.eq("SOLIDO")] = "SOLIDOS_COLOR_CAJA"
-    familia_analisis[tipo.isin(["SURTIDO", "SURTIDO_M", "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "ESTRUCTURAS_MIXTAS_RECETA"
+    familia_analisis[tipo.isin(['SURTIDO "M"', "RAINBOW", "BOUQUET", "BQT", "COMBO"])] = "ESTRUCTURAS_MIXTAS_RECETA"
     familia_analisis[tipo.eq("BULK")] = "ESTRUCTURAS_MIXTAS_RECETA"
 
     return pd.DataFrame({
@@ -435,42 +278,25 @@ def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def reconcile_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
-    """Correct stale operational labels using the original descriptive fields.
+    """Correct stale labels exclusively from original ``tipo_empaque`` data.
 
     Result tables and dashboard caches can outlive a classifier change. This
-    keeps their visible type aligned with the source wording whenever the frame
-    still contains enough original packaging/recipe detail to classify it.
+    keeps their visible type aligned with the source-system field.
     """
     if df.empty or "tipo_pedido_operativo" not in df.columns:
         return df
-    descriptor_cols = [
-        "tipo_orden_empaque",
-        "tipo_empaque",
-        "empaque",
-        "receta",
-        "bulkbouquet",
-        "codempaque",
-        "caja_id",
-    ]
-    available = [col for col in descriptor_cols if col in df.columns]
-    if not available:
+    if "tipo_empaque" not in df.columns:
         return df
 
     classified = classify_tipo_pedido_operativo(df)
-    has_source_detail = pd.Series(False, index=df.index)
     blank = {"", "sin_info", "nan", "none", "0", "0.0"}
-    for col in available:
-        values = df[col].fillna("").astype(str).str.strip().str.lower()
-        has_source_detail |= ~values.isin(blank)
-    usable = has_source_detail & classified["tipo_pedido_operativo"].ne("OTRO_NO_CLASIFICADO")
+    values = df["tipo_empaque"].fillna("").astype(str).str.strip().str.lower()
+    usable = ~values.isin(blank)
     if not usable.any():
         return df
 
     out = df.copy()
-    out.loc[usable, "tipo_pedido_operativo"] = classified.loc[usable, "tipo_pedido_operativo"]
-    if "subtipo_pedido_operativo" in out.columns:
-        out.loc[usable, "subtipo_pedido_operativo"] = classified.loc[usable, "subtipo_pedido_operativo"]
-    for col in ["es_pedido_solido", "es_pedido_no_solido", "es_rainbow"]:
+    for col in classified.columns:
         if col in out.columns:
             out.loc[usable, col] = classified.loc[usable, col]
     return out
@@ -488,10 +314,7 @@ def add_client_identifiers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def clean_historical_orders(
-    df: pd.DataFrame,
-    tipo_reference: dict[str, pd.DataFrame] | None = None,
-) -> pd.DataFrame:
+def clean_historical_orders(df: pd.DataFrame) -> pd.DataFrame:
     """Clean orders extract from LGF.
 
     Business rules:
@@ -550,10 +373,7 @@ def clean_historical_orders(
         missing_company = df["NomCompania"].isin(["sin_info", "", "nan", "none"])
         df.loc[missing_company, "NomCompania"] = df.loc[missing_company, "cliente"]
 
-    # Clasificación explícita del tipo de pedido: surtido, sólido, surtido M, Rainbow, etc.
-    # Sales extracts can omit the original recipe fields. Restore historical
-    # types where an earlier enriched output provides an unambiguous match.
-    df = attach_tipo_pedido_reference(df, tipo_reference)
+    # TIPEMPAQUE from the source system is the sole operational-type authority.
     tipo_pedido_info = classify_tipo_pedido_operativo(df)
     for col in tipo_pedido_info.columns:
         df[col] = tipo_pedido_info[col].values

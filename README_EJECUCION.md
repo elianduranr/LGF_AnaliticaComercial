@@ -19,21 +19,20 @@ GitHub. La maquina de ejecucion debe tener acceso a `192.168.1.22`, base
 `gaitana`, schema `op_sales`, y el driver ODBC de SQL Server instalado.
 
 Si la maquina usa autenticacion integrada de Windows, no hace falta definir
-usuario ni clave. Si usa autenticacion SQL, definir variables de entorno fuera
-del repositorio:
+usuario ni clave. Si usa autenticacion SQL, las credenciales se guardan en
+`configurar_credenciales.local.ps1`; el lanzador Bash lee ese archivo y exporta
+las variables necesarias sin imprimirlas en la terminal.
 
-```powershell
-$env:OP_SALES_SQL_SERVER = "192.168.1.22"
-$env:OP_SALES_SQL_DATABASE = "gaitana"
-$env:OP_SALES_SQL_USER = "usuario_sql"
-$env:OP_SALES_SQL_PASSWORD = "clave_sql"
+Desde Git Bash o la terminal Bash de Visual Studio Code, el dashboard debe
+abrirse en modo SQL con:
+
+```bash
+cd /c/Proyectos_gaitana/lgf_operativo_project
+bash ./run_dash_sql.sh
 ```
 
-El dashboard debe abrirse en modo SQL:
-
-```powershell
-.\run_dash_sql.ps1
-```
+Luego abrir `http://localhost:8085/` en el navegador. El proceso permanece
+activo en esa terminal; para detenerlo se usa `Ctrl+C`.
 
 La carpeta local de respaldo/carga inicial es:
 
@@ -44,11 +43,22 @@ bases de datos historicas/
 
 Esta carpeta ya existe en el proyecto. Las bases anuales pueden conservarse como respaldo, pero el flujo oficial carga el acumulado en SQL Server y luego lee `op_sales.fact_sales_line`.
 
-El acumulado oficial debe conservar los campos originales que distinguen
-recetas y surtidos (`TIPORDENEMPAQUE`, `EMPAQUE`, `RECETA`, `BULKBOUQUET`,
-componentes y cantidades operativas). La clasificacion se obtiene directamente
-de esos campos. Los formatos con marca explicita `BQT`, `COMBO` o `RAINBOW`
-se mantienen visibles y se analizan como estructuras mixtas.
+El acumulado oficial debe conservar los campos originales del sistema. Para
+`tipo_pedido_operativo`, la unica fuente autorizada es `TIPEMPAQUE`
+(`tipo_empaque` en el modelo canonico). No se infiere desde `EMPAQUE`,
+`TIPORDENEMPAQUE`, `RECETA`, `BULKBOUQUET`, codigos de caja ni referencias
+historicas.
+
+La regla aplicada es deliberadamente directa:
+
+- `solido por variedad` y `solido por color` se consolidan como `SOLIDO`.
+- Los demas valores conservan el nombre del sistema: `SURTIDO "M"`, `BOUQUET`,
+  `COMBO`, `RAINBOW` y `BQT`.
+- Si el sistema incorpora un valor nuevo, este se conserva visible; el pipeline
+  no intenta adivinar otra clasificacion.
+
+`TIPORDENEMPAQUE` se conserva como atributo independiente de la orden
+(`regular`, `adicional`, `fija`, etc.), pero nunca define el tipo operativo.
 
 ## Terminal Bash
 
@@ -90,7 +100,7 @@ python cargar_op_sales_sql.py \
 
 Luego:
 
-- `run_descriptivos.py` lee `op_sales.fact_sales_line`, clasifica tipos desde los campos fuente y genera perfiles/SKUs.
+- `run_descriptivos.py` lee `op_sales.fact_sales_line`, toma el tipo operativo exclusivamente de `tipo_empaque` y genera perfiles/SKUs.
 - `run_forecast_solidos.py` lee `op_sales.fact_sales_line` y conserva exclusivamente pedidos `SOLIDO` historicos necesarios para forecast.
 
 Validar que la entrada exista:
@@ -101,9 +111,9 @@ ls "bases de datos historicas/historic_sales_acum.csv"
 
 Pendiente recomendable para una fase posterior: crear un ejecutor `run_preparacion_historica.py` que materialice una unica base limpia reutilizable. No se crea ahora porque implicaria cambiar el contrato de los modulos que ya funcionan.
 
-No se debe ejecutar ninguna referencia tipologica adicional con la base
-completa. El flujo oficial clasifica directamente desde los campos originales
-de receta y estructura conservados en `historic_sales_acum.csv`.
+No se debe ejecutar ninguna referencia tipologica adicional. El flujo oficial
+usa exclusivamente `TIPEMPAQUE` para el tipo operativo y conserva por separado
+los campos de receta, empaque y estructura para sus respectivos analisis.
 
 ## 2. Generacion De Descriptivos
 
@@ -205,7 +215,24 @@ Salidas principales:
 
 ## 5. Dashboard
 
-Luego de ejecutar los tres modulos:
+Para abrir localmente la corrida disponible en modo SQL:
+
+```bash
+bash ./run_dash_sql.sh
+```
+
+Abrir:
+
+```text
+http://localhost:8085/
+```
+
+El lanzador selecciona automaticamente `.venv`, `carac_clients`, el entorno
+`SDG_env` o el `python` disponible. Tambien carga
+`configurar_credenciales.local.ps1` y consume los resultados de
+`resultados/descriptivos` y `resultados/forecast_solidos`.
+
+Si se necesita ejecutar `app_dash.py` directamente y elegir otro puerto:
 
 ```bash
 python app_dash.py \
@@ -215,7 +242,7 @@ python app_dash.py \
   --port 8050
 ```
 
-Abrir:
+En ese caso abrir:
 
 ```text
 http://127.0.0.1:8050/

@@ -33,11 +33,6 @@ def parse_args():
     parser.add_argument("--start-date", default=None, help="Fecha inicial opcional para --source sql, formato YYYY-MM-DD.")
     parser.add_argument("--end-date", default=None, help="Fecha final opcional para --source sql, formato YYYY-MM-DD.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Carpeta donde se guardan descriptivos.")
-    parser.add_argument(
-        "--tipo-reference",
-        default=None,
-        help="Respaldo opcional para extractos incompletos sin campos de receta; no usar con la base completa.",
-    )
     parser.add_argument("--historico-sheet", default=None, help="Hoja Excel del historico, si aplica.")
     time_group = parser.add_mutually_exclusive_group()
     time_group.add_argument("--year", type=int, default=None, help="Filtra a un unico ano calendario, por ejemplo 2026.")
@@ -88,7 +83,6 @@ if __name__ == "__main__":
         write_excel=not args.no_excel,
         analysis_year=args.year,
         analysis_years=args.years,
-        tipo_reference_path=args.tipo_reference,
     )
     print("\nProceso descriptivo terminado. Archivos generados en:", Path(args.output).resolve())
     print("\nTablas generadas:")

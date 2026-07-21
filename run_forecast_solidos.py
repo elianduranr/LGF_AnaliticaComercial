@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.lgf_operativo.cleaning import clean_historical_orders, load_tipo_pedido_reference
+from src.lgf_operativo.cleaning import clean_historical_orders, reconcile_tipo_pedido_operativo
 from src.lgf_operativo.io_utils import read_table, write_outputs
 from src.lgf_operativo.op_sales_sql import read_op_sales_fact
 from src.lgf_operativo.solid_forecast import SolidForecastConfig, run_solid_forecast_pipeline
@@ -68,11 +68,6 @@ def parse_args() -> argparse.Namespace:
         help="Opcional: CSV ya limpio y confirmado. Si se informa, reemplaza --raw-historico.",
     )
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Carpeta de salida separada del forecast.")
-    parser.add_argument(
-        "--tipo-reference",
-        default=None,
-        help="Respaldo opcional para extractos incompletos sin campos de receta; no usar con la base completa.",
-    )
     parser.add_argument("--historico-sheet", default=None, help="Hoja Excel, si la fuente cruda es XLSX/XLS.")
     parser.add_argument("--start-date", default=None, help="Fecha inicial opcional para --source sql, formato YYYY-MM-DD.")
     parser.add_argument("--end-date", default=None, help="Fecha final opcional para --source sql, formato YYYY-MM-DD.")
@@ -85,18 +80,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _forecast_cache_path(source: Path, output: Path, tipo_reference_path: Path | None = None) -> Path:
+def _forecast_cache_path(source: Path, output: Path) -> Path:
     stat = source.stat()
-    reference_stat = tipo_reference_path.stat() if tipo_reference_path and tipo_reference_path.exists() else None
     payload = {
         "path": str(source.resolve()).lower(),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "version": 5,
+        "version": 6,
         "scope": "confirmado_solido_forecast",
-        "tipo_reference": str(tipo_reference_path.resolve()).lower() if tipo_reference_path and tipo_reference_path.exists() else "",
-        "tipo_reference_size": reference_stat.st_size if reference_stat else 0,
-        "tipo_reference_mtime_ns": reference_stat.st_mtime_ns if reference_stat else 0,
     }
     key = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return output / "_cache" / f"historico_confirmado_solidos_{key}.pkl"
@@ -126,21 +117,8 @@ def _only_confirmed_solids(cleaned: pd.DataFrame) -> pd.DataFrame:
         & cleaned["tipo_pedido_operativo"].eq("SOLIDO")
         & pd.to_numeric(cleaned["tallos_analisis"], errors="coerce").fillna(0).gt(0)
     ].copy()
-    subset = _exclude_mixed_structure_markers(subset)
     keep = [col for col in SOLID_COLS if col in subset.columns]
     return subset[keep].copy()
-
-
-def _exclude_mixed_structure_markers(frame: pd.DataFrame) -> pd.DataFrame:
-    """Evita que historicos antiguos etiquetados SOLIDO incluyan BQT/COMBO."""
-    if frame.empty:
-        return frame
-    text = pd.Series("", index=frame.index, dtype="object")
-    for col in ["empaque", "sku_operativo", "sku_terminado"]:
-        if col in frame.columns:
-            text = text.str.cat(frame[col].fillna("").astype(str), sep=" ")
-    mixed = text.str.lower().str.contains(r"\bcombo\b|\bbqt\b|\bbouquet\b", regex=True, na=False)
-    return frame[~mixed].copy()
 
 
 def _read_clean_confirmed(path: Path) -> pd.DataFrame:
@@ -149,6 +127,7 @@ def _read_clean_confirmed(path: Path) -> pd.DataFrame:
 
 
 def _clean_confirmed_solids_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = reconcile_tipo_pedido_operativo(frame.copy())
     if "fecha" in frame.columns:
         frame["fecha"] = pd.to_datetime(frame["fecha"], errors="coerce")
     if "estado_canonico" in frame.columns:
@@ -161,7 +140,7 @@ def _clean_confirmed_solids_frame(frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame[pd.to_numeric(frame["tallos_analisis"], errors="coerce").fillna(0).gt(0)].copy()
     keep = [col for col in SOLID_COLS if col in frame.columns]
     frame = frame[keep].copy() if keep else frame
-    return _exclude_mixed_structure_markers(frame)
+    return frame
 
 
 def _load_raw_solids(
@@ -170,35 +149,31 @@ def _load_raw_solids(
     sheet: str | None,
     chunk_size: int,
     use_cache: bool,
-    tipo_reference_path: Path | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Limpia la fuente cruda por bloques y conserva solo SOLIDO confirmado.
 
     El cache pertenece exclusivamente al forecast para evitar forzar al
     descriptivo a usar toda la historia durante sus pruebas.
     """
-    cache = _forecast_cache_path(source, output, tipo_reference_path)
+    cache = _forecast_cache_path(source, output)
     if use_cache and cache.exists():
         return pd.read_pickle(cache), f"cache limpio forecast: {cache}"
 
     suffix = source.suffix.lower()
-    tipo_reference = load_tipo_pedido_reference(tipo_reference_path)
-    if tipo_reference:
-        print(f"- Referencia tipologica aplicada: {tipo_reference_path}", flush=True)
     chunks: list[pd.DataFrame] = []
     if suffix in {".csv", ".txt"}:
         try:
             reader = pd.read_csv(source, encoding="utf-8-sig", low_memory=False, chunksize=chunk_size)
             for idx, raw_chunk in enumerate(reader, start=1):
-                chunks.append(_only_confirmed_solids(clean_historical_orders(raw_chunk, tipo_reference=tipo_reference)))
+                chunks.append(_only_confirmed_solids(clean_historical_orders(raw_chunk)))
                 print(f"  bloque {idx:,}: {sum(len(item) for item in chunks):,} lineas solidas confirmadas", flush=True)
         except UnicodeDecodeError:
             reader = pd.read_csv(source, encoding="latin-1", low_memory=False, chunksize=chunk_size)
             for idx, raw_chunk in enumerate(reader, start=1):
-                chunks.append(_only_confirmed_solids(clean_historical_orders(raw_chunk, tipo_reference=tipo_reference)))
+                chunks.append(_only_confirmed_solids(clean_historical_orders(raw_chunk)))
                 print(f"  bloque {idx:,}: {sum(len(item) for item in chunks):,} lineas solidas confirmadas", flush=True)
     else:
-        chunks.append(_only_confirmed_solids(clean_historical_orders(read_table(source, sheet=sheet), tipo_reference=tipo_reference)))
+        chunks.append(_only_confirmed_solids(clean_historical_orders(read_table(source, sheet=sheet))))
 
     solids = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=SOLID_COLS)
     if use_cache:
@@ -219,7 +194,7 @@ def build_source_summary(historico: pd.DataFrame, source: str, source_path: Path
             {
                 "fuente": source,
                 "ruta_fuente": str(source_path.resolve()) if source_path else "",
-                "alcance": "SOLIDO historico observado/confirmado; excluye SURTIDO, SURTIDO_M, RAINBOW, BOUQUET, BQT y COMBO",
+                "alcance": "SOLIDO historico observado/confirmado; excluye SURTIDO \"M\", RAINBOW, BOUQUET, BQT y COMBO",
                 "fecha_min": fecha.min(),
                 "fecha_max": fecha.max(),
                 "anios": int(fecha.dt.year.nunique()),
@@ -259,7 +234,6 @@ if __name__ == "__main__":
             sheet=args.historico_sheet,
             chunk_size=args.chunk_size,
             use_cache=not args.no_cache,
-            tipo_reference_path=Path(args.tipo_reference) if args.tipo_reference else None,
         )
     if historico.empty:
         raise ValueError("No quedaron pedidos SOLIDO confirmados para construir el forecast.")
