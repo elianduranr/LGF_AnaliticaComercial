@@ -40,7 +40,7 @@ from dash import dcc
 from dash import html
 
 from fletes_dashboard import get_client_negotiation_term_map, get_fletes_filter_options, get_sales_freight_summary, render_fletes_tab
-from src.lgf_operativo.cleaning import reconcile_tipo_pedido_operativo
+from src.lgf_operativo.cleaning import VALID_OPERATIONAL_TYPES, reconcile_tipo_pedido_operativo
 from src.lgf_operativo.local_env import load_local_credentials
 
 
@@ -83,6 +83,7 @@ REGION_COLOR_MAP = {
     "OTHER": "#B07AA1",
 }
 REGION_FALLBACK_COLOR = "#9CA3AF"
+VALID_OPERATIONAL_TYPE_SET = set(VALID_OPERATIONAL_TYPES)
 GRAPH_CONTAINER_BG = "#FAFAFA"
 GRAPH_LABEL_LINE = "#555555"
 GRAPH_TEXT = "#374151"
@@ -1886,12 +1887,12 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
                 {"label": country, "value": country}
                 for country in sorted(ventas_source["pais"].dropna().astype(str).unique())
             ]
-        sales_type_col = "tipo_pedido_original" if "tipo_pedido_original" in ventas_source.columns else "tipo_pedido_operativo"
+        sales_type_col = "tipo_pedido_operativo"
         if sales_type_col in ventas_source.columns:
+            tipos = operational_type_values(ventas_source[sales_type_col])
             general_sales_type_options = [
-                {"label": tipo, "value": tipo}
-                for tipo in sorted(ventas_source[sales_type_col].dropna().astype(str).unique())
-                if tipo.strip()
+                {"label": operational_type_label(tipo), "value": tipo}
+                for tipo in tipos
             ]
     product_sources = [
         frame
@@ -2996,8 +2997,18 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         if selected_colors and "color" in scope.columns:
             scope = scope[scope["color"].astype(str).isin(set(selected_colors))].copy()
 
-        type_col = "tipo_pedido_original" if "tipo_pedido_original" in scope.columns else "tipo_pedido_operativo"
+        type_col = "tipo_pedido_operativo"
+        if type_col in scope.columns:
+            scope = scope[normalize_operational_type(scope[type_col]).isin(VALID_OPERATIONAL_TYPE_SET)].copy()
         type_options, type_values = tallos_options_from_frame(scope, type_col)
+        type_options = [
+            {
+                **option,
+                "label": operational_type_label(option["value"])
+                + (" | " + option["label"].split(" | ", 1)[1] if " | " in option["label"] else ""),
+            }
+            for option in type_options
+        ]
         selected_types = [value for value in selected_types if value in set(type_values)]
 
         return (
@@ -3130,8 +3141,8 @@ def build_app(data_dir: Path, forecast_dir: Path | None = None) -> Dash:
         sales = enrich_sales_with_original_type(data, data.get("ventas_semana", pd.DataFrame()))
         if tab != "visualizador_clientes_general" or sales.empty or "tipo_pedido_operativo" not in sales.columns:
             return [], []
-        tipos = sorted(sales["tipo_pedido_operativo"].dropna().astype(str).unique())
-        options = [{"label": tipo, "value": tipo} for tipo in tipos]
+        tipos = operational_type_values(sales["tipo_pedido_operativo"])
+        options = [{"label": operational_type_label(tipo), "value": tipo} for tipo in tipos]
         valid = set(tipos)
         value = [tipo for tipo in (current_value or []) if tipo in valid]
         return options, value
@@ -5200,7 +5211,8 @@ def filter_sales_visual(
         weeks = pd.to_numeric(out["semana_iso"], errors="coerce")
         out = out[weeks.between(low, high)].copy()
     if tipo_filter and "tipo_pedido_operativo" in out.columns:
-        out = out[out["tipo_pedido_operativo"].astype(str).isin(set(map(str, tipo_filter)))].copy()
+        valid_tipos = set(normalize_operational_type(pd.Series(tipo_filter))) & VALID_OPERATIONAL_TYPE_SET
+        out = out[normalize_operational_type(out["tipo_pedido_operativo"]).isin(valid_tipos)].copy()
     products = selected_values(product_filter)
     colors = selected_values(color_filter)
     if products and "producto" in out.columns:
@@ -5511,6 +5523,16 @@ def tallos_options_from_frame(
 
 def normalize_operational_type(series: pd.Series) -> pd.Series:
     return series.fillna("SIN_TIPO").astype(str).str.upper().str.replace("Ã“", "O", regex=False).str.strip()
+
+
+def operational_type_values(series: pd.Series) -> list[str]:
+    """Return only canonical business types, never raw order descriptors."""
+    present = set(normalize_operational_type(series).tolist())
+    return [tipo for tipo in VALID_OPERATIONAL_TYPES if tipo in present]
+
+
+def operational_type_label(value: object) -> str:
+    return str(value).strip().upper().replace("_", " ")
 
 
 def ensure_visual_operational_sku(df: pd.DataFrame) -> pd.DataFrame:
@@ -6212,9 +6234,9 @@ def filter_general_sales_frame(
     if selected_colors and "color" in out.columns:
         out = out[out["color"].astype(str).isin(selected_colors)].copy()
     selected_types = selected_values(order_types)
-    type_col = "tipo_pedido_original" if "tipo_pedido_original" in out.columns else "tipo_pedido_operativo"
+    type_col = "tipo_pedido_operativo"
     if selected_types and type_col in out.columns:
-        out = out[out[type_col].astype(str).isin(selected_types)].copy()
+        out = out[normalize_operational_type(out[type_col]).isin(set(selected_types))].copy()
     if "anio_semana" in out.columns and "week_start" not in out.columns and "semana_iso" in out.columns:
         out["week_start"] = pd.to_datetime(
             out["anio"].astype(str) + "-W" + pd.to_numeric(out["semana_iso"], errors="coerce").fillna(1).astype(int).astype(str).str.zfill(2) + "-1",

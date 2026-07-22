@@ -19,6 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dash import dash_table, dcc, html
 
+from src.lgf_operativo.cleaning import VALID_OPERATIONAL_TYPES, classify_tipo_pedido_operativo
 from src.lgf_operativo.local_env import load_local_credentials
 from src.lgf_operativo.op_sales_sql import get_connection
 
@@ -276,10 +277,7 @@ def _normalize_freight_order_type(frame: pd.DataFrame) -> pd.Series:
     if frame.empty:
         return pd.Series(dtype="object")
     source = frame.get("tipo_empaque_raw", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
-    source_upper = _ascii_upper_text(source)
-    out = source_upper.where(~source_upper.isin({"", "NAN", "NONE", "SIN DATO", "SIN_DATO"}), "Sin dato")
-    out = out.mask(source_upper.isin({"SOLIDO POR VARIEDAD", "SOLIDO POR COLOR"}), "SOLIDO")
-    return out
+    return classify_tipo_pedido_operativo(pd.DataFrame({"tipo_empaque": source}))["tipo_pedido_operativo"]
 
 
 def _read_freight_scope(
@@ -1134,7 +1132,8 @@ def get_fletes_type_options(
         return []
     if frame.empty or "tipo_pedido_operativo" not in frame.columns:
         return []
-    values = sorted(value for value in frame["tipo_pedido_operativo"].dropna().astype(str).unique() if value.strip())
+    present = set(frame["tipo_pedido_operativo"].dropna().astype(str).str.strip().str.upper())
+    values = [value for value in VALID_OPERATIONAL_TYPES if value in present]
     return [{"label": value, "value": value} for value in values]
 
 
@@ -1172,13 +1171,14 @@ def get_fletes_filter_options(
     client_frame = frame.copy()
     if {"cliente", "cod_cliente"}.issubset(client_frame.columns):
         client_frame["cliente_label"] = client_frame["cliente"].astype(str) + " | " + client_frame["cod_cliente"].astype(str)
+    valid_type_frame = frame[frame["tipo_pedido_operativo"].isin(set(VALID_OPERATIONAL_TYPES))].copy()
     return {
         "companies": _fletes_options_from_frame(frame, "NomCompania"),
         "clients": _fletes_options_from_frame(client_frame, "cod_cliente", "cliente_label"),
         "countries": _fletes_options_from_frame(frame, "pais"),
         "products": _fletes_options_from_frame(frame, "producto"),
         "colors": _fletes_options_from_frame(frame, "color"),
-        "types": _fletes_options_from_frame(frame, "tipo_pedido_operativo"),
+        "types": _fletes_options_from_frame(valid_type_frame, "tipo_pedido_operativo"),
     }
 
 

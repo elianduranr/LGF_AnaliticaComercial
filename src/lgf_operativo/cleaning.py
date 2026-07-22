@@ -13,6 +13,33 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+
+VALID_OPERATIONAL_TYPES = (
+    "SOLIDO",
+    "SURTIDO",
+    'SURTIDO "M"',
+    "RAINBOW",
+    "COMBO",
+    "BULK",
+    "BOUQUET",
+    "BQT",
+)
+
+_OPERATIONAL_TYPE_BY_SOURCE = {
+    "solido": "SOLIDO",
+    "solido por variedad": "SOLIDO",
+    "solido por color": "SOLIDO",
+    "surtido": "SURTIDO",
+    'surtido "m"': 'SURTIDO "M"',
+    "surtido m": 'SURTIDO "M"',
+    "surtido_m": 'SURTIDO "M"',
+    "rainbow": "RAINBOW",
+    "combo": "COMBO",
+    "bulk": "BULK",
+    "bouquet": "BOUQUET",
+    "bqt": "BQT",
+}
+
 CANONICAL_COLUMNS = {
     "fecha": ["FECHA", "Fecha", "fecha"],
     "cod_cliente": ["CODCUSTOM", "CodCustom", "COD_CLIENTE", "cod_cliente", "codigo_cliente"],
@@ -219,16 +246,15 @@ def classify_estado(estado: pd.Series) -> pd.DataFrame:
 def classify_tipo_pedido_operativo(df: pd.DataFrame) -> pd.DataFrame:
     """Use source-system ``TIPEMPAQUE`` as the sole operational-type authority.
 
-    The two solid variants are consolidated as ``SOLIDO``. Every other value
-    is preserved as supplied by the system (apart from case/text cleanup).
+    Only the closed business catalogue is exposed. Descriptive/order labels
+    such as ``REGULAR`` or ``MUESTRA`` are not operational packaging types.
     """
     if "tipo_empaque" in df.columns:
         raw = normalize_text_series(df["tipo_empaque"])
     else:
         raw = pd.Series("sin_info", index=df.index, dtype="object")
 
-    tipo = raw.str.upper()
-    tipo = tipo.where(~raw.isin(["solido por variedad", "solido por color"]), "SOLIDO")
+    tipo = raw.map(_OPERATIONAL_TYPE_BY_SOURCE).fillna("TIPO_EMPAQUE_NO_CLASIFICADO")
     tipo = tipo.where(raw.ne("sin_info"), "TIPO_EMPAQUE_NO_INFORMADO")
     subtipo = normalize_key_series(raw)
     origen_tipologia = pd.Series("tipo_empaque_sistema", index=df.index, dtype="object")

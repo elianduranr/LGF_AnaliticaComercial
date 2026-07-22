@@ -59,10 +59,10 @@ def test_reconciliacion_no_infiere_desde_empaque_o_receta():
     assert result["origen_tipologia_operativa"].eq("tipo_empaque_sistema").all()
 
 
-def test_valor_nuevo_del_sistema_se_conserva_sin_inferencia():
+def test_valor_fuera_del_catalogo_no_se_expone_como_tipo_operativo():
     source = pd.DataFrame(
         {
-            "tipo_empaque": ["nuevo formato operativo"],
+            "tipo_empaque": ["regular muestra"],
             "empaque": ["bouquet combo"],
             "receta": ["rainbow"],
         }
@@ -70,7 +70,7 @@ def test_valor_nuevo_del_sistema_se_conserva_sin_inferencia():
 
     result = classify_tipo_pedido_operativo(source)
 
-    assert result.loc[0, "tipo_pedido_operativo"] == "NUEVO FORMATO OPERATIVO"
+    assert result.loc[0, "tipo_pedido_operativo"] == "TIPO_EMPAQUE_NO_CLASIFICADO"
 
 
 def test_fletes_usa_solo_tipo_empaque_original():
